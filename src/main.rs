@@ -6,10 +6,13 @@ mod symbols;
 use cargo_metadata::MetadataCommand;
 use cli::parse_args;
 use imports::{ImportPath, parse_use_line};
-use resolver::{is_rust_library_crate, library_root, package_dependencies, package_for_manifest, resolve_package, rust_library_src};
+use resolver::{
+    is_rust_library_crate, library_root, package_dependencies, package_for_manifest,
+    resolve_package,
+};
 use std::path::Path;
 use std::process::ExitCode;
-use symbols::{SymbolDoc, add_reexported_matches, find_symbols, find_symbols_lossy, rank_matches};
+use symbols::{SymbolDoc, add_reexported_matches, find_symbols, rank_matches};
 
 fn main() -> ExitCode {
     match run() {
@@ -26,30 +29,10 @@ fn run() -> Result<(), String> {
     let import = parse_use_line(&args.use_line)?;
 
     if is_rust_library_crate(&import.crate_name) {
-        let src = rust_library_src(&import.crate_name)?;
-        if !src.exists() {
-            return Err(format!(
-                "rust source not found for {} at {}; install with `rustup component add rust-src`",
-                import.crate_name,
-                src.display()
-            ));
-        }
-
-        let mut matches = find_symbols_lossy(&src, &import.item)?;
-        if matches.is_empty() {
-            return Err(not_found_message(&import, &import.crate_name, None, &src));
-        }
-        rank_matches(&mut matches, &import);
-        print_report(
-            &import.crate_name,
-            None,
-            &src,
-            &args.use_line,
-            &import,
-            &matches,
-            &matches[0],
-        );
-        return Ok(());
+        return Err(format!(
+            "{} is part of the Rust standard library and is not supported; use the official Rust docs: https://doc.rust-lang.org/std/",
+            import.crate_name
+        ));
     }
 
     let metadata = MetadataCommand::new()
@@ -75,7 +58,7 @@ fn run() -> Result<(), String> {
         ));
     }
 
-    let mut matches = find_symbols(&root_file, &import.item, &import.segments)?;
+    let mut matches = find_symbols(&root_file, &import.item, &import.segments).unwrap_or_default();
     add_reexported_matches(
         &root_file,
         &import,
@@ -221,7 +204,11 @@ mod tests {
         assert!(message.contains("appears to be a module"));
         assert!(message.contains("tokio::sync::mpsc::Sender"));
 
-        let item = ImportPath { crate_name: "x".into(), segments: vec![], item: "Thing".into() };
+        let item = ImportPath {
+            crate_name: "x".into(),
+            segments: vec![],
+            item: "Thing".into(),
+        };
         let message = not_found_message(&item, "x", None, Path::new("/src"));
         assert!(!message.contains("appears to be a module"));
         assert!(looks_like_module_name("module_2"));
@@ -230,11 +217,31 @@ mod tests {
 
     #[test]
     fn print_report_covers_output_branches() {
-        let import = ImportPath { crate_name: "x".into(), segments: vec![], item: "Thing".into() };
+        let import = ImportPath {
+            crate_name: "x".into(),
+            segments: vec![],
+            item: "Thing".into(),
+        };
         let src = Path::new("/tmp/src");
         let first = doc("Thing", vec!["docs".into()]);
         let second = doc("Thing", Vec::new());
-        print_report("x", Some("1.2.3"), src, "use x::Thing;", &import, &[first, second], &doc("Thing", vec!["docs".into()]));
-        print_report("x", None, src, "use x::Thing;", &import, &[doc("Thing", Vec::new())], &doc("Thing", Vec::new()));
+        print_report(
+            "x",
+            Some("1.2.3"),
+            src,
+            "use x::Thing;",
+            &import,
+            &[first, second],
+            &doc("Thing", vec!["docs".into()]),
+        );
+        print_report(
+            "x",
+            None,
+            src,
+            "use x::Thing;",
+            &import,
+            &[doc("Thing", Vec::new())],
+            &doc("Thing", Vec::new()),
+        );
     }
 }

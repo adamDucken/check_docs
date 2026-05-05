@@ -6,7 +6,11 @@ fn binary_reports_dependency_item() {
         .args(["use syn::ItemUse;", "--root", "."])
         .output()
         .unwrap();
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("crate: syn"));
     assert!(stdout.contains("item: struct ItemUse"));
@@ -23,13 +27,21 @@ fn binary_rejects_bad_import() {
 }
 
 #[test]
-fn binary_reports_std_item() {
-    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
-        .args(["use std::fs::File;"])
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("item: struct File"));
+fn binary_rejects_rust_standard_library_items() {
+    for import in [
+        "use std::fs::File;",
+        "use core::fmt::Debug;",
+        "use alloc::vec::Vec;",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+            .arg(import)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("Rust standard library"));
+        assert!(stderr.contains("https://doc.rust-lang.org/std/"));
+    }
 }
 
 #[test]

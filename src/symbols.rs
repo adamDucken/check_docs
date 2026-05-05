@@ -2,7 +2,7 @@ use crate::imports::ImportPath;
 use crate::resolver::resolve_package;
 use cargo_metadata::{Package, PackageId};
 use quote::ToTokens;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use syn::spanned::Spanned;
 use walkdir::WalkDir;
@@ -53,7 +53,7 @@ fn find_symbols_with_parse_mode(
                     out.push(doc);
                 } else {
                     eprintln!(
-                        "check-docs: warning: skipped unparsable rust-src file {}: {err}",
+                        "check-docs: warning: skipped unparsable Rust source file {}: {err}",
                         file.display()
                     );
                 }
@@ -106,109 +106,403 @@ pub(crate) fn add_reexported_matches(
     dependencies: &HashMap<String, PackageId>,
     matches: &mut Vec<SymbolDoc>,
 ) -> Result<(), String> {
-    for path in collect_reexports(root_file, import)? {
-        if path.len() < 2 {
-            continue;
-        }
-        let crate_name = path[0].replace('-', "_");
-        if matches!(crate_name.as_str(), "crate" | "self") {
-            let item_name = path.last().expect("reexport path is non-empty");
-            let segments = &path[1..path.len() - 1];
-            for mut doc in find_symbols_internal(root_file, item_name, segments)? {
-                doc.reexported = true;
-                matches.push(doc);
-            }
-            continue;
-        }
-        if crate_name == "super" {
-            continue;
-        }
-        let Ok(package) = resolve_package(packages, dependencies, &crate_name) else {
-            let item_name = path.last().expect("reexport path is non-empty");
-            let segments = &path[..path.len() - 1];
-            for mut doc in find_symbols_internal(root_file, item_name, segments)? {
-                doc.reexported = true;
-                matches.push(doc);
-            }
-            continue;
-        };
-        let Some(root_file) = package
-            .targets
-            .iter()
-            .find(|target| target.kind.iter().any(|kind| kind == "lib"))
-            .map(|target| target.src_path.as_std_path().to_path_buf())
-        else {
+    let mut visited = HashSet::new();
+    if let Ok(mut docs) = resolve_reexports_in_module(
+        root_file,
+        &import.segments,
+        &import.item,
+        packages,
+        dependencies,
+        &mut visited,
+    ) {
+        matches.append(&mut docs);
+    }
+    add_reexported_module_path_matches(root_file, import, packages, dependencies, matches)?;
+    Ok(())
+}
+
+fn add_reexported_module_path_matches(
+    root_file: &Path,
+    import: &ImportPath,
+    packages: &[Package],
+    dependencies: &HashMap<String, PackageId>,
+    matches: &mut Vec<SymbolDoc>,
+) -> Result<(), String> {
+    for index in 0..import.segments.len() {
+        let parent_segments = &import.segments[..index];
+        let alias = &import.segments[index];
+        let remaining_segments = &import.segments[index + 1..];
+        let Ok(module) = resolve_module(root_file, parent_segments, false) else {
             continue;
         };
-        if !root_file.exists() {
-            continue;
-        }
-        let item_name = path.last().expect("reexport path is non-empty");
-        let segments = &path[1..path.len() - 1];
-        for mut doc in find_symbols(&root_file, item_name, segments)? {
-            doc.reexported = true;
-            matches.push(doc);
+        let mut paths = Vec::new();
+        collect_reexported_module_paths(&module.items, alias, &mut paths)?;
+        for path in paths {
+            let mut full_path = path.clone();
+            full_path.extend_from_slice(remaining_segments);
+            full_path.push(import.item.clone());
+            let Ok((target_root, target_segments)) = resolve_path_root(
+                root_file,
+                parent_segments,
+                &full_path,
+                packages,
+                dependencies,
+            ) else {
+                continue;
+            };
+            push_resolved_docs(&target_root, &import.item, &target_segments, matches);
+            let mut visited = HashSet::new();
+            if let Ok(mut docs) = resolve_reexports_in_module(
+                &target_root,
+                &target_segments,
+                &import.item,
+                packages,
+                dependencies,
+                &mut visited,
+            ) {
+                matches.append(&mut docs);
+            }
         }
     }
     Ok(())
 }
 
-fn collect_reexports(root_file: &Path, import: &ImportPath) -> Result<Vec<Vec<String>>, String> {
-    let module = resolve_module(root_file, &import.segments, true)?;
-    let mut out = Vec::new();
-    collect_reexports_from_items(&module.items, &import.item, &mut out)?;
-    Ok(out)
-}
-
-fn collect_reexports_from_items(
+fn collect_reexported_module_paths(
     items: &[syn::Item],
-    target: &str,
+    alias: &str,
     out: &mut Vec<Vec<String>>,
 ) -> Result<(), String> {
     for item in items {
-        match item {
-            syn::Item::Use(item) if matches!(item.vis, syn::Visibility::Public(_)) => {
-                collect_reexport_use_paths(&item.tree, Vec::new(), target, out)?;
-            }
-            _ => {}
+        if let syn::Item::Use(item) = item
+            && matches!(item.vis, syn::Visibility::Public(_))
+        {
+            collect_reexport_module_use_paths(&item.tree, Vec::new(), alias, out)?;
         }
     }
     Ok(())
 }
 
-fn collect_reexport_use_paths(
+fn collect_reexport_module_use_paths(
     tree: &syn::UseTree,
     mut prefix: Vec<String>,
-    target: &str,
+    alias: &str,
     out: &mut Vec<Vec<String>>,
 ) -> Result<(), String> {
     match tree {
         syn::UseTree::Path(path) => {
             prefix.push(path.ident.to_string());
-            collect_reexport_use_paths(&path.tree, prefix, target, out)
+            collect_reexport_module_use_paths(&path.tree, prefix, alias, out)
         }
         syn::UseTree::Name(name) => {
-            prefix.push(name.ident.to_string());
-            if prefix.last().is_some_and(|last| last == target) {
+            if name.ident == alias {
+                prefix.push(name.ident.to_string());
                 out.push(prefix);
+            }
+            Ok(())
+        }
+        syn::UseTree::Rename(rename) => {
+            if rename.rename == alias {
+                prefix.push(rename.ident.to_string());
+                out.push(prefix);
+            }
+            Ok(())
+        }
+        syn::UseTree::Glob(_) => Ok(()),
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                collect_reexport_module_use_paths(item, prefix.clone(), alias, out)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn resolve_reexports_in_module(
+    root_file: &Path,
+    module_segments: &[String],
+    target: &str,
+    packages: &[Package],
+    dependencies: &HashMap<String, PackageId>,
+    visited: &mut HashSet<String>,
+) -> Result<Vec<SymbolDoc>, String> {
+    let key = format!(
+        "{}::{}::{}",
+        root_file.display(),
+        module_segments.join("::"),
+        target
+    );
+    if !visited.insert(key) {
+        return Ok(Vec::new());
+    }
+
+    let module = resolve_module(root_file, module_segments, false)?;
+    let mut out = Vec::new();
+    for item in module.items {
+        let syn::Item::Use(item) = item else {
+            continue;
+        };
+        if !matches!(item.vis, syn::Visibility::Public(_)) {
+            continue;
+        }
+        collect_reexport_use_matches(
+            root_file,
+            module_segments,
+            &item.tree,
+            Vec::new(),
+            target,
+            packages,
+            dependencies,
+            visited,
+            &mut out,
+        )?;
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_reexport_use_matches(
+    root_file: &Path,
+    current_segments: &[String],
+    tree: &syn::UseTree,
+    mut prefix: Vec<String>,
+    target: &str,
+    packages: &[Package],
+    dependencies: &HashMap<String, PackageId>,
+    visited: &mut HashSet<String>,
+    out: &mut Vec<SymbolDoc>,
+) -> Result<(), String> {
+    match tree {
+        syn::UseTree::Path(path) => {
+            prefix.push(path.ident.to_string());
+            collect_reexport_use_matches(
+                root_file,
+                current_segments,
+                &path.tree,
+                prefix,
+                target,
+                packages,
+                dependencies,
+                visited,
+                out,
+            )
+        }
+        syn::UseTree::Name(name) => {
+            if name.ident == target {
+                prefix.push(name.ident.to_string());
+                let _ = resolve_reexport_path(
+                    root_file,
+                    current_segments,
+                    &prefix,
+                    target,
+                    packages,
+                    dependencies,
+                    visited,
+                    out,
+                );
             }
             Ok(())
         }
         syn::UseTree::Rename(rename) => {
             if rename.rename == target {
                 prefix.push(rename.ident.to_string());
-                out.push(prefix);
+                let _ = resolve_reexport_path(
+                    root_file,
+                    current_segments,
+                    &prefix,
+                    &rename.ident.to_string(),
+                    packages,
+                    dependencies,
+                    visited,
+                    out,
+                );
             }
             Ok(())
         }
-        syn::UseTree::Glob(_) => Err("glob imports are not supported".to_string()),
+        syn::UseTree::Glob(_) => {
+            let _ = resolve_glob_reexport_path(
+                root_file,
+                current_segments,
+                &prefix,
+                target,
+                packages,
+                dependencies,
+                visited,
+                out,
+            );
+            Ok(())
+        }
         syn::UseTree::Group(group) => {
             for item in &group.items {
-                collect_reexport_use_paths(item, prefix.clone(), target, out)?;
+                let _ = collect_reexport_use_matches(
+                    root_file,
+                    current_segments,
+                    item,
+                    prefix.clone(),
+                    target,
+                    packages,
+                    dependencies,
+                    visited,
+                    out,
+                );
             }
             Ok(())
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_reexport_path(
+    root_file: &Path,
+    current_segments: &[String],
+    path: &[String],
+    target: &str,
+    packages: &[Package],
+    dependencies: &HashMap<String, PackageId>,
+    visited: &mut HashSet<String>,
+    out: &mut Vec<SymbolDoc>,
+) -> Result<(), String> {
+    if path.len() < 2 {
+        return Ok(());
+    }
+    let (target_root, segments) =
+        resolve_path_root(root_file, current_segments, path, packages, dependencies)?;
+    let item_name = path.last().expect("reexport path is non-empty");
+    push_resolved_docs(&target_root, item_name, &segments, out);
+    if let Ok(mut nested) = resolve_reexports_in_module(
+        &target_root,
+        &segments,
+        target,
+        packages,
+        dependencies,
+        visited,
+    ) {
+        out.append(&mut nested);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_glob_reexport_path(
+    root_file: &Path,
+    current_segments: &[String],
+    path: &[String],
+    target: &str,
+    packages: &[Package],
+    dependencies: &HashMap<String, PackageId>,
+    visited: &mut HashSet<String>,
+    out: &mut Vec<SymbolDoc>,
+) -> Result<(), String> {
+    if path.is_empty() {
+        return Ok(());
+    }
+    let mut full_path = path.to_vec();
+    full_path.push(target.to_string());
+    let (target_root, segments) = resolve_path_root(
+        root_file,
+        current_segments,
+        &full_path,
+        packages,
+        dependencies,
+    )?;
+    push_resolved_docs(&target_root, target, &segments, out);
+    if let Ok(mut nested) = resolve_reexports_in_module(
+        &target_root,
+        &segments,
+        target,
+        packages,
+        dependencies,
+        visited,
+    ) {
+        out.append(&mut nested);
+    }
+    Ok(())
+}
+
+fn push_resolved_docs(root_file: &Path, item: &str, segments: &[String], out: &mut Vec<SymbolDoc>) {
+    if let Ok(docs) = find_symbols_internal(root_file, item, segments) {
+        for mut doc in docs {
+            doc.reexported = true;
+            out.push(doc);
+        }
+        return;
+    }
+
+    let Some(src) = root_file.parent() else {
+        return;
+    };
+    let Ok(mut docs) = find_symbols_lossy(src, item) else {
+        return;
+    };
+    docs.retain(|doc| path_components_match(&doc.path, src, segments));
+    for mut doc in docs {
+        doc.reexported = true;
+        out.push(doc);
+    }
+}
+
+fn path_components_match(path: &Path, src: &Path, segments: &[String]) -> bool {
+    let Ok(relative) = path.strip_prefix(src) else {
+        return false;
+    };
+    let text = relative.display().to_string().replace('-', "_");
+    segments.iter().all(|segment| {
+        text.split(['/', '\\', '.'])
+            .any(|component| component == segment)
+    })
+}
+
+fn resolve_path_root(
+    root_file: &Path,
+    current_segments: &[String],
+    path: &[String],
+    packages: &[Package],
+    dependencies: &HashMap<String, PackageId>,
+) -> Result<(PathBuf, Vec<String>), String> {
+    let first = path[0].replace('-', "_");
+    match first.as_str() {
+        "crate" => Ok((
+            root_file.to_path_buf(),
+            normalize_relative_segments(&[], &path[1..path.len() - 1]),
+        )),
+        "self" => Ok((
+            root_file.to_path_buf(),
+            normalize_relative_segments(current_segments, &path[1..path.len() - 1]),
+        )),
+        "super" => Ok((
+            root_file.to_path_buf(),
+            normalize_relative_segments(current_segments, &path[..path.len() - 1]),
+        )),
+        crate_name => {
+            if let Ok(package) = resolve_package(packages, dependencies, crate_name)
+                && let Some(root) = package
+                    .targets
+                    .iter()
+                    .find(|target| target.kind.iter().any(|kind| kind == "lib"))
+                    .map(|target| target.src_path.as_std_path().to_path_buf())
+            {
+                return Ok((root, path[1..path.len() - 1].to_vec()));
+            }
+            Ok((
+                root_file.to_path_buf(),
+                normalize_relative_segments(current_segments, &path[..path.len() - 1]),
+            ))
+        }
+    }
+}
+
+fn normalize_relative_segments(base: &[String], relative: &[String]) -> Vec<String> {
+    let mut segments = base.to_vec();
+    for segment in relative {
+        match segment.as_str() {
+            "self" => {}
+            "super" => {
+                segments.pop();
+            }
+            "crate" => segments.clear(),
+            _ => segments.push(segment.clone()),
+        }
+    }
+    segments
 }
 
 struct LoadedModule {
@@ -282,7 +576,12 @@ fn resolve_child_module(
             }
             _ => None,
         })
-        .ok_or_else(|| format!("module '{segment}' not found from {}", parent.path.display()))?;
+        .ok_or_else(|| {
+            format!(
+                "module '{segment}' not found from {}",
+                parent.path.display()
+            )
+        })?;
 
     if let Some((_, items)) = &module.content {
         return Ok(LoadedModule {
@@ -302,7 +601,12 @@ fn resolve_child_module(
             let mod_path = parent.child_dir.join(segment).join("mod.rs");
             mod_path.exists().then_some(mod_path)
         })
-        .ok_or_else(|| format!("module file for '{segment}' not found from {}", parent.path.display()))?;
+        .ok_or_else(|| {
+            format!(
+                "module file for '{segment}' not found from {}",
+                parent.path.display()
+            )
+        })?;
 
     load_module_file(&path)
 }
@@ -331,7 +635,12 @@ fn collect_items_direct(path: &Path, items: &[syn::Item], target: &str, out: &mu
     }
 }
 
-fn collect_items_recursive(path: &Path, items: &[syn::Item], target: &str, out: &mut Vec<SymbolDoc>) {
+fn collect_items_recursive(
+    path: &Path,
+    items: &[syn::Item],
+    target: &str,
+    out: &mut Vec<SymbolDoc>,
+) {
     for item in items {
         collect_item(path, item, target, out);
         if let syn::Item::Mod(module) = item
@@ -1109,14 +1418,24 @@ mod tests {
         );
         write(&dir.join("actual.rs"), "pub struct Actual;");
 
-        let import = ImportPath { crate_name: "x".into(), segments: vec![], item: "Secret".into() };
+        let import = ImportPath {
+            crate_name: "x".into(),
+            segments: vec![],
+            item: "Secret".into(),
+        };
         let mut matches = Vec::new();
         add_reexported_matches(&lib, &import, &[], &HashMap::new(), &mut matches).unwrap();
         assert_eq!(matches[0].name, "Secret");
         assert!(matches[0].reexported);
 
-        assert_eq!(find_symbols(&lib, "Actual", &["renamed".into()]).unwrap()[0].name, "Actual");
-        assert_eq!(find_symbols(&lib, "Inside", &["inline".into()]).unwrap()[0].name, "Inside");
+        assert_eq!(
+            find_symbols(&lib, "Actual", &["renamed".into()]).unwrap()[0].name,
+            "Actual"
+        );
+        assert_eq!(
+            find_symbols(&lib, "Inside", &["inline".into()]).unwrap()[0].name,
+            "Inside"
+        );
     }
 
     #[test]
@@ -1127,9 +1446,12 @@ mod tests {
         write(
             &lib,
             r#"
-            mod hidden { pub struct Secret; pub struct Original; }
-            pub mod nested { pub use super::hidden::Secret; }
+            mod hidden { pub struct Secret; pub struct Original; pub struct Globbed; }
+            mod facade { pub use super::hidden::Secret; }
+            pub mod nested { pub use super::hidden::Secret as NestedOnly; }
             pub use hidden::Original as PublicAlias;
+            pub use hidden::*;
+            pub use facade::Secret as RecursiveSecret;
             mod private_inline { pub struct Boundary; }
             "#,
         );
@@ -1137,12 +1459,21 @@ mod tests {
         let nested_parent_import = ImportPath {
             crate_name: "x".into(),
             segments: vec![],
-            item: "Secret".into(),
+            item: "NestedOnly".into(),
         };
         let mut matches = Vec::new();
-        add_reexported_matches(&lib, &nested_parent_import, &[], &HashMap::new(), &mut matches)
-            .unwrap();
-        assert!(matches.is_empty(), "nested pub use leaked into parent import");
+        add_reexported_matches(
+            &lib,
+            &nested_parent_import,
+            &[],
+            &HashMap::new(),
+            &mut matches,
+        )
+        .unwrap();
+        assert!(
+            matches.is_empty(),
+            "nested pub use leaked into parent import"
+        );
 
         let alias_import = ImportPath {
             crate_name: "x".into(),
@@ -1153,7 +1484,66 @@ mod tests {
         assert_eq!(matches[0].name, "Original");
         assert!(matches[0].reexported);
 
+        let glob_import = ImportPath {
+            crate_name: "x".into(),
+            segments: vec![],
+            item: "Globbed".into(),
+        };
+        let mut glob_matches = Vec::new();
+        add_reexported_matches(&lib, &glob_import, &[], &HashMap::new(), &mut glob_matches)
+            .unwrap();
+        assert_eq!(glob_matches[0].name, "Globbed");
+
+        let recursive_import = ImportPath {
+            crate_name: "x".into(),
+            segments: vec![],
+            item: "RecursiveSecret".into(),
+        };
+        let mut recursive_matches = Vec::new();
+        add_reexported_matches(
+            &lib,
+            &recursive_import,
+            &[],
+            &HashMap::new(),
+            &mut recursive_matches,
+        )
+        .unwrap();
+        assert_eq!(recursive_matches[0].name, "Secret");
+
         assert!(find_symbols(&lib, "Boundary", &["private_inline".into()]).is_err());
+    }
+
+    #[test]
+    fn reexports_handle_repeated_super_and_unresolved_globs() {
+        let dir = TempDir::new().unwrap();
+        let dir = dir.path();
+        let lib = dir.join("lib.rs");
+        write(
+            &lib,
+            r#"
+            mod hidden { pub struct Thing; }
+            pub mod a { pub mod b { pub use super::super::hidden::Thing; } }
+            pub use cfg_hidden::*;
+            "#,
+        );
+
+        let import = ImportPath {
+            crate_name: "x".into(),
+            segments: vec!["a".into(), "b".into()],
+            item: "Thing".into(),
+        };
+        let mut matches = Vec::new();
+        add_reexported_matches(&lib, &import, &[], &HashMap::new(), &mut matches).unwrap();
+        assert_eq!(matches[0].name, "Thing");
+
+        let missing = ImportPath {
+            crate_name: "x".into(),
+            segments: vec![],
+            item: "Missing".into(),
+        };
+        let mut missing_matches = Vec::new();
+        add_reexported_matches(&lib, &missing, &[], &HashMap::new(), &mut missing_matches).unwrap();
+        assert!(missing_matches.is_empty());
     }
 
     #[test]
@@ -1171,7 +1561,7 @@ mod tests {
             }}
             "#,
         );
-        let docs = find_symbols_lossy(&dir, "Bad").unwrap();
+        let docs = find_symbols_lossy(dir, "Bad").unwrap();
         assert_eq!(docs[0].kind, "struct");
 
         let source = std::fs::read_to_string(dir.join("b.rs")).unwrap();
@@ -1199,14 +1589,31 @@ mod tests {
             .unwrap();
         let root = metadata.root_package().unwrap();
         let deps = crate::resolver::package_dependencies(&metadata, &root.id);
-        let import = ImportPath { crate_name: "x".into(), segments: vec![], item: "MetadataCommand".into() };
+        let import = ImportPath {
+            crate_name: "x".into(),
+            segments: vec![],
+            item: "MetadataCommand".into(),
+        };
         let mut matches = Vec::new();
         add_reexported_matches(&lib, &import, &metadata.packages, &deps, &mut matches).unwrap();
         assert_eq!(matches[0].name, "MetadataCommand");
         assert!(matches[0].reexported);
 
-        let glob = ImportPath { crate_name: "x".into(), segments: vec![], item: "Nope".into() };
-        assert!(add_reexported_matches(&glob_lib, &glob, &metadata.packages, &deps, &mut Vec::new()).is_err());
+        let glob = ImportPath {
+            crate_name: "x".into(),
+            segments: vec![],
+            item: "Nope".into(),
+        };
+        let mut glob_matches = Vec::new();
+        add_reexported_matches(
+            &glob_lib,
+            &glob,
+            &metadata.packages,
+            &deps,
+            &mut glob_matches,
+        )
+        .unwrap();
+        assert!(glob_matches.is_empty());
     }
 
     #[test]
@@ -1216,10 +1623,17 @@ mod tests {
         let lib = dir.join("lib.rs");
         write(&lib, "pub mod outer;");
         write(&dir.join("outer/mod.rs"), "pub struct FromModRs;");
-        assert_eq!(find_symbols(&lib, "FromModRs", &["outer".into()]).unwrap()[0].name, "FromModRs");
+        assert_eq!(
+            find_symbols(&lib, "FromModRs", &["outer".into()]).unwrap()[0].name,
+            "FromModRs"
+        );
 
         write(&dir.join("bad.rs"), "pub struct Nope {");
-        assert!(find_symbols_with_parse_mode(dir, "Nope", false).unwrap_err().contains("failed to parse"));
+        assert!(
+            find_symbols_with_parse_mode(dir, "Nope", false)
+                .unwrap_err()
+                .contains("failed to parse")
+        );
         assert!(find_symbols_lossy(dir, "Missing").unwrap().is_empty());
 
         let macro_source = r#"
@@ -1245,10 +1659,36 @@ mod tests {
 
     #[test]
     fn ranking_prefers_reexported_public_module_hits() {
-        let import = ImportPath { crate_name: "x".into(), segments: vec!["api".into()], item: "Thing".into() };
+        let import = ImportPath {
+            crate_name: "x".into(),
+            segments: vec!["api".into()],
+            item: "Thing".into(),
+        };
         let mut docs = vec![
-            SymbolDoc { path: PathBuf::from("src/other.rs"), line: 2, kind: "struct", name: "Thing".into(), definition: String::new(), details: Vec::new(), docs: Vec::new(), derives: Vec::new(), public: false, reexported: false },
-            SymbolDoc { path: PathBuf::from("src/api.rs"), line: 1, kind: "struct", name: "Thing".into(), definition: String::new(), details: Vec::new(), docs: Vec::new(), derives: Vec::new(), public: true, reexported: true },
+            SymbolDoc {
+                path: PathBuf::from("src/other.rs"),
+                line: 2,
+                kind: "struct",
+                name: "Thing".into(),
+                definition: String::new(),
+                details: Vec::new(),
+                docs: Vec::new(),
+                derives: Vec::new(),
+                public: false,
+                reexported: false,
+            },
+            SymbolDoc {
+                path: PathBuf::from("src/api.rs"),
+                line: 1,
+                kind: "struct",
+                name: "Thing".into(),
+                definition: String::new(),
+                details: Vec::new(),
+                docs: Vec::new(),
+                derives: Vec::new(),
+                public: true,
+                reexported: true,
+            },
         ];
         rank_matches(&mut docs, &import);
         assert!(docs[0].reexported);

@@ -127,7 +127,10 @@ mod tests {
     #[test]
     fn rejects_absolute_and_too_short_paths() {
         let err = parse_use_line("use ::syn::ItemUse;").unwrap_err();
-        assert_eq!(err, "absolute use paths with leading `::` are not supported");
+        assert_eq!(
+            err,
+            "absolute use paths with leading `::` are not supported"
+        );
 
         let err = parse_use_line("use syn;").unwrap_err();
         assert!(err.contains("expected external use path"));

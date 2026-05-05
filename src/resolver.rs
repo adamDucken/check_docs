@@ -6,22 +6,6 @@ pub(crate) fn is_rust_library_crate(crate_name: &str) -> bool {
     matches!(crate_name, "std" | "core" | "alloc")
 }
 
-pub(crate) fn rust_library_src(crate_name: &str) -> Result<PathBuf, String> {
-    let output = std::process::Command::new("rustc")
-        .args(["--print", "sysroot"])
-        .output()
-        .map_err(|err| format!("failed to run `rustc --print sysroot`: {err}"))?;
-    if !output.status.success() {
-        return Err("`rustc --print sysroot` failed".to_string());
-    }
-    let sysroot = String::from_utf8(output.stdout)
-        .map_err(|err| format!("rustc sysroot output was not utf8: {err}"))?;
-    Ok(PathBuf::from(sysroot.trim())
-        .join("lib/rustlib/src/rust/library")
-        .join(crate_name)
-        .join("src"))
-}
-
 pub(crate) fn package_for_manifest<'a>(
     metadata: &'a Metadata,
     manifest_path: &Path,
@@ -34,7 +18,12 @@ pub(crate) fn package_for_manifest<'a>(
         .packages
         .iter()
         .find(|package| package.manifest_path.as_std_path() == manifest_path)
-        .ok_or_else(|| format!("package for manifest {} not found in cargo metadata", manifest_path.display()))
+        .ok_or_else(|| {
+            format!(
+                "package for manifest {} not found in cargo metadata",
+                manifest_path.display()
+            )
+        })
 }
 
 pub(crate) fn package_dependencies(
@@ -66,30 +55,16 @@ pub(crate) fn resolve_package<'a>(
     dependencies: &HashMap<String, PackageId>,
     crate_name: &str,
 ) -> Result<&'a Package, String> {
-    let mut matches: Vec<&Package> = dependencies
-        .get(crate_name)
-        .into_iter()
-        .filter_map(|id| packages.iter().find(|pkg| &pkg.id == id))
-        .collect();
+    let Some(package_id) = dependencies.get(crate_name) else {
+        return Err(format!(
+            "crate '{crate_name}' is not a direct dependency of the selected package"
+        ));
+    };
 
-    if matches.is_empty() {
-        matches = packages
-            .iter()
-            .filter(|pkg| pkg.name.replace('-', "_") == crate_name)
-            .collect();
-    }
-
-    match matches.as_slice() {
-        [package] => Ok(*package),
-        [] => Err(format!("crate '{crate_name}' not found in cargo metadata")),
-        many => Err(format!(
-            "crate '{crate_name}' is ambiguous: {}",
-            many.iter()
-                .map(|pkg| format!("{} {}", pkg.name, pkg.version))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
-    }
+    packages
+        .iter()
+        .find(|pkg| &pkg.id == package_id)
+        .ok_or_else(|| format!("direct dependency '{crate_name}' missing from cargo metadata"))
 }
 
 #[cfg(test)]
@@ -106,13 +81,11 @@ mod tests {
     }
 
     #[test]
-    fn detects_std_crates_and_builds_rust_src_path() {
+    fn detects_unsupported_rust_library_crates() {
         assert!(is_rust_library_crate("std"));
         assert!(is_rust_library_crate("core"));
         assert!(is_rust_library_crate("alloc"));
         assert!(!is_rust_library_crate("syn"));
-        let path = rust_library_src("std").unwrap();
-        assert!(path.ends_with("library/std/src"));
     }
 
     #[test]
@@ -136,14 +109,14 @@ mod tests {
         let package = package_for_manifest(&metadata, Path::new("Cargo.toml")).unwrap();
         let deps = package_dependencies(&metadata, &package.id);
 
-        let missing = resolve_package(&metadata.packages, &deps, "definitely_missing_crate").unwrap_err();
-        assert!(missing.contains("not found"));
+        let missing =
+            resolve_package(&metadata.packages, &deps, "definitely_missing_crate").unwrap_err();
+        assert!(missing.contains("not a direct dependency"));
 
-        let syn = resolve_package(&metadata.packages, &deps, "syn").unwrap().clone();
-        let mut ambiguous_packages = vec![syn.clone(), syn];
-        ambiguous_packages[1].version = "999.0.0".parse().unwrap();
-        let ambiguous = resolve_package(&ambiguous_packages, &HashMap::new(), "syn").unwrap_err();
-        assert!(ambiguous.contains("ambiguous"));
+        let mut broken_deps = deps.clone();
+        broken_deps.insert("missing_syn".into(), deps["syn"].clone());
+        let missing_metadata = resolve_package(&[], &broken_deps, "missing_syn").unwrap_err();
+        assert!(missing_metadata.contains("missing from cargo metadata"));
 
         let no_lib = library_root(package).unwrap_err();
         assert!(no_lib.contains("no library target"));
@@ -156,7 +129,9 @@ mod tests {
     #[test]
     fn dependency_lookup_is_empty_for_unknown_package_id() {
         let metadata = metadata();
-        let fake = PackageId { repr: "path+file:///missing#0.0.0".to_string() };
+        let fake = PackageId {
+            repr: "path+file:///missing#0.0.0".to_string(),
+        };
         assert!(package_dependencies(&metadata, &fake).is_empty());
     }
 }

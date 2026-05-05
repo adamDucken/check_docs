@@ -123,4 +123,26 @@ mod tests {
         let err = parse_use_line("use syn::*;").unwrap_err();
         assert_eq!(err, "glob imports are not supported");
     }
+
+    #[test]
+    fn rejects_absolute_and_too_short_paths() {
+        let err = parse_use_line("use ::syn::ItemUse;").unwrap_err();
+        assert_eq!(err, "absolute use paths with leading `::` are not supported");
+
+        let err = parse_use_line("use syn;").unwrap_err();
+        assert!(err.contains("expected external use path"));
+
+        let err = parse_use_line("use self::Thing;").unwrap_err();
+        assert_eq!(err, "only external crate use paths are supported");
+    }
+
+    #[test]
+    fn full_path_joins_all_segments() {
+        let import = ImportPath {
+            crate_name: "tokio".into(),
+            segments: vec!["sync".into(), "mpsc".into()],
+            item: "Sender".into(),
+        };
+        assert_eq!(import.full_path(), "tokio::sync::mpsc::Sender");
+    }
 }

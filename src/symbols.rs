@@ -1,4 +1,4 @@
-use crate::imports::{ImportPath, collect_use_paths};
+use crate::imports::ImportPath;
 use crate::resolver::resolve_package;
 use cargo_metadata::{Package, PackageId};
 use quote::ToTokens;
@@ -107,13 +107,14 @@ pub(crate) fn add_reexported_matches(
     matches: &mut Vec<SymbolDoc>,
 ) -> Result<(), String> {
     for path in collect_reexports(root_file, import)? {
-        if path.len() < 2 || path.last() != Some(&import.item) {
+        if path.len() < 2 {
             continue;
         }
         let crate_name = path[0].replace('-', "_");
         if matches!(crate_name.as_str(), "crate" | "self") {
+            let item_name = path.last().expect("reexport path is non-empty");
             let segments = &path[1..path.len() - 1];
-            for mut doc in find_symbols_internal(root_file, &import.item, segments)? {
+            for mut doc in find_symbols_internal(root_file, item_name, segments)? {
                 doc.reexported = true;
                 matches.push(doc);
             }
@@ -123,8 +124,9 @@ pub(crate) fn add_reexported_matches(
             continue;
         }
         let Ok(package) = resolve_package(packages, dependencies, &crate_name) else {
+            let item_name = path.last().expect("reexport path is non-empty");
             let segments = &path[..path.len() - 1];
-            for mut doc in find_symbols_internal(root_file, &import.item, segments)? {
+            for mut doc in find_symbols_internal(root_file, item_name, segments)? {
                 doc.reexported = true;
                 matches.push(doc);
             }
@@ -141,8 +143,9 @@ pub(crate) fn add_reexported_matches(
         if !root_file.exists() {
             continue;
         }
+        let item_name = path.last().expect("reexport path is non-empty");
         let segments = &path[1..path.len() - 1];
-        for mut doc in find_symbols(&root_file, &import.item, segments)? {
+        for mut doc in find_symbols(&root_file, item_name, segments)? {
             doc.reexported = true;
             matches.push(doc);
         }
@@ -165,24 +168,47 @@ fn collect_reexports_from_items(
     for item in items {
         match item {
             syn::Item::Use(item) if matches!(item.vis, syn::Visibility::Public(_)) => {
-                let mut paths = Vec::new();
-                if collect_use_paths(&item.tree, Vec::new(), &mut paths).is_ok() {
-                    out.extend(
-                        paths
-                            .into_iter()
-                            .filter(|path| path.last().is_some_and(|last| last == target)),
-                    );
-                }
-            }
-            syn::Item::Mod(module) => {
-                if let Some((_, items)) = &module.content {
-                    collect_reexports_from_items(items, target, out)?;
-                }
+                collect_reexport_use_paths(&item.tree, Vec::new(), target, out)?;
             }
             _ => {}
         }
     }
     Ok(())
+}
+
+fn collect_reexport_use_paths(
+    tree: &syn::UseTree,
+    mut prefix: Vec<String>,
+    target: &str,
+    out: &mut Vec<Vec<String>>,
+) -> Result<(), String> {
+    match tree {
+        syn::UseTree::Path(path) => {
+            prefix.push(path.ident.to_string());
+            collect_reexport_use_paths(&path.tree, prefix, target, out)
+        }
+        syn::UseTree::Name(name) => {
+            prefix.push(name.ident.to_string());
+            if prefix.last().is_some_and(|last| last == target) {
+                out.push(prefix);
+            }
+            Ok(())
+        }
+        syn::UseTree::Rename(rename) => {
+            if rename.rename == target {
+                prefix.push(rename.ident.to_string());
+                out.push(prefix);
+            }
+            Ok(())
+        }
+        syn::UseTree::Glob(_) => Err("glob imports are not supported".to_string()),
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                collect_reexport_use_paths(item, prefix.clone(), target, out)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 struct LoadedModule {
@@ -1010,4 +1036,232 @@ fn rust_files(root: &Path) -> Vec<PathBuf> {
         .collect();
     files.sort();
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write(path: &Path, text: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn resolves_public_module_path_and_item_kinds() {
+        let dir = TempDir::new().unwrap();
+        let dir = dir.path();
+        let lib = dir.join("lib.rs");
+        write(&lib, "pub mod api; mod private;");
+        write(
+            &dir.join("api.rs"),
+            r#"
+            /// docs
+            #[derive(Clone, Debug)]
+            pub struct Config<T> where T: Clone { pub name: String, value: T }
+            pub enum Mode { Fast, Slow(u8), Named { yes: bool } }
+            pub trait Worker: Send { type Job; const ID: u8; fn run(&self); }
+            pub type Alias = Result<(), ()>;
+            pub const LIMIT: usize = 3;
+            pub static FLAG: bool = true;
+            pub union Bits { pub i: u32, f: f32 }
+            pub fn make() -> Config<u8> { todo!() }
+            struct Hidden;
+            "#,
+        );
+        write(&dir.join("private.rs"), "pub struct Config;");
+
+        let segment = vec!["api".to_string()];
+        for (name, kind) in [
+            ("Config", "struct"),
+            ("Mode", "enum"),
+            ("Worker", "trait"),
+            ("Alias", "type"),
+            ("LIMIT", "const"),
+            ("FLAG", "static"),
+            ("Bits", "union"),
+            ("make", "fn"),
+        ] {
+            let docs = find_symbols(&lib, name, &segment).unwrap();
+            assert_eq!(docs[0].kind, kind);
+            assert!(docs[0].public);
+        }
+        assert!(find_symbols(&lib, "Hidden", &segment).unwrap().is_empty());
+        assert!(find_symbols(&lib, "Config", &["private".to_string()]).is_err());
+    }
+
+    #[test]
+    fn resolves_inline_and_path_modules_and_reexports() {
+        let dir = TempDir::new().unwrap();
+        let dir = dir.path();
+        let lib = dir.join("lib.rs");
+        write(
+            &lib,
+            r#"
+            mod hidden { pub struct Secret; }
+            pub use hidden::Secret;
+            #[path = "actual.rs"] pub mod renamed;
+            pub mod inline { pub struct Inside; }
+            "#,
+        );
+        write(&dir.join("actual.rs"), "pub struct Actual;");
+
+        let import = ImportPath { crate_name: "x".into(), segments: vec![], item: "Secret".into() };
+        let mut matches = Vec::new();
+        add_reexported_matches(&lib, &import, &[], &HashMap::new(), &mut matches).unwrap();
+        assert_eq!(matches[0].name, "Secret");
+        assert!(matches[0].reexported);
+
+        assert_eq!(find_symbols(&lib, "Actual", &["renamed".into()]).unwrap()[0].name, "Actual");
+        assert_eq!(find_symbols(&lib, "Inside", &["inline".into()]).unwrap()[0].name, "Inside");
+    }
+
+    #[test]
+    fn reexport_negative_and_alias_cases() {
+        let dir = TempDir::new().unwrap();
+        let dir = dir.path();
+        let lib = dir.join("lib.rs");
+        write(
+            &lib,
+            r#"
+            mod hidden { pub struct Secret; pub struct Original; }
+            pub mod nested { pub use super::hidden::Secret; }
+            pub use hidden::Original as PublicAlias;
+            mod private_inline { pub struct Boundary; }
+            "#,
+        );
+
+        let nested_parent_import = ImportPath {
+            crate_name: "x".into(),
+            segments: vec![],
+            item: "Secret".into(),
+        };
+        let mut matches = Vec::new();
+        add_reexported_matches(&lib, &nested_parent_import, &[], &HashMap::new(), &mut matches)
+            .unwrap();
+        assert!(matches.is_empty(), "nested pub use leaked into parent import");
+
+        let alias_import = ImportPath {
+            crate_name: "x".into(),
+            segments: vec![],
+            item: "PublicAlias".into(),
+        };
+        add_reexported_matches(&lib, &alias_import, &[], &HashMap::new(), &mut matches).unwrap();
+        assert_eq!(matches[0].name, "Original");
+        assert!(matches[0].reexported);
+
+        assert!(find_symbols(&lib, "Boundary", &["private_inline".into()]).is_err());
+    }
+
+    #[test]
+    fn lossy_scan_and_macro_helpers_work() {
+        let dir = TempDir::new().unwrap();
+        let dir = dir.path();
+        write(&dir.join("a.rs"), "/// bad\npub struct Bad {\n");
+        write(
+            &dir.join("b.rs"),
+            r#"
+            macro_rules! m { () => {
+                #[doc = "macro docs"]
+                #[derive(Clone, Copy)]
+                pub enum Generated { A, B(u8) }
+            }}
+            "#,
+        );
+        let docs = find_symbols_lossy(&dir, "Bad").unwrap();
+        assert_eq!(docs[0].kind, "struct");
+
+        let source = std::fs::read_to_string(dir.join("b.rs")).unwrap();
+        let parsed = syn::parse_file(&source).unwrap();
+        let mut out = Vec::new();
+        collect_items_recursive(&dir.join("b.rs"), &parsed.items, "Generated", &mut out);
+        assert_eq!(out[0].kind, "enum");
+        assert!(out[0].definition.contains("Generated"));
+        assert!(out[0].docs.iter().any(|line| line.contains("macro docs")));
+        assert!(out[0].derives.iter().any(|line| line.contains("Clone")));
+    }
+
+    #[test]
+    fn external_reexports_and_reexport_errors() {
+        let dir = TempDir::new().unwrap();
+        let dir = dir.path();
+        let lib = dir.join("lib.rs");
+        write(&lib, "pub use cargo_metadata::MetadataCommand;");
+        let glob_lib = dir.join("glob.rs");
+        write(&glob_lib, "pub use syn::*;");
+
+        let metadata = cargo_metadata::MetadataCommand::new()
+            .manifest_path("Cargo.toml")
+            .exec()
+            .unwrap();
+        let root = metadata.root_package().unwrap();
+        let deps = crate::resolver::package_dependencies(&metadata, &root.id);
+        let import = ImportPath { crate_name: "x".into(), segments: vec![], item: "MetadataCommand".into() };
+        let mut matches = Vec::new();
+        add_reexported_matches(&lib, &import, &metadata.packages, &deps, &mut matches).unwrap();
+        assert_eq!(matches[0].name, "MetadataCommand");
+        assert!(matches[0].reexported);
+
+        let glob = ImportPath { crate_name: "x".into(), segments: vec![], item: "Nope".into() };
+        assert!(add_reexported_matches(&glob_lib, &glob, &metadata.packages, &deps, &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn module_files_parse_errors_and_macro_branches() {
+        let dir = TempDir::new().unwrap();
+        let dir = dir.path();
+        let lib = dir.join("lib.rs");
+        write(&lib, "pub mod outer;");
+        write(&dir.join("outer/mod.rs"), "pub struct FromModRs;");
+        assert_eq!(find_symbols(&lib, "FromModRs", &["outer".into()]).unwrap()[0].name, "FromModRs");
+
+        write(&dir.join("bad.rs"), "pub struct Nope {");
+        assert!(find_symbols_with_parse_mode(dir, "Nope", false).unwrap_err().contains("failed to parse"));
+        assert!(find_symbols_lossy(dir, "Missing").unwrap().is_empty());
+
+        let macro_source = r#"
+            macro_rules! s { () => { pub struct MadeStruct { pub id: usize } } }
+            macro_rules! t { () => { pub trait MadeTrait { fn go(&self); } } }
+            macro_rules! private { () => { struct PrivateMade { id: usize } } }
+            macro_rules! none { () => { pub fn ignored() {} } }
+        "#;
+        let parsed = syn::parse_file(macro_source).unwrap();
+        let mut structs = Vec::new();
+        collect_items_recursive(&lib, &parsed.items, "MadeStruct", &mut structs);
+        assert_eq!(structs[0].kind, "struct");
+        let mut traits = Vec::new();
+        collect_items_recursive(&lib, &parsed.items, "MadeTrait", &mut traits);
+        assert_eq!(traits[0].kind, "trait");
+        let mut private = Vec::new();
+        collect_items_recursive(&lib, &parsed.items, "PrivateMade", &mut private);
+        assert!(!private[0].public);
+        let mut none = Vec::new();
+        collect_items_recursive(&lib, &parsed.items, "NotThere", &mut none);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn ranking_prefers_reexported_public_module_hits() {
+        let import = ImportPath { crate_name: "x".into(), segments: vec!["api".into()], item: "Thing".into() };
+        let mut docs = vec![
+            SymbolDoc { path: PathBuf::from("src/other.rs"), line: 2, kind: "struct", name: "Thing".into(), definition: String::new(), details: Vec::new(), docs: Vec::new(), derives: Vec::new(), public: false, reexported: false },
+            SymbolDoc { path: PathBuf::from("src/api.rs"), line: 1, kind: "struct", name: "Thing".into(), definition: String::new(), details: Vec::new(), docs: Vec::new(), derives: Vec::new(), public: true, reexported: true },
+        ];
+        rank_matches(&mut docs, &import);
+        assert!(docs[0].reexported);
+    }
+
+    #[test]
+    fn formatting_helpers_cover_edge_cases() {
+        assert_eq!(normalize_tokens("# [cfg(test)]".into()), "#[cfg(test)]");
+        assert_eq!(balanced_body("{a,{b},c} tail"), "a,{b},c");
+        assert_eq!(split_top_level("a, b(c,d), e { f, g }").len(), 3);
+        assert_eq!(read_token_string("a\\n\\\"b\" rest").unwrap().0, "a\n\"b");
+        assert!(macro_derives("#[derive(Clone, Debug)] struct X;").contains(&"Clone".into()));
+        assert!(doc_lines(&[]).is_empty());
+        assert!(derive_lines(&[]).is_empty());
+    }
 }

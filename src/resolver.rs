@@ -91,3 +91,72 @@ pub(crate) fn resolve_package<'a>(
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cargo_metadata::MetadataCommand;
+    use tempfile::TempDir;
+
+    fn metadata() -> Metadata {
+        MetadataCommand::new()
+            .manifest_path("Cargo.toml")
+            .exec()
+            .unwrap()
+    }
+
+    #[test]
+    fn detects_std_crates_and_builds_rust_src_path() {
+        assert!(is_rust_library_crate("std"));
+        assert!(is_rust_library_crate("core"));
+        assert!(is_rust_library_crate("alloc"));
+        assert!(!is_rust_library_crate("syn"));
+        let path = rust_library_src("std").unwrap();
+        assert!(path.ends_with("library/std/src"));
+    }
+
+    #[test]
+    fn resolves_package_for_exact_manifest_and_its_dependencies() {
+        let metadata = metadata();
+        let package = package_for_manifest(&metadata, Path::new("Cargo.toml")).unwrap();
+        assert_eq!(package.name, "check_docs");
+
+        let deps = package_dependencies(&metadata, &package.id);
+        assert!(deps.contains_key("syn"));
+        assert!(deps.contains_key("cargo_metadata"));
+
+        let syn = resolve_package(&metadata.packages, &deps, "syn").unwrap();
+        assert_eq!(syn.name, "syn");
+        assert!(library_root(syn).unwrap().ends_with("src/lib.rs"));
+    }
+
+    #[test]
+    fn resolver_error_paths_are_explicit() {
+        let metadata = metadata();
+        let package = package_for_manifest(&metadata, Path::new("Cargo.toml")).unwrap();
+        let deps = package_dependencies(&metadata, &package.id);
+
+        let missing = resolve_package(&metadata.packages, &deps, "definitely_missing_crate").unwrap_err();
+        assert!(missing.contains("not found"));
+
+        let syn = resolve_package(&metadata.packages, &deps, "syn").unwrap().clone();
+        let mut ambiguous_packages = vec![syn.clone(), syn];
+        ambiguous_packages[1].version = "999.0.0".parse().unwrap();
+        let ambiguous = resolve_package(&ambiguous_packages, &HashMap::new(), "syn").unwrap_err();
+        assert!(ambiguous.contains("ambiguous"));
+
+        let no_lib = library_root(package).unwrap_err();
+        assert!(no_lib.contains("no library target"));
+
+        let temp = TempDir::new().unwrap();
+        let bad = package_for_manifest(&metadata, &temp.path().join("Cargo.toml")).unwrap_err();
+        assert!(bad.contains("failed to canonicalize"));
+    }
+
+    #[test]
+    fn dependency_lookup_is_empty_for_unknown_package_id() {
+        let metadata = metadata();
+        let fake = PackageId { repr: "path+file:///missing#0.0.0".to_string() };
+        assert!(package_dependencies(&metadata, &fake).is_empty());
+    }
+}

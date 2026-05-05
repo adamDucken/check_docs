@@ -190,3 +190,51 @@ fn looks_like_module_name(name: &str) -> bool {
     name.chars()
         .all(|ch| ch.is_ascii_lowercase() || ch == '_' || ch.is_ascii_digit())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(name: &str, docs: Vec<String>) -> SymbolDoc {
+        SymbolDoc {
+            path: Path::new("/tmp/src/lib.rs").to_path_buf(),
+            line: 7,
+            kind: "struct",
+            name: name.into(),
+            definition: format!("pub struct {name};"),
+            details: vec!["field: usize".into()],
+            docs,
+            derives: vec!["Debug".into()],
+            public: true,
+            reexported: false,
+        }
+    }
+
+    #[test]
+    fn not_found_message_handles_modules_and_plain_items() {
+        let module = ImportPath {
+            crate_name: "tokio".into(),
+            segments: vec!["sync".into()],
+            item: "mpsc".into(),
+        };
+        let message = not_found_message(&module, "tokio", Some("1.0.0"), Path::new("/src"));
+        assert!(message.contains("appears to be a module"));
+        assert!(message.contains("tokio::sync::mpsc::Sender"));
+
+        let item = ImportPath { crate_name: "x".into(), segments: vec![], item: "Thing".into() };
+        let message = not_found_message(&item, "x", None, Path::new("/src"));
+        assert!(!message.contains("appears to be a module"));
+        assert!(looks_like_module_name("module_2"));
+        assert!(!looks_like_module_name("TypeName"));
+    }
+
+    #[test]
+    fn print_report_covers_output_branches() {
+        let import = ImportPath { crate_name: "x".into(), segments: vec![], item: "Thing".into() };
+        let src = Path::new("/tmp/src");
+        let first = doc("Thing", vec!["docs".into()]);
+        let second = doc("Thing", Vec::new());
+        print_report("x", Some("1.2.3"), src, "use x::Thing;", &import, &[first, second], &doc("Thing", vec!["docs".into()]));
+        print_report("x", None, src, "use x::Thing;", &import, &[doc("Thing", Vec::new())], &doc("Thing", Vec::new()));
+    }
+}

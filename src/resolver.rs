@@ -1,6 +1,12 @@
-use cargo_metadata::{Metadata, Package, PackageId};
+use cargo_metadata::{Metadata, Package, PackageId, Target};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+#[derive(Debug)]
+pub(crate) struct ResolvedDependency<'a> {
+    pub(crate) package: &'a Package,
+    pub(crate) target: &'a Target,
+}
 
 pub(crate) fn is_rust_library_crate(crate_name: &str) -> bool {
     matches!(crate_name, "std" | "core" | "alloc")
@@ -41,30 +47,40 @@ pub(crate) fn package_dependencies(
     deps
 }
 
-pub(crate) fn library_root(package: &Package) -> Result<PathBuf, String> {
-    package
-        .targets
-        .iter()
-        .find(|target| target.kind.iter().any(|kind| kind == "lib"))
-        .map(|target| target.src_path.as_std_path().to_path_buf())
-        .ok_or_else(|| format!("package {} has no library target", package.name))
-}
-
-pub(crate) fn resolve_package<'a>(
+pub(crate) fn resolve_dependency<'a>(
     packages: &'a [Package],
     dependencies: &HashMap<String, PackageId>,
     crate_name: &str,
-) -> Result<&'a Package, String> {
+) -> Result<ResolvedDependency<'a>, String> {
     let Some(package_id) = dependencies.get(crate_name) else {
         return Err(format!(
             "crate '{crate_name}' is not a direct dependency of the selected package"
         ));
     };
 
-    packages
+    let package = packages
         .iter()
         .find(|pkg| &pkg.id == package_id)
-        .ok_or_else(|| format!("direct dependency '{crate_name}' missing from cargo metadata"))
+        .ok_or_else(|| format!("direct dependency '{crate_name}' missing from cargo metadata"))?;
+    let target = library_target(package)?;
+    Ok(ResolvedDependency { package, target })
+}
+
+pub(crate) fn library_target(package: &Package) -> Result<&Target, String> {
+    package
+        .targets
+        .iter()
+        .find(|target| {
+            target
+                .kind
+                .iter()
+                .any(|kind| kind == "lib" || kind == "proc-macro")
+        })
+        .ok_or_else(|| format!("package {} has no doc-able library target", package.name))
+}
+
+pub(crate) fn package_spec(package: &Package) -> String {
+    format!("{}@{}", package.name, package.version)
 }
 
 #[cfg(test)]
@@ -95,12 +111,11 @@ mod tests {
         assert_eq!(package.name, "check_docs");
 
         let deps = package_dependencies(&metadata, &package.id);
-        assert!(deps.contains_key("syn"));
         assert!(deps.contains_key("cargo_metadata"));
 
-        let syn = resolve_package(&metadata.packages, &deps, "syn").unwrap();
-        assert_eq!(syn.name, "syn");
-        assert!(library_root(syn).unwrap().ends_with("src/lib.rs"));
+        let dep = resolve_dependency(&metadata.packages, &deps, "cargo_metadata").unwrap();
+        assert_eq!(dep.package.name, "cargo_metadata");
+        assert!(library_target(dep.package).is_ok());
     }
 
     #[test]
@@ -110,16 +125,16 @@ mod tests {
         let deps = package_dependencies(&metadata, &package.id);
 
         let missing =
-            resolve_package(&metadata.packages, &deps, "definitely_missing_crate").unwrap_err();
+            resolve_dependency(&metadata.packages, &deps, "definitely_missing_crate").unwrap_err();
         assert!(missing.contains("not a direct dependency"));
 
         let mut broken_deps = deps.clone();
-        broken_deps.insert("missing_syn".into(), deps["syn"].clone());
-        let missing_metadata = resolve_package(&[], &broken_deps, "missing_syn").unwrap_err();
+        broken_deps.insert("missing_dep".into(), deps["cargo_metadata"].clone());
+        let missing_metadata = resolve_dependency(&[], &broken_deps, "missing_dep").unwrap_err();
         assert!(missing_metadata.contains("missing from cargo metadata"));
 
-        let no_lib = library_root(package).unwrap_err();
-        assert!(no_lib.contains("no library target"));
+        let no_lib = library_target(package).unwrap_err();
+        assert!(no_lib.contains("no doc-able library target"));
 
         let temp = TempDir::new().unwrap();
         let bad = package_for_manifest(&metadata, &temp.path().join("Cargo.toml")).unwrap_err();

@@ -1,13 +1,12 @@
 use crate::imports::ImportPath;
-use crate::resolver::resolve_package;
-use cargo_metadata::{Package, PackageId};
-use quote::ToTokens;
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use syn::spanned::Spanned;
-use walkdir::WalkDir;
+use rustdoc_types::{
+    Crate, GenericParamDefKind, Id, Item, ItemEnum, MacroKind, StructKind, Type, VariantKind,
+    Visibility,
+};
+use std::collections::HashSet;
+use std::path::PathBuf;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct SymbolDoc {
     pub(crate) path: PathBuf,
     pub(crate) line: usize,
@@ -17,1691 +16,1075 @@ pub(crate) struct SymbolDoc {
     pub(crate) details: Vec<String>,
     pub(crate) docs: Vec<String>,
     pub(crate) derives: Vec<String>,
-    pub(crate) public: bool,
-    pub(crate) reexported: bool,
 }
 
-pub(crate) fn find_symbols(
-    root_file: &Path,
-    target: &str,
-    module_segments: &[String],
-) -> Result<Vec<SymbolDoc>, String> {
-    let module = resolve_module(root_file, module_segments, true)?;
-    let mut out = Vec::new();
-    collect_items_direct(&module.path, &module.items, target, &mut out);
-    out.retain(|doc| doc.public);
-    Ok(out)
+pub(crate) fn find_symbol(krate: &Crate, import: &ImportPath) -> Result<SymbolDoc, String> {
+    let mut current = krate.root;
+    let mut parts = import.segments.clone();
+    parts.push(import.item.clone());
+
+    for (index, part) in parts.iter().enumerate() {
+        let is_last = index + 1 == parts.len();
+        current = find_child(krate, current, part, is_last, &mut HashSet::new())?;
+        current = follow_use(krate, current, &mut HashSet::new())?;
+        if !is_last && !matches!(item(krate, current)?.inner, ItemEnum::Module(_)) {
+            return Err(format!("path segment '{part}' resolved to non-module item"));
+        }
+    }
+
+    let item = item(krate, current)?;
+    Ok(format_item(krate, item))
 }
 
-pub(crate) fn find_symbols_lossy(src: &Path, target: &str) -> Result<Vec<SymbolDoc>, String> {
-    find_symbols_with_parse_mode(src, target, true)
-}
+fn find_child(
+    krate: &Crate,
+    module_id: Id,
+    name: &str,
+    is_last: bool,
+    visited: &mut HashSet<Id>,
+) -> Result<Id, String> {
+    if !visited.insert(module_id) {
+        return Err(format!("cycle while resolving '{name}'"));
+    }
+    let module_item = item(krate, module_id)?;
+    let ItemEnum::Module(module) = &module_item.inner else {
+        return Err(format!(
+            "item '{}' is not a module",
+            module_item.name.clone().unwrap_or_default()
+        ));
+    };
 
-fn find_symbols_with_parse_mode(
-    src: &Path,
-    target: &str,
-    skip_parse_errors: bool,
-) -> Result<Vec<SymbolDoc>, String> {
-    let mut out = Vec::new();
-    for file in rust_files(src) {
-        let source = std::fs::read_to_string(&file)
-            .map_err(|err| format!("failed to read {}: {err}", file.display()))?;
-        let parsed = match syn::parse_file(&source) {
-            Ok(parsed) => parsed,
-            Err(err) if skip_parse_errors => {
-                if let Some(doc) = fallback_rust_src_doc(file.clone(), &source, target) {
-                    out.push(doc);
-                } else {
-                    eprintln!(
-                        "check-docs: warning: skipped unparsable Rust source file {}: {err}",
-                        file.display()
-                    );
+    for child_id in &module.items {
+        let child = item(krate, *child_id)?;
+        if !is_public(child) {
+            continue;
+        }
+        if exported_name(child).as_deref() == Some(name) {
+            return Ok(*child_id);
+        }
+    }
+
+    for child_id in &module.items {
+        let child = item(krate, *child_id)?;
+        if !is_public(child) {
+            continue;
+        }
+        let ItemEnum::Use(use_item) = &child.inner else {
+            continue;
+        };
+        if use_item.is_glob {
+            let Some(glob_id) = use_item.id else {
+                if is_last {
+                    return Err(format!(
+                        "glob import '{}' has no resolved id",
+                        use_item.source
+                    ));
                 }
                 continue;
-            }
-            Err(err) => return Err(format!("failed to parse {}: {err}", file.display())),
-        };
-        collect_items_recursive(&file, &parsed.items, target, &mut out);
-    }
-    Ok(out)
-}
-
-fn fallback_rust_src_doc(path: PathBuf, source: &str, target: &str) -> Option<SymbolDoc> {
-    let needles = [
-        ("struct", format!("struct {target}")),
-        ("enum", format!("enum {target}")),
-        ("trait", format!("trait {target}")),
-        ("type", format!("type {target}")),
-        ("fn", format!("fn {target}")),
-    ];
-    for (kind, needle) in needles {
-        let Some((line_index, line)) = source
-            .lines()
-            .enumerate()
-            .find(|(_, line)| line.contains(&needle))
-        else {
-            continue;
-        };
-        let public = line.contains(&format!("pub {needle}"));
-        return Some(SymbolDoc {
-            path,
-            line: line_index + 1,
-            kind,
-            name: target.to_string(),
-            definition: line.trim().to_string(),
-            details: Vec::new(),
-            docs: Vec::new(),
-            derives: Vec::new(),
-            public,
-            reexported: false,
-        });
-    }
-    None
-}
-
-pub(crate) fn add_reexported_matches(
-    root_file: &Path,
-    import: &ImportPath,
-    packages: &[Package],
-    dependencies: &HashMap<String, PackageId>,
-    matches: &mut Vec<SymbolDoc>,
-) -> Result<(), String> {
-    let mut visited = HashSet::new();
-    if let Ok(mut docs) = resolve_reexports_in_module(
-        root_file,
-        &import.segments,
-        &import.item,
-        packages,
-        dependencies,
-        &mut visited,
-    ) {
-        matches.append(&mut docs);
-    }
-    add_reexported_module_path_matches(root_file, import, packages, dependencies, matches)?;
-    Ok(())
-}
-
-fn add_reexported_module_path_matches(
-    root_file: &Path,
-    import: &ImportPath,
-    packages: &[Package],
-    dependencies: &HashMap<String, PackageId>,
-    matches: &mut Vec<SymbolDoc>,
-) -> Result<(), String> {
-    for index in 0..import.segments.len() {
-        let parent_segments = &import.segments[..index];
-        let alias = &import.segments[index];
-        let remaining_segments = &import.segments[index + 1..];
-        let Ok(module) = resolve_module(root_file, parent_segments, false) else {
-            continue;
-        };
-        let mut paths = Vec::new();
-        collect_reexported_module_paths(&module.items, alias, &mut paths)?;
-        for path in paths {
-            let mut full_path = path.clone();
-            full_path.extend_from_slice(remaining_segments);
-            full_path.push(import.item.clone());
-            let Ok((target_root, target_segments)) = resolve_path_root(
-                root_file,
-                parent_segments,
-                &full_path,
-                packages,
-                dependencies,
-            ) else {
-                continue;
             };
-            push_resolved_docs(&target_root, &import.item, &target_segments, matches);
-            let mut visited = HashSet::new();
-            if let Ok(mut docs) = resolve_reexports_in_module(
-                &target_root,
-                &target_segments,
-                &import.item,
-                packages,
-                dependencies,
-                &mut visited,
-            ) {
-                matches.append(&mut docs);
+            let target = follow_use(krate, glob_id, &mut HashSet::new())?;
+            if matches!(item(krate, target)?.inner, ItemEnum::Module(_))
+                && let Ok(found) = find_child(krate, target, name, is_last, visited)
+            {
+                return Ok(found);
             }
         }
     }
-    Ok(())
+
+    Err(format!(
+        "'{name}' not found under {}",
+        path_label(krate, module_id)
+    ))
 }
 
-fn collect_reexported_module_paths(
-    items: &[syn::Item],
-    alias: &str,
-    out: &mut Vec<Vec<String>>,
-) -> Result<(), String> {
-    for item in items {
-        if let syn::Item::Use(item) = item
-            && matches!(item.vis, syn::Visibility::Public(_))
-        {
-            collect_reexport_module_use_paths(&item.tree, Vec::new(), alias, out)?;
+fn follow_use(krate: &Crate, mut id: Id, visited: &mut HashSet<Id>) -> Result<Id, String> {
+    loop {
+        if !visited.insert(id) {
+            return Err("cycle while following rustdoc use item".to_string());
         }
-    }
-    Ok(())
-}
-
-fn collect_reexport_module_use_paths(
-    tree: &syn::UseTree,
-    mut prefix: Vec<String>,
-    alias: &str,
-    out: &mut Vec<Vec<String>>,
-) -> Result<(), String> {
-    match tree {
-        syn::UseTree::Path(path) => {
-            prefix.push(path.ident.to_string());
-            collect_reexport_module_use_paths(&path.tree, prefix, alias, out)
-        }
-        syn::UseTree::Name(name) => {
-            if name.ident == alias {
-                prefix.push(name.ident.to_string());
-                out.push(prefix);
-            }
-            Ok(())
-        }
-        syn::UseTree::Rename(rename) => {
-            if rename.rename == alias {
-                prefix.push(rename.ident.to_string());
-                out.push(prefix);
-            }
-            Ok(())
-        }
-        syn::UseTree::Glob(_) => Ok(()),
-        syn::UseTree::Group(group) => {
-            for item in &group.items {
-                collect_reexport_module_use_paths(item, prefix.clone(), alias, out)?;
-            }
-            Ok(())
-        }
-    }
-}
-
-fn resolve_reexports_in_module(
-    root_file: &Path,
-    module_segments: &[String],
-    target: &str,
-    packages: &[Package],
-    dependencies: &HashMap<String, PackageId>,
-    visited: &mut HashSet<String>,
-) -> Result<Vec<SymbolDoc>, String> {
-    let key = format!(
-        "{}::{}::{}",
-        root_file.display(),
-        module_segments.join("::"),
-        target
-    );
-    if !visited.insert(key) {
-        return Ok(Vec::new());
-    }
-
-    let module = resolve_module(root_file, module_segments, false)?;
-    let mut out = Vec::new();
-    for item in module.items {
-        let syn::Item::Use(item) = item else {
-            continue;
+        let current = item(krate, id)?;
+        let ItemEnum::Use(use_item) = &current.inner else {
+            return Ok(id);
         };
-        if !matches!(item.vis, syn::Visibility::Public(_)) {
-            continue;
-        }
-        collect_reexport_use_matches(
-            root_file,
-            module_segments,
-            &item.tree,
+        let Some(next) = use_item.id else {
+            return Err(format!("use '{}' has no resolved id", use_item.source));
+        };
+        id = next;
+    }
+}
+
+fn item(krate: &Crate, id: Id) -> Result<&Item, String> {
+    krate
+        .index
+        .get(&id)
+        .ok_or_else(|| format!("rustdoc item id {:?} missing from index", id))
+}
+
+fn exported_name(item: &Item) -> Option<String> {
+    match &item.inner {
+        ItemEnum::Use(use_item) => Some(use_item.name.clone()),
+        _ => item.name.clone(),
+    }
+}
+
+fn is_public(item: &Item) -> bool {
+    matches!(item.visibility, Visibility::Public | Visibility::Default)
+}
+
+fn path_label(krate: &Crate, id: Id) -> String {
+    krate
+        .paths
+        .get(&id)
+        .map(|summary| summary.path.join("::"))
+        .or_else(|| krate.index.get(&id).and_then(|item| item.name.clone()))
+        .unwrap_or_else(|| format!("{:?}", id))
+}
+
+fn format_item(krate: &Crate, item: &Item) -> SymbolDoc {
+    let name = item
+        .name
+        .clone()
+        .unwrap_or_else(|| exported_name(item).unwrap_or_default());
+    let (kind, definition, details) = match &item.inner {
+        ItemEnum::Struct(s) => (
+            "struct",
+            struct_def(krate, &name, s),
+            struct_details(krate, s),
+        ),
+        ItemEnum::Enum(e) => ("enum", enum_def(krate, &name, e), enum_details(krate, e)),
+        ItemEnum::Trait(t) => ("trait", trait_def(krate, &name, t), trait_details(krate, t)),
+        ItemEnum::Function(f) => ("fn", fn_def(&name, f), Vec::new()),
+        ItemEnum::TypeAlias(t) => (
+            "type",
+            format!(
+                "pub type {}{} = {};",
+                name,
+                generics(&t.generics),
+                type_str(&t.type_)
+            ),
             Vec::new(),
-            target,
-            packages,
-            dependencies,
-            visited,
-            &mut out,
-        )?;
-    }
-    Ok(out)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn collect_reexport_use_matches(
-    root_file: &Path,
-    current_segments: &[String],
-    tree: &syn::UseTree,
-    mut prefix: Vec<String>,
-    target: &str,
-    packages: &[Package],
-    dependencies: &HashMap<String, PackageId>,
-    visited: &mut HashSet<String>,
-    out: &mut Vec<SymbolDoc>,
-) -> Result<(), String> {
-    match tree {
-        syn::UseTree::Path(path) => {
-            prefix.push(path.ident.to_string());
-            collect_reexport_use_matches(
-                root_file,
-                current_segments,
-                &path.tree,
-                prefix,
-                target,
-                packages,
-                dependencies,
-                visited,
-                out,
-            )
-        }
-        syn::UseTree::Name(name) => {
-            if name.ident == target {
-                prefix.push(name.ident.to_string());
-                let _ = resolve_reexport_path(
-                    root_file,
-                    current_segments,
-                    &prefix,
-                    target,
-                    packages,
-                    dependencies,
-                    visited,
-                    out,
-                );
-            }
-            Ok(())
-        }
-        syn::UseTree::Rename(rename) => {
-            if rename.rename == target {
-                prefix.push(rename.ident.to_string());
-                let _ = resolve_reexport_path(
-                    root_file,
-                    current_segments,
-                    &prefix,
-                    &rename.ident.to_string(),
-                    packages,
-                    dependencies,
-                    visited,
-                    out,
-                );
-            }
-            Ok(())
-        }
-        syn::UseTree::Glob(_) => {
-            let _ = resolve_glob_reexport_path(
-                root_file,
-                current_segments,
-                &prefix,
-                target,
-                packages,
-                dependencies,
-                visited,
-                out,
-            );
-            Ok(())
-        }
-        syn::UseTree::Group(group) => {
-            for item in &group.items {
-                let _ = collect_reexport_use_matches(
-                    root_file,
-                    current_segments,
-                    item,
-                    prefix.clone(),
-                    target,
-                    packages,
-                    dependencies,
-                    visited,
-                    out,
-                );
-            }
-            Ok(())
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn resolve_reexport_path(
-    root_file: &Path,
-    current_segments: &[String],
-    path: &[String],
-    target: &str,
-    packages: &[Package],
-    dependencies: &HashMap<String, PackageId>,
-    visited: &mut HashSet<String>,
-    out: &mut Vec<SymbolDoc>,
-) -> Result<(), String> {
-    if path.len() < 2 {
-        return Ok(());
-    }
-    let (target_root, segments) =
-        resolve_path_root(root_file, current_segments, path, packages, dependencies)?;
-    let item_name = path.last().expect("reexport path is non-empty");
-    push_resolved_docs(&target_root, item_name, &segments, out);
-    if let Ok(mut nested) = resolve_reexports_in_module(
-        &target_root,
-        &segments,
-        target,
-        packages,
-        dependencies,
-        visited,
-    ) {
-        out.append(&mut nested);
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn resolve_glob_reexport_path(
-    root_file: &Path,
-    current_segments: &[String],
-    path: &[String],
-    target: &str,
-    packages: &[Package],
-    dependencies: &HashMap<String, PackageId>,
-    visited: &mut HashSet<String>,
-    out: &mut Vec<SymbolDoc>,
-) -> Result<(), String> {
-    if path.is_empty() {
-        return Ok(());
-    }
-    let mut full_path = path.to_vec();
-    full_path.push(target.to_string());
-    let (target_root, segments) = resolve_path_root(
-        root_file,
-        current_segments,
-        &full_path,
-        packages,
-        dependencies,
-    )?;
-    push_resolved_docs(&target_root, target, &segments, out);
-    if let Ok(mut nested) = resolve_reexports_in_module(
-        &target_root,
-        &segments,
-        target,
-        packages,
-        dependencies,
-        visited,
-    ) {
-        out.append(&mut nested);
-    }
-    Ok(())
-}
-
-fn push_resolved_docs(root_file: &Path, item: &str, segments: &[String], out: &mut Vec<SymbolDoc>) {
-    if let Ok(docs) = find_symbols_internal(root_file, item, segments) {
-        for mut doc in docs {
-            doc.reexported = true;
-            out.push(doc);
-        }
-        return;
-    }
-
-    let Some(src) = root_file.parent() else {
-        return;
-    };
-    let Ok(mut docs) = find_symbols_lossy(src, item) else {
-        return;
-    };
-    docs.retain(|doc| path_components_match(&doc.path, src, segments));
-    for mut doc in docs {
-        doc.reexported = true;
-        out.push(doc);
-    }
-}
-
-fn path_components_match(path: &Path, src: &Path, segments: &[String]) -> bool {
-    let Ok(relative) = path.strip_prefix(src) else {
-        return false;
-    };
-    let text = relative.display().to_string().replace('-', "_");
-    segments.iter().all(|segment| {
-        text.split(['/', '\\', '.'])
-            .any(|component| component == segment)
-    })
-}
-
-fn resolve_path_root(
-    root_file: &Path,
-    current_segments: &[String],
-    path: &[String],
-    packages: &[Package],
-    dependencies: &HashMap<String, PackageId>,
-) -> Result<(PathBuf, Vec<String>), String> {
-    let first = path[0].replace('-', "_");
-    match first.as_str() {
-        "crate" => Ok((
-            root_file.to_path_buf(),
-            normalize_relative_segments(&[], &path[1..path.len() - 1]),
-        )),
-        "self" => Ok((
-            root_file.to_path_buf(),
-            normalize_relative_segments(current_segments, &path[1..path.len() - 1]),
-        )),
-        "super" => Ok((
-            root_file.to_path_buf(),
-            normalize_relative_segments(current_segments, &path[..path.len() - 1]),
-        )),
-        crate_name => {
-            if let Ok(package) = resolve_package(packages, dependencies, crate_name)
-                && let Some(root) = package
-                    .targets
-                    .iter()
-                    .find(|target| target.kind.iter().any(|kind| kind == "lib"))
-                    .map(|target| target.src_path.as_std_path().to_path_buf())
-            {
-                return Ok((root, path[1..path.len() - 1].to_vec()));
-            }
-            Ok((
-                root_file.to_path_buf(),
-                normalize_relative_segments(current_segments, &path[..path.len() - 1]),
-            ))
-        }
-    }
-}
-
-fn normalize_relative_segments(base: &[String], relative: &[String]) -> Vec<String> {
-    let mut segments = base.to_vec();
-    for segment in relative {
-        match segment.as_str() {
-            "self" => {}
-            "super" => {
-                segments.pop();
-            }
-            "crate" => segments.clear(),
-            _ => segments.push(segment.clone()),
-        }
-    }
-    segments
-}
-
-struct LoadedModule {
-    path: PathBuf,
-    child_dir: PathBuf,
-    items: Vec<syn::Item>,
-}
-
-fn find_symbols_internal(
-    root_file: &Path,
-    target: &str,
-    module_segments: &[String],
-) -> Result<Vec<SymbolDoc>, String> {
-    let module = resolve_module(root_file, module_segments, false)?;
-    let mut out = Vec::new();
-    collect_items_direct(&module.path, &module.items, target, &mut out);
-    out.retain(|doc| doc.public);
-    Ok(out)
-}
-
-fn resolve_module(
-    root_file: &Path,
-    segments: &[String],
-    require_public_modules: bool,
-) -> Result<LoadedModule, String> {
-    let mut module = load_module_file(root_file)?;
-    for segment in segments {
-        module = resolve_child_module(&module, segment, require_public_modules)?;
-    }
-    Ok(module)
-}
-
-fn load_module_file(path: &Path) -> Result<LoadedModule, String> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-    let parsed = syn::parse_file(&source)
-        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
-    Ok(LoadedModule {
-        path: path.to_path_buf(),
-        child_dir: module_child_dir(path),
-        items: parsed.items,
-    })
-}
-
-fn module_child_dir(path: &Path) -> PathBuf {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    if path
-        .file_stem()
-        .is_some_and(|stem| stem == "lib" || stem == "main" || stem == "mod")
-    {
-        parent.to_path_buf()
-    } else {
-        parent.join(path.file_stem().unwrap_or_default())
-    }
-}
-
-fn resolve_child_module(
-    parent: &LoadedModule,
-    segment: &str,
-    require_public: bool,
-) -> Result<LoadedModule, String> {
-    let module = parent
-        .items
-        .iter()
-        .find_map(|item| match item {
-            syn::Item::Mod(module)
-                if module.ident == segment
-                    && (!require_public || matches!(module.vis, syn::Visibility::Public(_))) =>
-            {
-                Some(module)
-            }
-            _ => None,
-        })
-        .ok_or_else(|| {
+        ),
+        ItemEnum::Constant { type_, .. } => (
+            "const",
+            format!("pub const {name}: {} = ...;", type_str(type_)),
+            Vec::new(),
+        ),
+        ItemEnum::Static(s) => (
+            "static",
             format!(
-                "module '{segment}' not found from {}",
-                parent.path.display()
-            )
-        })?;
-
-    if let Some((_, items)) = &module.content {
-        return Ok(LoadedModule {
-            path: parent.path.clone(),
-            child_dir: parent.child_dir.join(segment),
-            items: items.clone(),
-        });
-    }
-
-    let path = explicit_module_path(module)
-        .map(|relative| parent.child_dir.join(relative))
-        .or_else(|| {
-            let file_path = parent.child_dir.join(format!("{segment}.rs"));
-            file_path.exists().then_some(file_path)
-        })
-        .or_else(|| {
-            let mod_path = parent.child_dir.join(segment).join("mod.rs");
-            mod_path.exists().then_some(mod_path)
-        })
-        .ok_or_else(|| {
-            format!(
-                "module file for '{segment}' not found from {}",
-                parent.path.display()
-            )
-        })?;
-
-    load_module_file(&path)
-}
-
-fn explicit_module_path(module: &syn::ItemMod) -> Option<PathBuf> {
-    module.attrs.iter().find_map(|attr| {
-        if !attr.path().is_ident("path") {
-            return None;
-        }
-        match &attr.meta {
-            syn::Meta::NameValue(value) => match &value.value {
-                syn::Expr::Lit(expr_lit) => match &expr_lit.lit {
-                    syn::Lit::Str(value) => Some(PathBuf::from(value.value())),
-                    _ => None,
-                },
-                _ => None,
-            },
-            _ => None,
-        }
-    })
-}
-
-fn collect_items_direct(path: &Path, items: &[syn::Item], target: &str, out: &mut Vec<SymbolDoc>) {
-    for item in items {
-        collect_item(path, item, target, out);
-    }
-}
-
-fn collect_items_recursive(
-    path: &Path,
-    items: &[syn::Item],
-    target: &str,
-    out: &mut Vec<SymbolDoc>,
-) {
-    for item in items {
-        collect_item(path, item, target, out);
-        if let syn::Item::Mod(module) = item
-            && let Some((_, items)) = &module.content
-        {
-            collect_items_recursive(path, items, target, out);
-        }
-    }
-}
-
-fn collect_item(path: &Path, item: &syn::Item, target: &str, out: &mut Vec<SymbolDoc>) {
-    match item {
-        syn::Item::Fn(function) if function.sig.ident == target => {
-            out.push(function_doc(path.to_path_buf(), function));
-        }
-        syn::Item::Struct(item) if item.ident == target => {
-            out.push(struct_doc(path.to_path_buf(), item));
-        }
-        syn::Item::Enum(item) if item.ident == target => {
-            out.push(enum_doc(path.to_path_buf(), item));
-        }
-        syn::Item::Trait(item) if item.ident == target => {
-            out.push(trait_doc(path.to_path_buf(), item));
-        }
-        syn::Item::Type(item) if item.ident == target => {
-            out.push(type_doc(path.to_path_buf(), item));
-        }
-        syn::Item::Const(item) if item.ident == target => {
-            out.push(const_doc(path.to_path_buf(), item));
-        }
-        syn::Item::Static(item) if item.ident == target => {
-            out.push(static_doc(path.to_path_buf(), item));
-        }
-        syn::Item::Union(item) if item.ident == target => {
-            out.push(union_doc(path.to_path_buf(), item));
-        }
-        syn::Item::Macro(item) => {
-            if let Some(doc) = macro_symbol_doc(path.to_path_buf(), item, target) {
-                out.push(doc);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn function_doc(path: PathBuf, function: &syn::ItemFn) -> SymbolDoc {
-    SymbolDoc {
-        path,
-        line: function.sig.span().start().line,
-        kind: "fn",
-        name: function.sig.ident.to_string(),
-        definition: function.sig.to_token_stream().to_string(),
-        details: Vec::new(),
-        docs: doc_lines(&function.attrs),
-        derives: Vec::new(),
-        reexported: false,
-        public: matches!(function.vis, syn::Visibility::Public(_)),
-    }
-}
-
-fn struct_doc(path: PathBuf, item: &syn::ItemStruct) -> SymbolDoc {
-    SymbolDoc {
-        path,
-        line: item.ident.span().start().line,
-        kind: "struct",
-        name: item.ident.to_string(),
-        definition: format!(
-            "{}struct {}{}{} {}",
-            visibility(&item.vis),
-            item.ident,
-            item.generics.to_token_stream(),
-            where_clause(&item.generics),
-            fields_definition(&item.fields)
+                "pub static {}{name}: {} = ...;",
+                if s.is_mutable { "mut " } else { "" },
+                type_str(&s.type_)
+            ),
+            Vec::new(),
         ),
-        details: fields_details(&item.fields),
-        docs: doc_lines(&item.attrs),
-        derives: derive_lines(&item.attrs),
-        reexported: false,
-        public: matches!(item.vis, syn::Visibility::Public(_)),
-    }
-}
-
-fn enum_doc(path: PathBuf, item: &syn::ItemEnum) -> SymbolDoc {
-    let details = item
-        .variants
-        .iter()
-        .map(|variant| match &variant.fields {
-            syn::Fields::Unit => variant.ident.to_string(),
-            fields => format!("{} {}", variant.ident, fields_inline(fields)),
-        })
-        .collect();
-    SymbolDoc {
-        path,
-        line: item.ident.span().start().line,
-        kind: "enum",
-        name: item.ident.to_string(),
-        definition: format!(
-            "{}enum {}{}{} {{ {} }}",
-            visibility(&item.vis),
-            item.ident,
-            item.generics.to_token_stream(),
-            where_clause(&item.generics),
-            enum_variants_definition(item)
+        ItemEnum::Union(u) => ("union", union_def(krate, &name, u), union_details(krate, u)),
+        ItemEnum::Macro(_) => (
+            "macro",
+            format!("macro_rules! {name} {{ ... }}"),
+            Vec::new(),
         ),
+        ItemEnum::ProcMacro(pm) => match pm.kind {
+            MacroKind::Bang => ("macro", format!("pub macro {name}!(...)"), Vec::new()),
+            MacroKind::Attr => ("proc-attribute", format!("#[{name}]"), Vec::new()),
+            MacroKind::Derive => ("proc-derive", format!("#[derive({name})]"), Vec::new()),
+        },
+        ItemEnum::Use(u) => (
+            "use",
+            format!("pub use {} as {};", u.source, u.name),
+            Vec::new(),
+        ),
+        _ => (
+            "item",
+            format!("pub {} {name}", kind_name(&item.inner)),
+            Vec::new(),
+        ),
+    };
+    SymbolDoc {
+        path: item
+            .span
+            .as_ref()
+            .map(|span| span.filename.clone())
+            .unwrap_or_default(),
+        line: item.span.as_ref().map(|span| span.begin.0).unwrap_or(0),
+        kind,
+        name,
+        definition,
         details,
-        docs: doc_lines(&item.attrs),
-        derives: derive_lines(&item.attrs),
-        reexported: false,
-        public: matches!(item.vis, syn::Visibility::Public(_)),
-    }
-}
-
-fn trait_doc(path: PathBuf, item: &syn::ItemTrait) -> SymbolDoc {
-    let items_definition = item
-        .items
-        .iter()
-        .map(|item| item.to_token_stream().to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let details = item
-        .items
-        .iter()
-        .map(|item| match item {
-            syn::TraitItem::Fn(f) => f.sig.to_token_stream().to_string(),
-            syn::TraitItem::Type(t) => format!("type {}{}", t.ident, t.generics.to_token_stream()),
-            syn::TraitItem::Const(c) => format!("const {} : {}", c.ident, c.ty.to_token_stream()),
-            syn::TraitItem::Macro(m) => m.mac.to_token_stream().to_string(),
-            _ => item.to_token_stream().to_string(),
-        })
-        .collect();
-    SymbolDoc {
-        path,
-        line: item.ident.span().start().line,
-        kind: "trait",
-        name: item.ident.to_string(),
-        definition: format!(
-            "{}{}trait {}{}{}{} {{ {} }}",
-            visibility(&item.vis),
-            if item.unsafety.is_some() {
-                "unsafe "
-            } else {
-                ""
-            },
-            item.ident,
-            item.generics.to_token_stream(),
-            supertraits(item),
-            where_clause(&item.generics),
-            items_definition
-        ),
-        details,
-        docs: doc_lines(&item.attrs),
+        docs: item
+            .docs
+            .as_deref()
+            .unwrap_or("")
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect(),
         derives: Vec::new(),
-        reexported: false,
-        public: matches!(item.vis, syn::Visibility::Public(_)),
     }
 }
 
-fn type_doc(path: PathBuf, item: &syn::ItemType) -> SymbolDoc {
-    SymbolDoc {
-        path,
-        line: item.ident.span().start().line,
-        kind: "type",
-        name: item.ident.to_string(),
-        definition: format!(
-            "{}type {}{} = {} ;",
-            visibility(&item.vis),
-            item.ident,
-            item.generics.to_token_stream(),
-            item.ty.to_token_stream()
-        ),
-        details: Vec::new(),
-        docs: doc_lines(&item.attrs),
-        derives: Vec::new(),
-        reexported: false,
-        public: matches!(item.vis, syn::Visibility::Public(_)),
+fn kind_name(inner: &ItemEnum) -> &'static str {
+    match inner {
+        ItemEnum::Module(_) => "module",
+        ItemEnum::ExternCrate { .. } => "extern crate",
+        ItemEnum::Use(_) => "use",
+        ItemEnum::StructField(_) => "field",
+        ItemEnum::Variant(_) => "variant",
+        ItemEnum::TraitAlias(_) => "trait alias",
+        ItemEnum::Impl(_) => "impl",
+        ItemEnum::ExternType => "extern type",
+        ItemEnum::Primitive(_) => "primitive",
+        ItemEnum::AssocConst { .. } => "assoc const",
+        ItemEnum::AssocType { .. } => "assoc type",
+        _ => "item",
     }
 }
 
-fn const_doc(path: PathBuf, item: &syn::ItemConst) -> SymbolDoc {
-    SymbolDoc {
-        path,
-        line: item.ident.span().start().line,
-        kind: "const",
-        name: item.ident.to_string(),
-        definition: format!(
-            "{}const {} : {} = ... ;",
-            visibility(&item.vis),
-            item.ident,
-            item.ty.to_token_stream()
+fn struct_def(krate: &Crate, name: &str, s: &rustdoc_types::Struct) -> String {
+    match &s.kind {
+        StructKind::Unit => format!("pub struct {name}{};", generics(&s.generics)),
+        StructKind::Tuple(fields) => format!(
+            "pub struct {name}{}({});",
+            generics(&s.generics),
+            fields
+                .iter()
+                .map(|id| id
+                    .and_then(|id| field_type(krate, id))
+                    .unwrap_or_else(|| "_".into()))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
-        details: Vec::new(),
-        docs: doc_lines(&item.attrs),
-        derives: Vec::new(),
-        reexported: false,
-        public: matches!(item.vis, syn::Visibility::Public(_)),
+        StructKind::Plain { fields, .. } => format!(
+            "pub struct {name}{} {{ {} }}",
+            generics(&s.generics),
+            fields
+                .iter()
+                .filter_map(|id| field_line(krate, *id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
-fn static_doc(path: PathBuf, item: &syn::ItemStatic) -> SymbolDoc {
-    SymbolDoc {
-        path,
-        line: item.ident.span().start().line,
-        kind: "static",
-        name: item.ident.to_string(),
-        definition: format!(
-            "{}static {} : {} = ... ;",
-            visibility(&item.vis),
-            item.ident,
-            item.ty.to_token_stream()
-        ),
-        details: Vec::new(),
-        docs: doc_lines(&item.attrs),
-        derives: Vec::new(),
-        reexported: false,
-        public: matches!(item.vis, syn::Visibility::Public(_)),
-    }
-}
-
-fn union_doc(path: PathBuf, item: &syn::ItemUnion) -> SymbolDoc {
-    SymbolDoc {
-        path,
-        line: item.ident.span().start().line,
-        kind: "union",
-        name: item.ident.to_string(),
-        definition: format!(
-            "{}union {}{}{} {{ {} }}",
-            visibility(&item.vis),
-            item.ident,
-            item.generics.to_token_stream(),
-            where_clause(&item.generics),
-            fields_definition(&syn::Fields::Named(item.fields.clone()))
-        ),
-        details: item
-            .fields
-            .named
+fn struct_details(krate: &Crate, s: &rustdoc_types::Struct) -> Vec<String> {
+    match &s.kind {
+        StructKind::Plain { fields, .. } => fields
             .iter()
-            .map(|field| {
-                format!(
-                    "{}{}: {}",
-                    visibility(&field.vis),
-                    field.ident.as_ref().unwrap(),
-                    field.ty.to_token_stream()
-                )
+            .filter_map(|id| field_line(krate, *id))
+            .collect(),
+        StructKind::Tuple(fields) => fields
+            .iter()
+            .enumerate()
+            .filter_map(|(i, id)| {
+                id.and_then(|id| field_type(krate, id))
+                    .map(|ty| format!("#{i}: {ty}"))
             })
             .collect(),
-        docs: doc_lines(&item.attrs),
-        derives: derive_lines(&item.attrs),
-        reexported: false,
-        public: matches!(item.vis, syn::Visibility::Public(_)),
+        StructKind::Unit => Vec::new(),
     }
 }
 
-fn macro_symbol_doc(path: PathBuf, item: &syn::ItemMacro, target: &str) -> Option<SymbolDoc> {
-    let tokens = item.mac.tokens.to_string();
-    let needle_struct = format!("struct {target}");
-    let needle_enum = format!("enum {target}");
-    let needle_trait = format!("trait {target}");
-    let (kind, needle) = if macro_tokens_contain_item(&item.mac.tokens, "struct", target) {
-        ("struct", needle_struct)
-    } else if macro_tokens_contain_item(&item.mac.tokens, "enum", target) {
-        ("enum", needle_enum)
-    } else if macro_tokens_contain_item(&item.mac.tokens, "trait", target) {
-        ("trait", needle_trait)
+fn enum_def(krate: &Crate, name: &str, e: &rustdoc_types::Enum) -> String {
+    format!(
+        "pub enum {name}{} {{ {} }}",
+        generics(&e.generics),
+        enum_details(krate, e).join(", ")
+    )
+}
+
+fn enum_details(krate: &Crate, e: &rustdoc_types::Enum) -> Vec<String> {
+    e.variants
+        .iter()
+        .filter_map(|id| {
+            let item = krate.index.get(id)?;
+            let name = item.name.clone()?;
+            let ItemEnum::Variant(v) = &item.inner else {
+                return Some(name);
+            };
+            Some(match &v.kind {
+                VariantKind::Plain => name,
+                VariantKind::Tuple(fields) => format!(
+                    "{}({})",
+                    name,
+                    fields
+                        .iter()
+                        .map(|id| id
+                            .and_then(|id| field_type(krate, id))
+                            .unwrap_or_else(|| "_".into()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                VariantKind::Struct { fields, .. } => format!(
+                    "{} {{ {} }}",
+                    name,
+                    fields
+                        .iter()
+                        .filter_map(|id| field_line(krate, *id))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            })
+        })
+        .collect()
+}
+
+fn trait_def(_krate: &Crate, name: &str, t: &rustdoc_types::Trait) -> String {
+    let prefix = if t.is_unsafe {
+        "pub unsafe trait"
     } else {
+        "pub trait"
+    };
+    format!("{prefix} {name}{} {{ ... }}", generics(&t.generics))
+}
+
+fn trait_details(krate: &Crate, t: &rustdoc_types::Trait) -> Vec<String> {
+    t.items
+        .iter()
+        .filter_map(|id| krate.index.get(id))
+        .filter_map(|item| {
+            let name = item.name.clone().unwrap_or_default();
+            match &item.inner {
+                ItemEnum::Function(f) => Some(fn_def(&name, f)),
+                ItemEnum::AssocType { .. } => Some(format!("type {name};")),
+                ItemEnum::AssocConst { type_, .. } => {
+                    Some(format!("const {name}: {};", type_str(type_)))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn fn_def(name: &str, f: &rustdoc_types::Function) -> String {
+    let mut prefix = String::from("pub ");
+    if f.header.is_const {
+        prefix.push_str("const ");
+    }
+    if f.header.is_async {
+        prefix.push_str("async ");
+    }
+    if f.header.is_unsafe {
+        prefix.push_str("unsafe ");
+    }
+    let inputs = f
+        .sig
+        .inputs
+        .iter()
+        .map(|(name, ty)| format!("{name}: {}", type_str(ty)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let output = f
+        .sig
+        .output
+        .as_ref()
+        .map(|ty| format!(" -> {}", type_str(ty)))
+        .unwrap_or_default();
+    format!(
+        "{prefix}fn {name}{}({inputs}){output}",
+        generics(&f.generics)
+    )
+}
+
+fn union_def(krate: &Crate, name: &str, u: &rustdoc_types::Union) -> String {
+    format!(
+        "pub union {name}{} {{ {} }}",
+        generics(&u.generics),
+        union_details(krate, u).join(", ")
+    )
+}
+
+fn union_details(krate: &Crate, u: &rustdoc_types::Union) -> Vec<String> {
+    u.fields
+        .iter()
+        .filter_map(|id| field_line(krate, *id))
+        .collect()
+}
+
+fn field_line(krate: &Crate, id: Id) -> Option<String> {
+    let field = krate.index.get(&id)?;
+    let ItemEnum::StructField(ty) = &field.inner else {
         return None;
     };
-
-    let mut docs = doc_lines(&item.attrs);
-    if docs.is_empty() {
-        docs = macro_doc_lines(&tokens, &needle);
-    }
-
-    Some(SymbolDoc {
-        path,
-        line: item.mac.span().start().line,
-        kind,
-        name: target.to_string(),
-        definition: macro_definition(&tokens, &needle, kind, target),
-        details: macro_details(&tokens, &needle),
-        docs,
-        derives: macro_derives(&tokens),
-        reexported: false,
-        public: tokens.contains(&format!("pub {needle}")),
-    })
+    Some(format!(
+        "{}: {}",
+        field.name.clone().unwrap_or_else(|| "_".into()),
+        type_str(ty)
+    ))
 }
 
-fn macro_tokens_contain_item(tokens: &proc_macro2::TokenStream, kind: &str, target: &str) -> bool {
-    let mut previous_ident: Option<String> = None;
-    for token in tokens.clone() {
-        match token {
-            proc_macro2::TokenTree::Ident(ident) => {
-                let ident = ident.to_string();
-                if previous_ident.as_deref() == Some(kind) && ident == target {
-                    return true;
-                }
-                previous_ident = Some(ident);
-            }
-            proc_macro2::TokenTree::Group(group) => {
-                if macro_tokens_contain_item(&group.stream(), kind, target) {
-                    return true;
-                }
-                previous_ident = None;
-            }
-            _ => previous_ident = None,
-        }
-    }
-    false
-}
-
-fn macro_definition(tokens: &str, needle: &str, kind: &str, target: &str) -> String {
-    let visibility = if tokens.contains(&format!("pub {needle}")) {
-        "pub "
-    } else {
-        ""
+fn field_type(krate: &Crate, id: Id) -> Option<String> {
+    let field = krate.index.get(&id)?;
+    let ItemEnum::StructField(ty) = &field.inner else {
+        return None;
     };
-    if kind == "trait" {
-        let body = macro_body(tokens, needle);
-        return format!("{visibility}trait {target} {{ {body} }}");
-    }
-    if kind == "enum" {
-        let body = macro_body(tokens, needle);
-        return format!("{visibility}enum {target} {{ {body} }}");
-    }
-    if kind == "struct" {
-        let body = macro_body(tokens, needle);
-        return format!("{visibility}struct {target} {{ {body} }}");
-    }
-    format!("macro-generated {kind} {target}")
+    Some(type_str(ty))
 }
 
-fn macro_body(tokens: &str, needle: &str) -> String {
-    let Some(start) = tokens.find(needle) else {
+fn generics(g: &rustdoc_types::Generics) -> String {
+    if g.params.is_empty() {
         return String::new();
-    };
-    let rest = &tokens[start + needle.len()..];
-    let Some(open) = rest.find('{') else {
-        return String::new();
-    };
-    balanced_body(&rest[open..])
-}
-
-fn macro_doc_lines(tokens: &str, needle: &str) -> Vec<String> {
-    let Some(index) = tokens.find(needle) else {
-        return Vec::new();
-    };
-    let before = &tokens[..index];
-    let mut docs = Vec::new();
-    let mut rest = before;
-    while let Some(doc_index) = rest.find("doc = \"") {
-        rest = &rest[doc_index + 7..];
-        let Some((value, consumed)) = read_token_string(rest) else {
-            break;
-        };
-        docs.push(value.trim().to_string());
-        rest = &rest[consumed..];
     }
-    docs
-}
-
-fn read_token_string(text: &str) -> Option<(String, usize)> {
-    let mut out = String::new();
-    let mut escaped = false;
-    for (index, ch) in text.char_indices() {
-        if escaped {
-            out.push(match ch {
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                '\\' => '\\',
-                '"' => '"',
-                other => other,
-            });
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == '"' {
-            return Some((out, index + 1));
-        } else {
-            out.push(ch);
-        }
-    }
-    None
-}
-
-fn macro_details(tokens: &str, needle: &str) -> Vec<String> {
-    let Some(start) = tokens.find(needle) else {
-        return Vec::new();
-    };
-    let rest = &tokens[start + needle.len()..];
-    let Some(open) = rest.find('{') else {
-        return Vec::new();
-    };
-    let body = balanced_body(&rest[open..]);
-    split_top_level(&body)
-        .into_iter()
-        .map(|line| line.trim().trim_end_matches(',').to_string())
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .collect()
-}
-
-fn balanced_body(text: &str) -> String {
-    let mut depth = 0usize;
-    let mut out = String::new();
-    for ch in text.chars() {
-        match ch {
-            '{' => {
-                depth += 1;
-                if depth > 1 {
-                    out.push(ch);
-                }
-            }
-            '}' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    break;
-                }
-                out.push(ch);
-            }
-            _ if depth > 0 => out.push(ch),
-            _ => {}
-        }
-    }
-    out
-}
-
-fn split_top_level(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut paren = 0usize;
-    let mut bracket = 0usize;
-    let mut brace = 0usize;
-    for ch in text.chars() {
-        match ch {
-            '(' => paren += 1,
-            ')' => paren = paren.saturating_sub(1),
-            '[' => bracket += 1,
-            ']' => bracket = bracket.saturating_sub(1),
-            '{' => brace += 1,
-            '}' => brace = brace.saturating_sub(1),
-            ',' if paren == 0 && bracket == 0 && brace == 0 => {
-                out.push(current.trim().to_string());
-                current.clear();
-                continue;
-            }
-            _ => {}
-        }
-        current.push(ch);
-    }
-    if !current.trim().is_empty() {
-        out.push(current.trim().to_string());
-    }
-    out
-}
-
-fn macro_derives(tokens: &str) -> Vec<String> {
-    let Some(index) = tokens.find("derive") else {
-        return Vec::new();
-    };
-    let rest = &tokens[index + "derive".len()..];
-    let Some(open) = rest.find('(') else {
-        return Vec::new();
-    };
-    let Some(close) = rest[open + 1..].find(')') else {
-        return Vec::new();
-    };
-    rest[open + 1..open + 1 + close]
-        .split(',')
-        .map(|part| part.trim().to_string())
-        .filter(|part| !part.is_empty())
-        .collect()
-}
-
-fn attrs_prefix(attrs: &[syn::Attribute]) -> String {
-    attrs
-        .iter()
-        .filter(|attr| !attr.path().is_ident("doc"))
-        .map(|attr| normalize_tokens(attr.to_token_stream().to_string()))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn normalize_tokens(tokens: String) -> String {
-    tokens.replace("# [", "#[")
-}
-
-fn fields_definition(fields: &syn::Fields) -> String {
-    match fields {
-        syn::Fields::Named(fields) => {
-            let body = fields
-                .named
-                .iter()
-                .map(|field| {
-                    let attrs = attrs_prefix(&field.attrs);
-                    let prefix = if attrs.is_empty() {
-                        String::new()
-                    } else {
-                        format!("{attrs}\n    ")
-                    };
-                    format!(
-                        "    {}{}{}: {},",
-                        prefix,
-                        visibility(&field.vis),
-                        field.ident.as_ref().unwrap(),
-                        field.ty.to_token_stream()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("{{\n{body}\n}}")
-        }
-        syn::Fields::Unnamed(fields) => format!(
-            "({});",
-            fields
-                .unnamed
-                .iter()
-                .map(|field| {
-                    let attrs = attrs_prefix(&field.attrs);
-                    let prefix = if attrs.is_empty() {
-                        String::new()
-                    } else {
-                        format!("{attrs} ")
-                    };
-                    format!(
-                        "{}{}{}",
-                        prefix,
-                        visibility(&field.vis),
-                        field.ty.to_token_stream()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        syn::Fields::Unit => ";".to_string(),
-    }
-}
-
-fn enum_variants_definition(item: &syn::ItemEnum) -> String {
-    item.variants
-        .iter()
-        .map(|variant| {
-            let attrs = attrs_prefix(&variant.attrs);
-            let prefix = if attrs.is_empty() {
-                String::new()
-            } else {
-                format!("{attrs}\n    ")
-            };
-            format!(
-                "    {}{}{},",
-                prefix,
-                variant.ident,
-                match &variant.fields {
-                    syn::Fields::Unit => String::new(),
-                    fields => format!(" {}", fields_definition(fields).trim_end_matches(';')),
-                }
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn fields_details(fields: &syn::Fields) -> Vec<String> {
-    match fields {
-        syn::Fields::Named(fields) => fields
-            .named
+    format!(
+        "<{}>",
+        g.params
             .iter()
-            .map(|field| {
-                format!(
-                    "{}{}: {}",
-                    visibility(&field.vis),
-                    field.ident.as_ref().unwrap(),
-                    field.ty.to_token_stream()
-                )
+            .map(|p| match &p.kind {
+                GenericParamDefKind::Lifetime { .. } => format!("'{}", p.name),
+                GenericParamDefKind::Type { .. } | GenericParamDefKind::Const { .. } =>
+                    p.name.clone(),
             })
-            .collect(),
-        syn::Fields::Unnamed(fields) => fields
-            .unnamed
-            .iter()
-            .enumerate()
-            .map(|(index, field)| {
-                format!(
-                    "#{index}: {}{}",
-                    visibility(&field.vis),
-                    field.ty.to_token_stream()
-                )
-            })
-            .collect(),
-        syn::Fields::Unit => Vec::new(),
-    }
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
-fn fields_inline(fields: &syn::Fields) -> String {
-    match fields {
-        syn::Fields::Named(fields) => format!(
-            "{{ {} }}",
-            fields
-                .named
-                .iter()
-                .map(|field| format!(
-                    "{}: {}",
-                    field.ident.as_ref().unwrap(),
-                    field.ty.to_token_stream()
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        syn::Fields::Unnamed(fields) => format!(
+fn type_str(ty: &Type) -> String {
+    match ty {
+        Type::ResolvedPath(path) => path.path.clone(),
+        Type::DynTrait(_) => "dyn Trait".to_string(),
+        Type::Generic(name) => name.clone(),
+        Type::Primitive(name) => name.clone(),
+        Type::FunctionPointer(_) => "fn(...)".to_string(),
+        Type::Tuple(items) => format!(
             "({})",
-            fields
-                .unnamed
-                .iter()
-                .map(|field| field.ty.to_token_stream().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
+            items.iter().map(type_str).collect::<Vec<_>>().join(", ")
         ),
-        syn::Fields::Unit => String::new(),
+        Type::Slice(inner) => format!("[{}]", type_str(inner)),
+        Type::Array { type_, len } => format!("[{}; {len}]", type_str(type_)),
+        Type::Pat { type_, .. } => type_str(type_),
+        Type::ImplTrait(_) => "impl Trait".to_string(),
+        Type::Infer => "_".to_string(),
+        Type::RawPointer { is_mutable, type_ } => format!(
+            "*{} {}",
+            if *is_mutable { "mut" } else { "const" },
+            type_str(type_)
+        ),
+        Type::BorrowedRef {
+            lifetime,
+            is_mutable,
+            type_,
+        } => format!(
+            "&{}{}{}",
+            lifetime
+                .as_ref()
+                .map(|l| format!("'{l} "))
+                .unwrap_or_default(),
+            if *is_mutable { "mut " } else { "" },
+            type_str(type_)
+        ),
+        Type::QualifiedPath { name, .. } => name.clone(),
     }
-}
-
-fn visibility(vis: &syn::Visibility) -> String {
-    match vis {
-        syn::Visibility::Inherited => String::new(),
-        _ => format!("{} ", vis.to_token_stream()),
-    }
-}
-
-fn where_clause(generics: &syn::Generics) -> String {
-    generics
-        .where_clause
-        .as_ref()
-        .map(|clause| format!(" {}", clause.to_token_stream()))
-        .unwrap_or_default()
-}
-
-fn supertraits(item: &syn::ItemTrait) -> String {
-    if item.supertraits.is_empty() {
-        String::new()
-    } else {
-        format!(" : {}", item.supertraits.to_token_stream())
-    }
-}
-
-fn doc_lines(attrs: &[syn::Attribute]) -> Vec<String> {
-    attrs
-        .iter()
-        .filter(|attr| attr.path().is_ident("doc"))
-        .filter_map(|attr| match &attr.meta {
-            syn::Meta::NameValue(value) => match &value.value {
-                syn::Expr::Lit(expr_lit) => match &expr_lit.lit {
-                    syn::Lit::Str(value) => Some(value.value().trim().to_string()),
-                    _ => None,
-                },
-                _ => None,
-            },
-            _ => None,
-        })
-        .collect()
-}
-
-fn derive_lines(attrs: &[syn::Attribute]) -> Vec<String> {
-    attrs
-        .iter()
-        .filter_map(|attr| match &attr.meta {
-            syn::Meta::List(list) if list.path.is_ident("derive") => Some(list.tokens.to_string()),
-            _ => None,
-        })
-        .flat_map(|line| {
-            line.split(',')
-                .map(|part| part.trim().to_string())
-                .collect::<Vec<_>>()
-        })
-        .filter(|line| !line.is_empty())
-        .collect()
-}
-
-pub(crate) fn rank_matches(matches: &mut [SymbolDoc], import: &ImportPath) {
-    matches.sort_by_cached_key(|doc| {
-        let path_display = doc.path.display().to_string();
-        let path_text = path_display.replace('-', "_");
-        let module_hits = import
-            .segments
-            .iter()
-            .filter(|segment| path_text.contains(segment.as_str()))
-            .count();
-        (
-            !doc.reexported,
-            std::cmp::Reverse(module_hits),
-            !doc.public,
-            path_display,
-            doc.line,
-        )
-    });
-}
-
-fn rust_files(root: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|entry| entry.file_name() != "target" && entry.file_name() != ".git")
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .map(|entry| entry.into_path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
-        .collect();
-    files.sort();
-    files
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use rustdoc_types::{
+        Abi, Attribute, Constant, Enum, Function, FunctionHeader, FunctionSignature,
+        GenericParamDef, GenericParamDefKind, Generics, Item, Module, Path, ProcMacro, Static,
+        Struct, Trait, TypeAlias, Union, Use, Variant,
+    };
+    use std::collections::HashMap;
+    use std::path::PathBuf;
 
-    fn write(path: &Path, text: &str) {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
+    fn generics_empty() -> Generics {
+        Generics {
+            params: Vec::new(),
+            where_predicates: Vec::new(),
         }
-        std::fs::write(path, text).unwrap();
     }
 
-    #[test]
-    fn resolves_public_module_path_and_item_kinds() {
-        let dir = TempDir::new().unwrap();
-        let dir = dir.path();
-        let lib = dir.join("lib.rs");
-        write(&lib, "pub mod api; mod private;");
-        write(
-            &dir.join("api.rs"),
-            r#"
-            /// docs
-            #[derive(Clone, Debug)]
-            pub struct Config<T> where T: Clone { pub name: String, value: T }
-            pub enum Mode { Fast, Slow(u8), Named { yes: bool } }
-            pub trait Worker: Send { type Job; const ID: u8; fn run(&self); }
-            pub type Alias = Result<(), ()>;
-            pub const LIMIT: usize = 3;
-            pub static FLAG: bool = true;
-            pub union Bits { pub i: u32, f: f32 }
-            pub fn make() -> Config<u8> { todo!() }
-            struct Hidden;
-            "#,
-        );
-        write(&dir.join("private.rs"), "pub struct Config;");
-
-        let segment = vec!["api".to_string()];
-        for (name, kind) in [
-            ("Config", "struct"),
-            ("Mode", "enum"),
-            ("Worker", "trait"),
-            ("Alias", "type"),
-            ("LIMIT", "const"),
-            ("FLAG", "static"),
-            ("Bits", "union"),
-            ("make", "fn"),
-        ] {
-            let docs = find_symbols(&lib, name, &segment).unwrap();
-            assert_eq!(docs[0].kind, kind);
-            assert!(docs[0].public);
+    fn generics_all() -> Generics {
+        Generics {
+            params: vec![
+                GenericParamDef {
+                    name: "a".into(),
+                    kind: GenericParamDefKind::Lifetime { outlives: vec![] },
+                },
+                GenericParamDef {
+                    name: "T".into(),
+                    kind: GenericParamDefKind::Type {
+                        bounds: vec![],
+                        default: None,
+                        is_synthetic: false,
+                    },
+                },
+                GenericParamDef {
+                    name: "N".into(),
+                    kind: GenericParamDefKind::Const {
+                        type_: Type::Primitive("usize".into()),
+                        default: None,
+                    },
+                },
+            ],
+            where_predicates: Vec::new(),
         }
-        assert!(find_symbols(&lib, "Hidden", &segment).unwrap().is_empty());
-        assert!(find_symbols(&lib, "Config", &["private".to_string()]).is_err());
+    }
+
+    fn span(line: usize) -> rustdoc_types::Span {
+        rustdoc_types::Span {
+            filename: PathBuf::from(format!("src/{line}.rs")),
+            begin: (line, 1),
+            end: (line, 10),
+        }
+    }
+
+    fn item(id: u32, name: Option<&str>, visibility: Visibility, inner: ItemEnum) -> Item {
+        Item {
+            id: Id(id),
+            crate_id: 0,
+            name: name.map(ToOwned::to_owned),
+            span: Some(span(id as usize)),
+            visibility,
+            docs: name.map(|n| format!("docs for {n}\n\nmore")),
+            links: HashMap::new(),
+            attrs: vec![Attribute::Other("#[cfg(test)]".into())],
+            deprecation: None,
+            inner,
+        }
+    }
+
+    fn krate(items: Vec<Item>, root: Id) -> Crate {
+        Crate {
+            root,
+            crate_version: Some("1.0.0".into()),
+            includes_private: false,
+            index: items.into_iter().map(|i| (i.id, i)).collect(),
+            paths: HashMap::new(),
+            external_crates: HashMap::new(),
+            target: rustdoc_types::Target {
+                triple: "x86_64-unknown-linux-gnu".into(),
+                target_features: Vec::new(),
+            },
+            format_version: rustdoc_types::FORMAT_VERSION,
+        }
+    }
+
+    fn function() -> Function {
+        Function {
+            sig: FunctionSignature {
+                inputs: vec![("x".into(), Type::Primitive("u8".into()))],
+                output: Some(Type::Primitive("bool".into())),
+                is_c_variadic: false,
+            },
+            generics: generics_all(),
+            header: FunctionHeader {
+                is_const: true,
+                is_unsafe: true,
+                is_async: true,
+                abi: Abi::Rust,
+            },
+            has_body: true,
+        }
     }
 
     #[test]
-    fn resolves_inline_and_path_modules_and_reexports() {
-        let dir = TempDir::new().unwrap();
-        let dir = dir.path();
-        let lib = dir.join("lib.rs");
-        write(
-            &lib,
-            r#"
-            mod hidden { pub struct Secret; }
-            pub use hidden::Secret;
-            #[path = "actual.rs"] pub mod renamed;
-            pub mod inline { pub struct Inside; }
-            "#,
+    fn graph_resolves_direct_modules_uses_globs_and_cycles() {
+        let root = item(
+            1,
+            Some("fixture"),
+            Visibility::Public,
+            ItemEnum::Module(Module {
+                is_crate: true,
+                items: vec![Id(2), Id(8), Id(9), Id(10)],
+                is_stripped: false,
+            }),
         );
-        write(&dir.join("actual.rs"), "pub struct Actual;");
-
-        let import = ImportPath {
-            crate_name: "x".into(),
-            segments: vec![],
-            item: "Secret".into(),
-        };
-        let mut matches = Vec::new();
-        add_reexported_matches(&lib, &import, &[], &HashMap::new(), &mut matches).unwrap();
-        assert_eq!(matches[0].name, "Secret");
-        assert!(matches[0].reexported);
-
-        assert_eq!(
-            find_symbols(&lib, "Actual", &["renamed".into()]).unwrap()[0].name,
-            "Actual"
+        let api = item(
+            2,
+            Some("api"),
+            Visibility::Public,
+            ItemEnum::Module(Module {
+                is_crate: false,
+                items: vec![Id(3), Id(4), Id(5), Id(6), Id(7)],
+                is_stripped: false,
+            }),
         );
-        assert_eq!(
-            find_symbols(&lib, "Inside", &["inline".into()]).unwrap()[0].name,
-            "Inside"
+        let hidden = item(
+            3,
+            Some("Hidden"),
+            Visibility::Crate,
+            ItemEnum::Struct(Struct {
+                kind: StructKind::Unit,
+                generics: generics_empty(),
+                impls: vec![],
+            }),
         );
-    }
-
-    #[test]
-    fn reexport_negative_and_alias_cases() {
-        let dir = TempDir::new().unwrap();
-        let dir = dir.path();
-        let lib = dir.join("lib.rs");
-        write(
-            &lib,
-            r#"
-            mod hidden { pub struct Secret; pub struct Original; pub struct Globbed; }
-            mod facade { pub use super::hidden::Secret; }
-            pub mod nested { pub use super::hidden::Secret as NestedOnly; }
-            pub use hidden::Original as PublicAlias;
-            pub use hidden::*;
-            pub use facade::Secret as RecursiveSecret;
-            mod private_inline { pub struct Boundary; }
-            "#,
+        let field = item(
+            4,
+            Some("name"),
+            Visibility::Public,
+            ItemEnum::StructField(Type::Primitive("String".into())),
+        );
+        let config = item(
+            5,
+            Some("Config"),
+            Visibility::Public,
+            ItemEnum::Struct(Struct {
+                kind: StructKind::Plain {
+                    fields: vec![Id(4)],
+                    has_stripped_fields: false,
+                },
+                generics: generics_all(),
+                impls: vec![],
+            }),
+        );
+        let alias = item(
+            6,
+            Some("Alias"),
+            Visibility::Public,
+            ItemEnum::Use(Use {
+                source: "api::Config".into(),
+                name: "Alias".into(),
+                id: Some(Id(5)),
+                is_glob: false,
+            }),
+        );
+        let cycle = item(
+            7,
+            Some("Cycle"),
+            Visibility::Public,
+            ItemEnum::Use(Use {
+                source: "api::Cycle".into(),
+                name: "Cycle".into(),
+                id: Some(Id(7)),
+                is_glob: false,
+            }),
+        );
+        let glob_mod = item(
+            8,
+            Some("glob_mod"),
+            Visibility::Public,
+            ItemEnum::Module(Module {
+                is_crate: false,
+                items: vec![Id(11)],
+                is_stripped: false,
+            }),
+        );
+        let glob_use = item(
+            9,
+            Some("glob"),
+            Visibility::Public,
+            ItemEnum::Use(Use {
+                source: "glob_mod::*".into(),
+                name: "glob".into(),
+                id: Some(Id(8)),
+                is_glob: true,
+            }),
+        );
+        let bad_glob = item(
+            10,
+            Some("bad"),
+            Visibility::Public,
+            ItemEnum::Use(Use {
+                source: "missing::*".into(),
+                name: "bad".into(),
+                id: None,
+                is_glob: true,
+            }),
+        );
+        let globbed = item(
+            11,
+            Some("Globbed"),
+            Visibility::Public,
+            ItemEnum::Enum(Enum {
+                generics: generics_empty(),
+                has_stripped_variants: false,
+                variants: vec![],
+                impls: vec![],
+            }),
+        );
+        let krate = krate(
+            vec![
+                root, api, hidden, field, config, alias, cycle, glob_mod, glob_use, bad_glob,
+                globbed,
+            ],
+            Id(1),
         );
 
-        let nested_parent_import = ImportPath {
-            crate_name: "x".into(),
-            segments: vec![],
-            item: "NestedOnly".into(),
-        };
-        let mut matches = Vec::new();
-        add_reexported_matches(
-            &lib,
-            &nested_parent_import,
-            &[],
-            &HashMap::new(),
-            &mut matches,
+        let direct = find_symbol(
+            &krate,
+            &ImportPath {
+                crate_name: "x".into(),
+                segments: vec!["api".into()],
+                item: "Config".into(),
+            },
         )
         .unwrap();
+        assert_eq!(direct.kind, "struct");
+        assert!(direct.definition.contains("Config<'a, T, N>"));
+        assert!(direct.details[0].contains("name: String"));
+        assert!(direct.docs.iter().any(|line| line == "docs for Config"));
+
+        let via_use = find_symbol(
+            &krate,
+            &ImportPath {
+                crate_name: "x".into(),
+                segments: vec!["api".into()],
+                item: "Alias".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(via_use.name, "Config");
+
+        let via_glob = find_symbol(
+            &krate,
+            &ImportPath {
+                crate_name: "x".into(),
+                segments: vec![],
+                item: "Globbed".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(via_glob.kind, "enum");
+
         assert!(
-            matches.is_empty(),
-            "nested pub use leaked into parent import"
+            find_symbol(
+                &krate,
+                &ImportPath {
+                    crate_name: "x".into(),
+                    segments: vec!["api".into()],
+                    item: "Hidden".into()
+                }
+            )
+            .unwrap_err()
+            .contains("not found")
         );
-
-        let alias_import = ImportPath {
-            crate_name: "x".into(),
-            segments: vec![],
-            item: "PublicAlias".into(),
-        };
-        add_reexported_matches(&lib, &alias_import, &[], &HashMap::new(), &mut matches).unwrap();
-        assert_eq!(matches[0].name, "Original");
-        assert!(matches[0].reexported);
-
-        let glob_import = ImportPath {
-            crate_name: "x".into(),
-            segments: vec![],
-            item: "Globbed".into(),
-        };
-        let mut glob_matches = Vec::new();
-        add_reexported_matches(&lib, &glob_import, &[], &HashMap::new(), &mut glob_matches)
-            .unwrap();
-        assert_eq!(glob_matches[0].name, "Globbed");
-
-        let recursive_import = ImportPath {
-            crate_name: "x".into(),
-            segments: vec![],
-            item: "RecursiveSecret".into(),
-        };
-        let mut recursive_matches = Vec::new();
-        add_reexported_matches(
-            &lib,
-            &recursive_import,
-            &[],
-            &HashMap::new(),
-            &mut recursive_matches,
-        )
-        .unwrap();
-        assert_eq!(recursive_matches[0].name, "Secret");
-
-        assert!(find_symbols(&lib, "Boundary", &["private_inline".into()]).is_err());
-    }
-
-    #[test]
-    fn reexports_handle_repeated_super_and_unresolved_globs() {
-        let dir = TempDir::new().unwrap();
-        let dir = dir.path();
-        let lib = dir.join("lib.rs");
-        write(
-            &lib,
-            r#"
-            mod hidden { pub struct Thing; }
-            pub mod a { pub mod b { pub use super::super::hidden::Thing; } }
-            pub use cfg_hidden::*;
-            "#,
-        );
-
-        let import = ImportPath {
-            crate_name: "x".into(),
-            segments: vec!["a".into(), "b".into()],
-            item: "Thing".into(),
-        };
-        let mut matches = Vec::new();
-        add_reexported_matches(&lib, &import, &[], &HashMap::new(), &mut matches).unwrap();
-        assert_eq!(matches[0].name, "Thing");
-
-        let missing = ImportPath {
-            crate_name: "x".into(),
-            segments: vec![],
-            item: "Missing".into(),
-        };
-        let mut missing_matches = Vec::new();
-        add_reexported_matches(&lib, &missing, &[], &HashMap::new(), &mut missing_matches).unwrap();
-        assert!(missing_matches.is_empty());
-    }
-
-    #[test]
-    fn lossy_scan_and_macro_helpers_work() {
-        let dir = TempDir::new().unwrap();
-        let dir = dir.path();
-        write(&dir.join("a.rs"), "/// bad\npub struct Bad {\n");
-        write(
-            &dir.join("b.rs"),
-            r#"
-            macro_rules! m { () => {
-                #[doc = "macro docs"]
-                #[derive(Clone, Copy)]
-                pub enum Generated { A, B(u8) }
-            }}
-            "#,
-        );
-        let docs = find_symbols_lossy(dir, "Bad").unwrap();
-        assert_eq!(docs[0].kind, "struct");
-
-        let source = std::fs::read_to_string(dir.join("b.rs")).unwrap();
-        let parsed = syn::parse_file(&source).unwrap();
-        let mut out = Vec::new();
-        collect_items_recursive(&dir.join("b.rs"), &parsed.items, "Generated", &mut out);
-        assert_eq!(out[0].kind, "enum");
-        assert!(out[0].definition.contains("Generated"));
-        assert!(out[0].docs.iter().any(|line| line.contains("macro docs")));
-        assert!(out[0].derives.iter().any(|line| line.contains("Clone")));
-    }
-
-    #[test]
-    fn external_reexports_and_reexport_errors() {
-        let dir = TempDir::new().unwrap();
-        let dir = dir.path();
-        let lib = dir.join("lib.rs");
-        write(&lib, "pub use cargo_metadata::MetadataCommand;");
-        let glob_lib = dir.join("glob.rs");
-        write(&glob_lib, "pub use syn::*;");
-
-        let metadata = cargo_metadata::MetadataCommand::new()
-            .manifest_path("Cargo.toml")
-            .exec()
-            .unwrap();
-        let root = metadata.root_package().unwrap();
-        let deps = crate::resolver::package_dependencies(&metadata, &root.id);
-        let import = ImportPath {
-            crate_name: "x".into(),
-            segments: vec![],
-            item: "MetadataCommand".into(),
-        };
-        let mut matches = Vec::new();
-        add_reexported_matches(&lib, &import, &metadata.packages, &deps, &mut matches).unwrap();
-        assert_eq!(matches[0].name, "MetadataCommand");
-        assert!(matches[0].reexported);
-
-        let glob = ImportPath {
-            crate_name: "x".into(),
-            segments: vec![],
-            item: "Nope".into(),
-        };
-        let mut glob_matches = Vec::new();
-        add_reexported_matches(
-            &glob_lib,
-            &glob,
-            &metadata.packages,
-            &deps,
-            &mut glob_matches,
-        )
-        .unwrap();
-        assert!(glob_matches.is_empty());
-    }
-
-    #[test]
-    fn module_files_parse_errors_and_macro_branches() {
-        let dir = TempDir::new().unwrap();
-        let dir = dir.path();
-        let lib = dir.join("lib.rs");
-        write(&lib, "pub mod outer;");
-        write(&dir.join("outer/mod.rs"), "pub struct FromModRs;");
-        assert_eq!(
-            find_symbols(&lib, "FromModRs", &["outer".into()]).unwrap()[0].name,
-            "FromModRs"
-        );
-
-        write(&dir.join("bad.rs"), "pub struct Nope {");
         assert!(
-            find_symbols_with_parse_mode(dir, "Nope", false)
+            find_symbol(
+                &krate,
+                &ImportPath {
+                    crate_name: "x".into(),
+                    segments: vec!["api".into()],
+                    item: "Cycle".into()
+                }
+            )
+            .unwrap_err()
+            .contains("cycle")
+        );
+        assert!(
+            find_child(&krate, Id(1), "Nope", true, &mut HashSet::new())
                 .unwrap_err()
-                .contains("failed to parse")
+                .contains("glob import")
         );
-        assert!(find_symbols_lossy(dir, "Missing").unwrap().is_empty());
-
-        let macro_source = r#"
-            macro_rules! s { () => { pub struct MadeStruct { pub id: usize } } }
-            macro_rules! t { () => { pub trait MadeTrait { fn go(&self); } } }
-            macro_rules! private { () => { struct PrivateMade { id: usize } } }
-            macro_rules! none { () => { pub fn ignored() {} } }
-        "#;
-        let parsed = syn::parse_file(macro_source).unwrap();
-        let mut structs = Vec::new();
-        collect_items_recursive(&lib, &parsed.items, "MadeStruct", &mut structs);
-        assert_eq!(structs[0].kind, "struct");
-        let mut traits = Vec::new();
-        collect_items_recursive(&lib, &parsed.items, "MadeTrait", &mut traits);
-        assert_eq!(traits[0].kind, "trait");
-        let mut private = Vec::new();
-        collect_items_recursive(&lib, &parsed.items, "PrivateMade", &mut private);
-        assert!(!private[0].public);
-        let mut none = Vec::new();
-        collect_items_recursive(&lib, &parsed.items, "NotThere", &mut none);
-        assert!(none.is_empty());
+        assert!(
+            find_child(&krate, Id(5), "Nope", true, &mut HashSet::new())
+                .unwrap_err()
+                .contains("not a module")
+        );
+        assert!(
+            super::item(&krate, Id(999))
+                .unwrap_err()
+                .contains("missing")
+        );
     }
 
     #[test]
-    fn ranking_prefers_reexported_public_module_hits() {
-        let import = ImportPath {
-            crate_name: "x".into(),
-            segments: vec!["api".into()],
-            item: "Thing".into(),
-        };
-        let mut docs = vec![
-            SymbolDoc {
-                path: PathBuf::from("src/other.rs"),
-                line: 2,
-                kind: "struct",
-                name: "Thing".into(),
-                definition: String::new(),
-                details: Vec::new(),
-                docs: Vec::new(),
-                derives: Vec::new(),
-                public: false,
-                reexported: false,
-            },
-            SymbolDoc {
-                path: PathBuf::from("src/api.rs"),
-                line: 1,
-                kind: "struct",
-                name: "Thing".into(),
-                definition: String::new(),
-                details: Vec::new(),
-                docs: Vec::new(),
-                derives: Vec::new(),
-                public: true,
-                reexported: true,
-            },
+    fn formatter_covers_item_kinds() {
+        let f1 = item(
+            1,
+            Some("a"),
+            Visibility::Public,
+            ItemEnum::StructField(Type::Primitive("u8".into())),
+        );
+        let f2 = item(
+            2,
+            None,
+            Visibility::Default,
+            ItemEnum::StructField(Type::BorrowedRef {
+                lifetime: Some("a".into()),
+                is_mutable: true,
+                type_: Box::new(Type::Primitive("str".into())),
+            }),
+        );
+        let v1 = item(
+            3,
+            Some("Plain"),
+            Visibility::Public,
+            ItemEnum::Variant(Variant {
+                kind: VariantKind::Plain,
+                discriminant: None,
+            }),
+        );
+        let v2 = item(
+            4,
+            Some("Tuple"),
+            Visibility::Public,
+            ItemEnum::Variant(Variant {
+                kind: VariantKind::Tuple(vec![Some(Id(1)), None]),
+                discriminant: None,
+            }),
+        );
+        let v3 = item(
+            5,
+            Some("Structy"),
+            Visibility::Public,
+            ItemEnum::Variant(Variant {
+                kind: VariantKind::Struct {
+                    fields: vec![Id(2)],
+                    has_stripped_fields: false,
+                },
+                discriminant: None,
+            }),
+        );
+        let mut items = vec![f1, f2, v1, v2, v3];
+        let cases = vec![
+            item(
+                10,
+                Some("Unit"),
+                Visibility::Public,
+                ItemEnum::Struct(Struct {
+                    kind: StructKind::Unit,
+                    generics: generics_empty(),
+                    impls: vec![],
+                }),
+            ),
+            item(
+                11,
+                Some("TupleStruct"),
+                Visibility::Public,
+                ItemEnum::Struct(Struct {
+                    kind: StructKind::Tuple(vec![Some(Id(1)), None]),
+                    generics: generics_empty(),
+                    impls: vec![],
+                }),
+            ),
+            item(
+                12,
+                Some("E"),
+                Visibility::Public,
+                ItemEnum::Enum(Enum {
+                    generics: generics_empty(),
+                    has_stripped_variants: false,
+                    variants: vec![Id(3), Id(4), Id(5)],
+                    impls: vec![],
+                }),
+            ),
+            item(
+                13,
+                Some("run"),
+                Visibility::Public,
+                ItemEnum::Function(function()),
+            ),
+            item(
+                14,
+                Some("Alias"),
+                Visibility::Public,
+                ItemEnum::TypeAlias(TypeAlias {
+                    type_: Type::Array {
+                        type_: Box::new(Type::Primitive("u8".into())),
+                        len: "4".into(),
+                    },
+                    generics: generics_empty(),
+                }),
+            ),
+            item(
+                15,
+                Some("C"),
+                Visibility::Public,
+                ItemEnum::Constant {
+                    type_: Type::Primitive("usize".into()),
+                    const_: Constant {
+                        expr: "1".into(),
+                        value: Some("1".into()),
+                        is_literal: true,
+                    },
+                },
+            ),
+            item(
+                16,
+                Some("S"),
+                Visibility::Public,
+                ItemEnum::Static(Static {
+                    type_: Type::Primitive("bool".into()),
+                    is_mutable: true,
+                    expr: "false".into(),
+                    is_unsafe: false,
+                }),
+            ),
+            item(
+                17,
+                Some("U"),
+                Visibility::Public,
+                ItemEnum::Union(Union {
+                    generics: generics_empty(),
+                    has_stripped_fields: false,
+                    fields: vec![Id(1)],
+                    impls: vec![],
+                }),
+            ),
+            item(
+                18,
+                Some("m"),
+                Visibility::Public,
+                ItemEnum::Macro("() => {}".into()),
+            ),
+            item(
+                19,
+                Some("bang"),
+                Visibility::Public,
+                ItemEnum::ProcMacro(ProcMacro {
+                    kind: MacroKind::Bang,
+                    helpers: vec![],
+                }),
+            ),
+            item(
+                20,
+                Some("attr"),
+                Visibility::Public,
+                ItemEnum::ProcMacro(ProcMacro {
+                    kind: MacroKind::Attr,
+                    helpers: vec![],
+                }),
+            ),
+            item(
+                21,
+                Some("Der"),
+                Visibility::Public,
+                ItemEnum::ProcMacro(ProcMacro {
+                    kind: MacroKind::Derive,
+                    helpers: vec!["helper".into()],
+                }),
+            ),
+            item(
+                22,
+                Some("import"),
+                Visibility::Public,
+                ItemEnum::Use(Use {
+                    source: "a::b".into(),
+                    name: "import".into(),
+                    id: None,
+                    is_glob: false,
+                }),
+            ),
+            item(
+                23,
+                Some("mod"),
+                Visibility::Public,
+                ItemEnum::Module(Module {
+                    is_crate: false,
+                    items: vec![],
+                    is_stripped: false,
+                }),
+            ),
         ];
-        rank_matches(&mut docs, &import);
-        assert!(docs[0].reexported);
+        items.extend(cases.clone());
+        let docs = krate(items, Id(23));
+        for it in &cases {
+            let doc = format_item(&docs, it);
+            assert!(!doc.definition.is_empty());
+        }
+
+        let trait_item = item(
+            30,
+            Some("go"),
+            Visibility::Default,
+            ItemEnum::Function(function()),
+        );
+        let assoc_type = item(
+            31,
+            Some("Out"),
+            Visibility::Default,
+            ItemEnum::AssocType {
+                generics: generics_empty(),
+                bounds: vec![],
+                type_: None,
+            },
+        );
+        let assoc_const = item(
+            32,
+            Some("ID"),
+            Visibility::Default,
+            ItemEnum::AssocConst {
+                type_: Type::Primitive("u8".into()),
+                value: None,
+            },
+        );
+        let tr = item(
+            33,
+            Some("Worker"),
+            Visibility::Public,
+            ItemEnum::Trait(Trait {
+                is_auto: false,
+                is_unsafe: true,
+                is_dyn_compatible: true,
+                items: vec![Id(30), Id(31), Id(32)],
+                generics: generics_empty(),
+                bounds: vec![],
+                implementations: vec![],
+            }),
+        );
+        let krate = krate(
+            vec![trait_item, assoc_type, assoc_const, tr.clone()],
+            Id(33),
+        );
+        let doc = format_item(&krate, &tr);
+        assert_eq!(doc.kind, "trait");
+        assert_eq!(doc.details.len(), 3);
     }
 
     #[test]
-    fn formatting_helpers_cover_edge_cases() {
-        assert_eq!(normalize_tokens("# [cfg(test)]".into()), "#[cfg(test)]");
-        assert_eq!(balanced_body("{a,{b},c} tail"), "a,{b},c");
-        assert_eq!(split_top_level("a, b(c,d), e { f, g }").len(), 3);
-        assert_eq!(read_token_string("a\\n\\\"b\" rest").unwrap().0, "a\n\"b");
-        assert!(macro_derives("#[derive(Clone, Debug)] struct X;").contains(&"Clone".into()));
-        assert!(doc_lines(&[]).is_empty());
-        assert!(derive_lines(&[]).is_empty());
+    fn type_formatting_handles_common_shapes() {
+        assert_eq!(type_str(&Type::Primitive("usize".into())), "usize");
+        assert_eq!(
+            type_str(&Type::Tuple(vec![Type::Primitive("u8".into())])),
+            "(u8)"
+        );
+        assert_eq!(
+            type_str(&Type::Slice(Box::new(Type::Primitive("u8".into())))),
+            "[u8]"
+        );
+        assert_eq!(
+            type_str(&Type::RawPointer {
+                is_mutable: false,
+                type_: Box::new(Type::Primitive("u8".into()))
+            }),
+            "*const u8"
+        );
+        assert_eq!(type_str(&Type::Infer), "_");
+        assert_eq!(
+            type_str(&Type::FunctionPointer(Box::new(
+                rustdoc_types::FunctionPointer {
+                    sig: FunctionSignature {
+                        inputs: vec![],
+                        output: None,
+                        is_c_variadic: false
+                    },
+                    generic_params: vec![],
+                    header: FunctionHeader {
+                        is_const: false,
+                        is_unsafe: false,
+                        is_async: false,
+                        abi: Abi::Rust
+                    }
+                }
+            ))),
+            "fn(...)"
+        );
+        assert_eq!(
+            type_str(&Type::ResolvedPath(Path {
+                path: "std::vec::Vec".into(),
+                id: Id(1),
+                args: None
+            })),
+            "std::vec::Vec"
+        );
+        assert_eq!(
+            type_str(&Type::Pat {
+                type_: Box::new(Type::Primitive("u8".into())),
+                __pat_unstable_do_not_use: "1..".into()
+            }),
+            "u8"
+        );
+        assert_eq!(
+            type_str(&Type::QualifiedPath {
+                name: "Item".into(),
+                args: None,
+                self_type: Box::new(Type::Generic("T".into())),
+                trait_: None
+            }),
+            "Item"
+        );
+        assert_eq!(generics(&generics_all()), "<'a, T, N>");
     }
 }

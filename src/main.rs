@@ -1,18 +1,18 @@
 mod cli;
 mod imports;
 mod resolver;
+mod rustdoc_json;
 mod symbols;
 
 use cargo_metadata::MetadataCommand;
 use cli::parse_args;
-use imports::{ImportPath, parse_use_line};
+use imports::ImportPath;
 use resolver::{
-    is_rust_library_crate, library_root, package_dependencies, package_for_manifest,
-    resolve_package,
+    is_rust_library_crate, package_dependencies, package_for_manifest, resolve_dependency,
 };
 use std::path::Path;
 use std::process::ExitCode;
-use symbols::{SymbolDoc, add_reexported_matches, find_symbols, rank_matches};
+use symbols::SymbolDoc;
 
 fn main() -> ExitCode {
     match run() {
@@ -26,7 +26,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
-    let import = parse_use_line(&args.use_line)?;
+    let import = imports::parse_use_line(&args.use_line)?;
 
     if is_rust_library_crate(&import.crate_name) {
         return Err(format!(
@@ -35,55 +35,40 @@ fn run() -> Result<(), String> {
         ));
     }
 
+    let manifest_path = args.root.join("Cargo.toml");
+    if !manifest_path.exists() {
+        return Err(format!(
+            "no Cargo.toml found at {}",
+            manifest_path.display()
+        ));
+    }
     let metadata = MetadataCommand::new()
-        .manifest_path(args.root.join("Cargo.toml"))
+        .manifest_path(&manifest_path)
         .exec()
         .map_err(|err| format!("failed to read cargo metadata: {err}"))?;
 
-    let root_package = package_for_manifest(&metadata, &args.root.join("Cargo.toml"))?;
+    let root_package = package_for_manifest(&metadata, &manifest_path)?;
     let root_dependencies = package_dependencies(&metadata, &root_package.id);
-    let package = resolve_package(&metadata.packages, &root_dependencies, &import.crate_name)?;
-    let package_dependencies = package_dependencies(&metadata, &package.id);
-    let root_file = library_root(package)?;
-    let src = root_file
-        .parent()
-        .ok_or_else(|| format!("library target {} has no parent", root_file.display()))?
-        .to_path_buf();
-
-    if !root_file.exists() {
-        return Err(format!(
-            "source not found for {} at {}",
-            package.name,
-            root_file.display()
-        ));
-    }
-
-    let mut matches = find_symbols(&root_file, &import.item, &import.segments).unwrap_or_default();
-    add_reexported_matches(
-        &root_file,
-        &import,
-        &metadata.packages,
-        &package_dependencies,
-        &mut matches,
-    )?;
-    if matches.is_empty() {
-        return Err(not_found_message(
+    let dep = resolve_dependency(&metadata.packages, &root_dependencies, &import.crate_name)?;
+    let (krate, json_path) =
+        rustdoc_json::load_or_generate(manifest_path, &metadata, dep.package, dep.target)?;
+    let found = symbols::find_symbol(&krate, &import).map_err(|err| {
+        not_found_message(
             &import,
-            &package.name,
-            Some(&package.version.to_string()),
-            &src,
-        ));
-    }
-    rank_matches(&mut matches, &import);
+            &dep.package.name,
+            Some(&dep.package.version.to_string()),
+            &json_path,
+            Some(&err),
+        )
+    })?;
 
     print_report(
-        &package.name,
-        Some(&package.version.to_string()),
-        &src,
+        &dep.package.name,
+        Some(&dep.package.version.to_string()),
+        &json_path,
         &args.use_line,
         &import,
-        &matches,
-        &matches[0],
+        &found,
     );
 
     Ok(())
@@ -92,10 +77,9 @@ fn run() -> Result<(), String> {
 fn print_report(
     crate_name: &str,
     version: Option<&str>,
-    src: &Path,
+    source: &Path,
     use_line: &str,
-    import: &ImportPath,
-    matches: &[SymbolDoc],
+    _import: &ImportPath,
     found: &SymbolDoc,
 ) {
     if let Some(version) = version {
@@ -103,18 +87,14 @@ fn print_report(
     } else {
         println!("crate: {crate_name}");
     }
-    println!("source: {}", src.display());
+    println!("source: {}", source.display());
     println!("import: {}", use_line.trim());
     println!("item: {} {}", found.kind, found.name);
-    println!(
-        "location: {}:{}",
-        found
-            .path
-            .strip_prefix(src)
-            .unwrap_or(&found.path)
-            .display(),
-        found.line
-    );
+    if found.path.as_os_str().is_empty() {
+        println!("location: (unknown)");
+    } else {
+        println!("location: {}:{}", found.path.display(), found.line);
+    }
     println!("definition: {}", found.definition);
     if !found.derives.is_empty() {
         println!("derives: {}", found.derives.join(", "));
@@ -133,20 +113,14 @@ fn print_report(
             println!("  {line}");
         }
     }
-    if matches.len() > 1 {
-        println!(
-            "note: {} items named '{}' found; best match shown",
-            matches.len(),
-            import.item
-        );
-    }
 }
 
 fn not_found_message(
     import: &ImportPath,
     crate_name: &str,
     version: Option<&str>,
-    src: &Path,
+    source: &Path,
+    context: Option<&str>,
 ) -> String {
     let crate_label = if let Some(version) = version {
         format!("{crate_name} {version}")
@@ -154,16 +128,16 @@ fn not_found_message(
         crate_name.to_string()
     };
     let mut message = format!(
-        "item '{}' not found in {} ({})",
+        "item '{}' not found in {} ({}): {}",
         import.item,
         crate_label,
-        src.display()
+        source.display(),
+        context.unwrap_or("no matching public rustdoc item")
     );
     if looks_like_module_name(&import.item) {
         message.push_str(&format!(
-            "; '{}' appears to be a module — query a concrete item inside it, e.g. `use {}::Sender;`",
-            import.item,
-            import.full_path()
+            "; '{}' appears to be a module — query a concrete item inside that module",
+            import.item
         ));
     }
     message
@@ -177,10 +151,11 @@ fn looks_like_module_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn doc(name: &str, docs: Vec<String>) -> SymbolDoc {
         SymbolDoc {
-            path: Path::new("/tmp/src/lib.rs").to_path_buf(),
+            path: PathBuf::from("/tmp/src/lib.rs"),
             line: 7,
             kind: "struct",
             name: name.into(),
@@ -188,8 +163,6 @@ mod tests {
             details: vec!["field: usize".into()],
             docs,
             derives: vec!["Debug".into()],
-            public: true,
-            reexported: false,
         }
     }
 
@@ -200,16 +173,17 @@ mod tests {
             segments: vec!["sync".into()],
             item: "mpsc".into(),
         };
-        let message = not_found_message(&module, "tokio", Some("1.0.0"), Path::new("/src"));
+        let message = not_found_message(&module, "tokio", Some("1.0.0"), Path::new("/src"), None);
         assert!(message.contains("appears to be a module"));
-        assert!(message.contains("tokio::sync::mpsc::Sender"));
+        assert!(message.contains("query a concrete item inside that module"));
+        assert!(!message.contains("Sender"));
 
         let item = ImportPath {
             crate_name: "x".into(),
             segments: vec![],
             item: "Thing".into(),
         };
-        let message = not_found_message(&item, "x", None, Path::new("/src"));
+        let message = not_found_message(&item, "x", None, Path::new("/src"), None);
         assert!(!message.contains("appears to be a module"));
         assert!(looks_like_module_name("module_2"));
         assert!(!looks_like_module_name("TypeName"));
@@ -223,15 +197,12 @@ mod tests {
             item: "Thing".into(),
         };
         let src = Path::new("/tmp/src");
-        let first = doc("Thing", vec!["docs".into()]);
-        let second = doc("Thing", Vec::new());
         print_report(
             "x",
             Some("1.2.3"),
             src,
             "use x::Thing;",
             &import,
-            &[first, second],
             &doc("Thing", vec!["docs".into()]),
         );
         print_report(
@@ -240,7 +211,6 @@ mod tests {
             src,
             "use x::Thing;",
             &import,
-            &[doc("Thing", Vec::new())],
             &doc("Thing", Vec::new()),
         );
     }

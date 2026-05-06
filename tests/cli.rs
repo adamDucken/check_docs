@@ -3,7 +3,7 @@ use std::process::Command;
 #[test]
 fn binary_reports_dependency_item() {
     let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
-        .args(["use syn::ItemUse;", "--root", "."])
+        .args(["use cargo_metadata::MetadataCommand;", "--root", "."])
         .output()
         .unwrap();
     assert!(
@@ -12,8 +12,8 @@ fn binary_reports_dependency_item() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("crate: syn"));
-    assert!(stdout.contains("item: struct ItemUse"));
+    assert!(stdout.contains("crate: cargo_metadata"));
+    assert!(stdout.contains("item: struct MetadataCommand"));
 }
 
 #[test]

@@ -15,7 +15,16 @@ impl ImportPath {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn parse_use_line(line: &str) -> Result<ImportPath, String> {
+    let mut imports = parse_use_lines(line)?;
+    if imports.len() != 1 {
+        return Err("expected one import path".to_string());
+    }
+    Ok(imports.remove(0))
+}
+
+pub(crate) fn parse_use_lines(line: &str) -> Result<Vec<ImportPath>, String> {
     let mut text = line.trim().to_string();
     if let Some(rest) = text.strip_prefix("use ") {
         text = rest.trim().to_string();
@@ -29,19 +38,24 @@ pub(crate) fn parse_use_line(line: &str) -> Result<ImportPath, String> {
     if text.starts_with("::") {
         return Err("absolute use paths with leading `::` are not supported".to_string());
     }
-    text = expand_single_brace_path(&text)?;
     if text.contains('*') {
         return Err("glob imports are not supported".to_string());
     }
 
-    let parts: Vec<String> = text
-        .split("::")
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(ToOwned::to_owned)
-        .collect();
+    expand_brace_paths(&text)?
+        .into_iter()
+        .map(|path| parse_path(&path, line))
+        .collect()
+}
+
+fn parse_path(text: &str, original: &str) -> Result<ImportPath, String> {
+    let raw_parts = text.split("::").map(str::trim).collect::<Vec<_>>();
+    if raw_parts.iter().any(|part| part.is_empty()) {
+        return Err(format!("invalid empty use path segment in '{original}'"));
+    }
+    let parts: Vec<String> = raw_parts.into_iter().map(ToOwned::to_owned).collect();
     if parts.len() < 2 {
-        return Err(format!("expected external use path, got '{line}'"));
+        return Err(format!("expected external use path, got '{original}'"));
     }
     if matches!(parts[0].as_str(), "crate" | "self" | "super") {
         return Err("only external crate use paths are supported".to_string());
@@ -54,22 +68,29 @@ pub(crate) fn parse_use_line(line: &str) -> Result<ImportPath, String> {
     })
 }
 
-fn expand_single_brace_path(text: &str) -> Result<String, String> {
+fn expand_brace_paths(text: &str) -> Result<Vec<String>, String> {
     let Some(open) = text.find('{') else {
-        return Ok(text.to_string());
+        return Ok(vec![text.to_string()]);
     };
     let Some(close) = text.rfind('}') else {
         return Err(format!("expected external use path, got '{text}'"));
     };
+    if text[open + 1..close].contains('{') || !text[close + 1..].trim().is_empty() {
+        return Err("nested brace imports are not supported for now".to_string());
+    }
     let prefix = text[..open].trim_end_matches("::").trim();
     let inner = text[open + 1..close].trim();
-    if inner.contains(',') {
-        return Err("brace imports must contain one item for now".to_string());
+    if inner.is_empty() {
+        return Err("brace imports must contain at least one item".to_string());
     }
-    if inner.contains('{') || text[close + 1..].trim().len() != 0 {
-        return Err("brace imports must contain one item for now".to_string());
+    let items = inner.split(',').map(str::trim).collect::<Vec<_>>();
+    if items.iter().any(|item| item.is_empty()) {
+        return Err("brace imports must not contain empty items".to_string());
     }
-    Ok(format!("{prefix}::{inner}"))
+    items
+        .into_iter()
+        .map(|item| Ok(format!("{prefix}::{item}")))
+        .collect()
 }
 
 #[cfg(test)]
@@ -100,9 +121,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_multi_item_brace_use() {
+    fn parses_multi_item_brace_use() {
+        let imports = parse_use_lines("use syn::{ItemUse, item::UseTree};").unwrap();
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].item, "ItemUse");
+        assert_eq!(imports[1].segments, vec!["item"]);
+        assert_eq!(imports[1].item, "UseTree");
+
         let err = parse_use_line("use syn::{ItemUse, UseTree};").unwrap_err();
-        assert_eq!(err, "brace imports must contain one item for now");
+        assert_eq!(err, "expected one import path");
     }
 
     #[test]
@@ -124,6 +151,15 @@ mod tests {
 
         let err = parse_use_line("use self::Thing;").unwrap_err();
         assert_eq!(err, "only external crate use paths are supported");
+    }
+
+    #[test]
+    fn rejects_empty_path_segments_and_empty_brace_items() {
+        let err = parse_use_line("use syn::::ItemUse;").unwrap_err();
+        assert!(err.contains("invalid empty use path segment"));
+
+        let err = parse_use_lines("use syn::{ItemUse,,UseTree};").unwrap_err();
+        assert_eq!(err, "brace imports must not contain empty items");
     }
 
     #[test]

@@ -26,13 +26,15 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
-    let import = imports::parse_use_line(&args.use_line)?;
+    let imports = imports::parse_use_lines(&args.use_line)?;
 
-    if is_rust_library_crate(&import.crate_name) {
-        return Err(format!(
-            "{} is part of the Rust standard library and is not supported; use the official Rust docs: https://doc.rust-lang.org/std/",
-            import.crate_name
-        ));
+    for import in &imports {
+        if is_rust_library_crate(&import.crate_name) {
+            return Err(format!(
+                "{} is part of the Rust standard library and is not supported; use the official Rust docs: https://doc.rust-lang.org/std/",
+                import.crate_name
+            ));
+        }
     }
 
     let manifest_path = args.root.join("Cargo.toml");
@@ -49,29 +51,45 @@ fn run() -> Result<(), String> {
 
     let root_package = package_for_manifest(&metadata, &manifest_path)?;
     let root_dependencies = package_dependencies(&metadata, &root_package.id);
-    let dep = resolve_dependency(&metadata.packages, &root_dependencies, &import.crate_name)?;
-    let (krate, json_path) =
-        rustdoc_json::load_or_generate(manifest_path, &metadata, dep.package, dep.target)?;
-    let found = symbols::find_symbol(&krate, &import).map_err(|err| {
-        not_found_message(
-            &import,
+    for (index, import) in imports.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        let dep = resolve_dependency(&metadata.packages, &root_dependencies, &import.crate_name)?;
+        let (krate, json_path) = rustdoc_json::load_or_generate(
+            manifest_path.clone(),
+            &metadata,
+            dep.package,
+            dep.target,
+        )?;
+        let found = symbols::find_symbol(&krate, import).map_err(|err| {
+            not_found_message(
+                import,
+                &dep.package.name,
+                Some(&dep.package.version.to_string()),
+                &json_path,
+                Some(&err),
+            )
+        })?;
+
+        print_report(
             &dep.package.name,
             Some(&dep.package.version.to_string()),
             &json_path,
-            Some(&err),
-        )
-    })?;
-
-    print_report(
-        &dep.package.name,
-        Some(&dep.package.version.to_string()),
-        &json_path,
-        &args.use_line,
-        &import,
-        &found,
-    );
+            &format_use(import),
+            import,
+            &found,
+        );
+    }
 
     Ok(())
+}
+
+fn format_use(import: &ImportPath) -> String {
+    let mut parts = vec![import.crate_name.clone()];
+    parts.extend(import.segments.clone());
+    parts.push(import.item.clone());
+    format!("use {};", parts.join("::"))
 }
 
 fn print_report(
@@ -105,6 +123,18 @@ fn print_report(
             println!("  {line}");
         }
     }
+    if !found.methods.is_empty() {
+        println!("methods:");
+        for line in &found.methods {
+            println!("  {line}");
+        }
+    }
+    if !found.impls.is_empty() {
+        println!("impls:");
+        for line in &found.impls {
+            println!("  {line}");
+        }
+    }
     if found.docs.is_empty() {
         println!("docs: (none)");
     } else {
@@ -127,12 +157,38 @@ fn not_found_message(
     } else {
         crate_name.to_string()
     };
+    let Some(context) = context else {
+        let mut message = format!(
+            "item '{}' not found in {} ({}): no matching public rustdoc item",
+            import.item,
+            crate_label,
+            source.display(),
+        );
+        if looks_like_module_name(&import.item) {
+            message.push_str(&format!(
+                "; '{}' appears to be a module — query a concrete item inside that module",
+                import.item
+            ));
+        }
+        return message;
+    };
+
+    if context.contains("external re-export") {
+        return format!(
+            "item '{}' is a public re-export with unsupported rustdoc external id in {} ({}): {}; query/add the external crate directly if available",
+            import.item,
+            crate_label,
+            source.display(),
+            context
+        );
+    }
+
     let mut message = format!(
         "item '{}' not found in {} ({}): {}",
         import.item,
         crate_label,
         source.display(),
-        context.unwrap_or("no matching public rustdoc item")
+        context
     );
     if looks_like_module_name(&import.item) {
         message.push_str(&format!(
@@ -163,6 +219,8 @@ mod tests {
             details: vec!["field: usize".into()],
             docs,
             derives: vec!["Debug".into()],
+            methods: vec!["pub fn new() -> Self".into()],
+            impls: vec!["impl Clone".into()],
         }
     }
 

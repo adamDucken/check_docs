@@ -1,7 +1,8 @@
 use crate::imports::ImportPath;
 use rustdoc_types::{
-    Crate, GenericParamDefKind, Id, Item, ItemEnum, MacroKind, StructKind, Type, VariantKind,
-    Visibility,
+    AssocItemConstraintKind, Attribute, Crate, GenericArg, GenericArgs, GenericBound,
+    GenericParamDefKind, Id, Item, ItemEnum, MacroKind, StructKind, Term, TraitBoundModifier, Type,
+    VariantKind, Visibility,
 };
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -16,6 +17,8 @@ pub(crate) struct SymbolDoc {
     pub(crate) details: Vec<String>,
     pub(crate) docs: Vec<String>,
     pub(crate) derives: Vec<String>,
+    pub(crate) methods: Vec<String>,
+    pub(crate) impls: Vec<String>,
 }
 
 pub(crate) fn find_symbol(krate: &Crate, import: &ImportPath) -> Result<SymbolDoc, String> {
@@ -114,10 +117,23 @@ fn follow_use(krate: &Crate, mut id: Id, visited: &mut HashSet<Id>) -> Result<Id
 }
 
 fn item(krate: &Crate, id: Id) -> Result<&Item, String> {
-    krate
-        .index
-        .get(&id)
-        .ok_or_else(|| format!("rustdoc item id {:?} missing from index", id))
+    krate.index.get(&id).ok_or_else(|| {
+        if let Some(summary) = krate.paths.get(&id) {
+            let external = krate
+                .external_crates
+                .get(&summary.crate_id)
+                .map(|krate| krate.name.as_str())
+                .unwrap_or("unknown");
+            format!(
+                "rustdoc item id {:?} references external re-export from crate '{}' (path {}); full item data is not present in this crate's rustdoc JSON",
+                id,
+                external,
+                summary.path.join("::")
+            )
+        } else {
+            format!("rustdoc item id {:?} missing from index and paths", id)
+        }
+    })
 }
 
 fn exported_name(item: &Item) -> Option<String> {
@@ -194,6 +210,7 @@ fn format_item(krate: &Crate, item: &Item) -> SymbolDoc {
             format!("pub use {} as {};", u.source, u.name),
             Vec::new(),
         ),
+        ItemEnum::Module(_) => ("module", format!("pub module {name}"), Vec::new()),
         _ => (
             "item",
             format!("pub {} {name}", kind_name(&item.inner)),
@@ -219,7 +236,126 @@ fn format_item(krate: &Crate, item: &Item) -> SymbolDoc {
             .map(|line| line.trim().to_string())
             .filter(|line| !line.is_empty())
             .collect(),
-        derives: Vec::new(),
+        derives: derives(krate, item),
+        methods: methods(krate, item),
+        impls: impls(krate, item),
+    }
+}
+
+fn derives(krate: &Crate, item: &Item) -> Vec<String> {
+    let mut derives = derive_attrs(&item.attrs);
+    for impl_id in impl_ids(item) {
+        let Some(impl_item) = krate.index.get(&impl_id) else {
+            continue;
+        };
+        let ItemEnum::Impl(imp) = &impl_item.inner else {
+            continue;
+        };
+        if !impl_item
+            .attrs
+            .iter()
+            .any(|attr| matches!(attr, Attribute::AutomaticallyDerived))
+        {
+            continue;
+        }
+        let Some(trait_) = &imp.trait_ else {
+            continue;
+        };
+        let name = trait_.path.rsplit("::").next().unwrap_or(&trait_.path);
+        if name != "StructuralPartialEq" && !derives.iter().any(|existing| existing == name) {
+            derives.push(name.to_string());
+        }
+    }
+    derives.sort();
+    derives
+}
+
+fn derive_attrs(attrs: &[Attribute]) -> Vec<String> {
+    let mut derives = Vec::new();
+    for attr in attrs {
+        let Attribute::Other(text) = attr else {
+            continue;
+        };
+        let Some(start) = text.find("derive(") else {
+            continue;
+        };
+        let after = &text[start + "derive(".len()..];
+        let Some(end) = after.find(')') else {
+            continue;
+        };
+        derives.extend(
+            after[..end]
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned),
+        );
+    }
+    derives
+}
+
+fn methods(krate: &Crate, item: &Item) -> Vec<String> {
+    let mut methods = Vec::new();
+    for impl_id in impl_ids(item) {
+        let Some(impl_item) = krate.index.get(&impl_id) else {
+            continue;
+        };
+        let ItemEnum::Impl(imp) = &impl_item.inner else {
+            continue;
+        };
+        if imp.trait_.is_some() || imp.is_negative || imp.is_synthetic {
+            continue;
+        }
+        for item_id in &imp.items {
+            let Some(method) = krate.index.get(item_id) else {
+                continue;
+            };
+            if !is_public(method) {
+                continue;
+            }
+            if let (Some(name), ItemEnum::Function(f)) = (&method.name, &method.inner) {
+                methods.push(fn_def(name, f));
+            }
+        }
+    }
+    methods.sort();
+    methods
+}
+
+fn impls(krate: &Crate, item: &Item) -> Vec<String> {
+    let mut impls = Vec::new();
+    for impl_id in impl_ids(item) {
+        let Some(impl_item) = krate.index.get(&impl_id) else {
+            continue;
+        };
+        let ItemEnum::Impl(imp) = &impl_item.inner else {
+            continue;
+        };
+        if imp.is_synthetic || imp.blanket_impl.is_some() {
+            continue;
+        }
+        let Some(trait_) = &imp.trait_ else {
+            continue;
+        };
+        let prefix = if imp.is_negative { "impl !" } else { "impl " };
+        let safety = if imp.is_unsafe { "unsafe " } else { "" };
+        impls.push(format!(
+            "{safety}{prefix}{} for {}",
+            format_path(trait_),
+            type_str(&imp.for_)
+        ));
+    }
+    impls.sort();
+    impls.dedup();
+    impls
+}
+
+fn impl_ids(item: &Item) -> Vec<Id> {
+    match &item.inner {
+        ItemEnum::Struct(s) => s.impls.clone(),
+        ItemEnum::Enum(e) => e.impls.clone(),
+        ItemEnum::Union(u) => u.impls.clone(),
+        _ => Vec::new(),
     }
 }
 
@@ -268,18 +404,33 @@ fn struct_def(krate: &Crate, name: &str, s: &rustdoc_types::Struct) -> String {
 
 fn struct_details(krate: &Crate, s: &rustdoc_types::Struct) -> Vec<String> {
     match &s.kind {
-        StructKind::Plain { fields, .. } => fields
-            .iter()
-            .filter_map(|id| field_line(krate, *id))
-            .collect(),
-        StructKind::Tuple(fields) => fields
-            .iter()
-            .enumerate()
-            .filter_map(|(i, id)| {
-                id.and_then(|id| field_type(krate, id))
-                    .map(|ty| format!("#{i}: {ty}"))
-            })
-            .collect(),
+        StructKind::Plain {
+            fields,
+            has_stripped_fields,
+        } => {
+            let mut details = fields
+                .iter()
+                .filter_map(|id| field_line(krate, *id))
+                .collect::<Vec<_>>();
+            if *has_stripped_fields {
+                details.push("fields: private/stripped".to_string());
+            }
+            details
+        }
+        StructKind::Tuple(fields) => {
+            let mut details = fields
+                .iter()
+                .enumerate()
+                .filter_map(|(i, id)| {
+                    id.and_then(|id| field_type(krate, id))
+                        .map(|ty| format!("#{i}: {ty}"))
+                })
+                .collect::<Vec<_>>();
+            if fields.iter().any(Option::is_none) {
+                details.push("fields: private/stripped".to_string());
+            }
+            details
+        }
         StructKind::Unit => Vec::new(),
     }
 }
@@ -293,7 +444,8 @@ fn enum_def(krate: &Crate, name: &str, e: &rustdoc_types::Enum) -> String {
 }
 
 fn enum_details(krate: &Crate, e: &rustdoc_types::Enum) -> Vec<String> {
-    e.variants
+    let mut details = e
+        .variants
         .iter()
         .filter_map(|id| {
             let item = krate.index.get(id)?;
@@ -325,7 +477,11 @@ fn enum_details(krate: &Crate, e: &rustdoc_types::Enum) -> Vec<String> {
                 ),
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if e.has_stripped_variants {
+        details.push("variants: private/stripped".to_string());
+    }
+    details
 }
 
 fn trait_def(_krate: &Crate, name: &str, t: &rustdoc_types::Trait) -> String {
@@ -366,13 +522,14 @@ fn fn_def(name: &str, f: &rustdoc_types::Function) -> String {
     if f.header.is_unsafe {
         prefix.push_str("unsafe ");
     }
+    prefix.push_str(&abi_str(&f.header.abi));
     let inputs = f
         .sig
         .inputs
         .iter()
         .map(|(name, ty)| format!("{name}: {}", type_str(ty)))
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect::<Vec<_>>();
+    let inputs = signature_inputs(inputs, f.sig.is_c_variadic);
     let output = f
         .sig
         .output
@@ -394,10 +551,15 @@ fn union_def(krate: &Crate, name: &str, u: &rustdoc_types::Union) -> String {
 }
 
 fn union_details(krate: &Crate, u: &rustdoc_types::Union) -> Vec<String> {
-    u.fields
+    let mut details = u
+        .fields
         .iter()
         .filter_map(|id| field_line(krate, *id))
-        .collect()
+        .collect::<Vec<_>>();
+    if u.has_stripped_fields {
+        details.push("fields: private/stripped".to_string());
+    }
+    details
 }
 
 fn field_line(krate: &Crate, id: Id) -> Option<String> {
@@ -421,38 +583,65 @@ fn field_type(krate: &Crate, id: Id) -> Option<String> {
 }
 
 fn generics(g: &rustdoc_types::Generics) -> String {
-    if g.params.is_empty() {
-        return String::new();
+    let params = g
+        .params
+        .iter()
+        .filter(|p| {
+            !matches!(
+                &p.kind,
+                GenericParamDefKind::Type {
+                    is_synthetic: true,
+                    ..
+                }
+            )
+        })
+        .map(|p| match &p.kind {
+            GenericParamDefKind::Lifetime { .. } => lifetime_str(&p.name),
+            GenericParamDefKind::Type { .. } | GenericParamDefKind::Const { .. } => p.name.clone(),
+        })
+        .collect::<Vec<_>>();
+    if params.is_empty() {
+        String::new()
+    } else {
+        format!("<{}>", params.join(", "))
     }
-    format!(
-        "<{}>",
-        g.params
-            .iter()
-            .map(|p| match &p.kind {
-                GenericParamDefKind::Lifetime { .. } => format!("'{}", p.name),
-                GenericParamDefKind::Type { .. } | GenericParamDefKind::Const { .. } =>
-                    p.name.clone(),
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
 }
 
 fn type_str(ty: &Type) -> String {
     match ty {
-        Type::ResolvedPath(path) => path.path.clone(),
-        Type::DynTrait(_) => "dyn Trait".to_string(),
+        Type::ResolvedPath(path) => format_path(path),
+        Type::DynTrait(dyn_trait) => {
+            let traits = dyn_trait
+                .traits
+                .iter()
+                .map(|t| {
+                    let bound = format_path(&t.trait_);
+                    if t.generic_params.is_empty() {
+                        bound
+                    } else {
+                        format!("for<{}> {bound}", generic_param_names(&t.generic_params))
+                    }
+                })
+                .chain(dyn_trait.lifetime.as_ref().map(|l| lifetime_str(l)))
+                .collect::<Vec<_>>()
+                .join(" + ");
+            format!("dyn {traits}")
+        }
         Type::Generic(name) => name.clone(),
         Type::Primitive(name) => name.clone(),
-        Type::FunctionPointer(_) => "fn(...)".to_string(),
-        Type::Tuple(items) => format!(
-            "({})",
-            items.iter().map(type_str).collect::<Vec<_>>().join(", ")
-        ),
+        Type::FunctionPointer(fp) => fn_pointer_str(fp),
+        Type::Tuple(items) => {
+            let inner = items.iter().map(type_str).collect::<Vec<_>>().join(", ");
+            if items.len() == 1 {
+                format!("({inner},)")
+            } else {
+                format!("({inner})")
+            }
+        }
         Type::Slice(inner) => format!("[{}]", type_str(inner)),
         Type::Array { type_, len } => format!("[{}; {len}]", type_str(type_)),
         Type::Pat { type_, .. } => type_str(type_),
-        Type::ImplTrait(_) => "impl Trait".to_string(),
+        Type::ImplTrait(bounds) => format!("impl {}", bounds_str(bounds)),
         Type::Infer => "_".to_string(),
         Type::RawPointer { is_mutable, type_ } => format!(
             "*{} {}",
@@ -467,13 +656,201 @@ fn type_str(ty: &Type) -> String {
             "&{}{}{}",
             lifetime
                 .as_ref()
-                .map(|l| format!("'{l} "))
+                .map(|l| format!("{} ", lifetime_str(l)))
                 .unwrap_or_default(),
             if *is_mutable { "mut " } else { "" },
             type_str(type_)
         ),
-        Type::QualifiedPath { name, .. } => name.clone(),
+        Type::QualifiedPath {
+            name,
+            args,
+            self_type,
+            trait_,
+        } => {
+            let name = format!(
+                "{name}{}",
+                args.as_deref().map(args_str).unwrap_or_default()
+            );
+            if let Some(trait_) = trait_ {
+                let trait_path = format_path(trait_);
+                if trait_path.is_empty() {
+                    format!("{}::{name}", type_str(self_type))
+                } else {
+                    format!("<{} as {trait_path}>::{name}", type_str(self_type))
+                }
+            } else {
+                format!("{}::{name}", type_str(self_type))
+            }
+        }
     }
+}
+
+fn format_path(path: &rustdoc_types::Path) -> String {
+    format!(
+        "{}{}",
+        path.path,
+        path.args.as_deref().map(args_str).unwrap_or_default()
+    )
+}
+
+fn args_str(args: &GenericArgs) -> String {
+    match args {
+        GenericArgs::AngleBracketed { args, constraints } => {
+            let mut parts = args.iter().map(generic_arg_str).collect::<Vec<_>>();
+            parts.extend(constraints.iter().map(|constraint| {
+                let args = constraint.args.as_deref().map(args_str).unwrap_or_default();
+                match &constraint.binding {
+                    AssocItemConstraintKind::Equality(term) => {
+                        format!("{}{} = {}", constraint.name, args, term_str(term))
+                    }
+                    AssocItemConstraintKind::Constraint(bounds) => {
+                        format!("{}{}: {}", constraint.name, args, bounds_str(bounds))
+                    }
+                }
+            }));
+            if parts.is_empty() {
+                String::new()
+            } else {
+                format!("<{}>", parts.join(", "))
+            }
+        }
+        GenericArgs::Parenthesized { inputs, output } => {
+            let inputs = inputs.iter().map(type_str).collect::<Vec<_>>().join(", ");
+            let output = output
+                .as_ref()
+                .map(|ty| format!(" -> {}", type_str(ty)))
+                .unwrap_or_default();
+            format!("({inputs}){output}")
+        }
+        GenericArgs::ReturnTypeNotation => "(..)".to_string(),
+    }
+}
+
+fn generic_arg_str(arg: &GenericArg) -> String {
+    match arg {
+        GenericArg::Lifetime(lifetime) => lifetime_str(lifetime),
+        GenericArg::Type(ty) => type_str(ty),
+        GenericArg::Const(c) => c.expr.clone(),
+        GenericArg::Infer => "_".to_string(),
+    }
+}
+
+fn term_str(term: &Term) -> String {
+    match term {
+        Term::Type(ty) => type_str(ty),
+        Term::Constant(c) => c.expr.clone(),
+    }
+}
+
+fn bounds_str(bounds: &[GenericBound]) -> String {
+    if bounds.is_empty() {
+        return "Trait".to_string();
+    }
+    bounds.iter().map(bound_str).collect::<Vec<_>>().join(" + ")
+}
+
+fn bound_str(bound: &GenericBound) -> String {
+    match bound {
+        GenericBound::TraitBound {
+            trait_,
+            generic_params,
+            modifier,
+        } => {
+            let modifier = match modifier {
+                TraitBoundModifier::None => "",
+                TraitBoundModifier::Maybe => "?",
+                TraitBoundModifier::MaybeConst => "~const ",
+            };
+            let bound = format!("{modifier}{}", format_path(trait_));
+            if generic_params.is_empty() {
+                bound
+            } else {
+                format!("for<{}> {bound}", generic_param_names(generic_params))
+            }
+        }
+        GenericBound::Outlives(lifetime) => lifetime_str(lifetime),
+        GenericBound::Use(args) => format!(
+            "use<{}>",
+            args.iter()
+                .map(|arg| match arg {
+                    rustdoc_types::PreciseCapturingArg::Lifetime(l) => lifetime_str(l),
+                    rustdoc_types::PreciseCapturingArg::Param(p) => p.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn generic_param_names(params: &[rustdoc_types::GenericParamDef]) -> String {
+    params
+        .iter()
+        .map(|p| match &p.kind {
+            GenericParamDefKind::Lifetime { .. } => lifetime_str(&p.name),
+            GenericParamDefKind::Type { .. } | GenericParamDefKind::Const { .. } => p.name.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn lifetime_str(lifetime: &str) -> String {
+    if lifetime.starts_with('\'') {
+        lifetime.to_string()
+    } else {
+        format!("'{lifetime}")
+    }
+}
+
+fn fn_pointer_str(fp: &rustdoc_types::FunctionPointer) -> String {
+    let prefix = if fp.header.is_unsafe { "unsafe " } else { "" };
+    let abi = abi_str(&fp.header.abi);
+    let inputs = fp
+        .sig
+        .inputs
+        .iter()
+        .map(|(_, ty)| type_str(ty))
+        .collect::<Vec<_>>();
+    let inputs = signature_inputs(inputs, fp.sig.is_c_variadic);
+    let output = fp
+        .sig
+        .output
+        .as_ref()
+        .map(|ty| format!(" -> {}", type_str(ty)))
+        .unwrap_or_default();
+    format!("{prefix}{abi}fn({inputs}){output}")
+}
+
+fn signature_inputs(mut inputs: Vec<String>, is_c_variadic: bool) -> String {
+    if is_c_variadic {
+        inputs.push("...".to_string());
+    }
+    inputs.join(", ")
+}
+
+fn abi_str(abi: &rustdoc_types::Abi) -> String {
+    use rustdoc_types::Abi;
+
+    let name = match abi {
+        Abi::Rust => return String::new(),
+        Abi::C { unwind: false } => "C",
+        Abi::C { unwind: true } => "C-unwind",
+        Abi::Cdecl { unwind: false } => "cdecl",
+        Abi::Cdecl { unwind: true } => "cdecl-unwind",
+        Abi::Stdcall { unwind: false } => "stdcall",
+        Abi::Stdcall { unwind: true } => "stdcall-unwind",
+        Abi::Fastcall { unwind: false } => "fastcall",
+        Abi::Fastcall { unwind: true } => "fastcall-unwind",
+        Abi::Aapcs { unwind: false } => "aapcs",
+        Abi::Aapcs { unwind: true } => "aapcs-unwind",
+        Abi::Win64 { unwind: false } => "win64",
+        Abi::Win64 { unwind: true } => "win64-unwind",
+        Abi::SysV64 { unwind: false } => "sysv64",
+        Abi::SysV64 { unwind: true } => "sysv64-unwind",
+        Abi::System { unwind: false } => "system",
+        Abi::System { unwind: true } => "system-unwind",
+        Abi::Other(name) => name,
+    };
+    format!("extern \"{name}\" ")
 }
 
 #[cfg(test)]
@@ -481,8 +858,8 @@ mod tests {
     use super::*;
     use rustdoc_types::{
         Abi, Attribute, Constant, Enum, Function, FunctionHeader, FunctionSignature,
-        GenericParamDef, GenericParamDefKind, Generics, Item, Module, Path, ProcMacro, Static,
-        Struct, Trait, TypeAlias, Union, Use, Variant,
+        GenericParamDef, GenericParamDefKind, Generics, Impl, Item, Module, Path, ProcMacro,
+        Static, Struct, Trait, TypeAlias, Union, Use, Variant,
     };
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -1024,11 +1401,102 @@ mod tests {
     }
 
     #[test]
+    fn formatter_reports_derived_traits_methods_and_impls() {
+        let method = item(
+            2,
+            Some("new"),
+            Visibility::Public,
+            ItemEnum::Function(Function {
+                sig: FunctionSignature {
+                    inputs: vec![],
+                    output: Some(Type::Generic("Self".into())),
+                    is_c_variadic: false,
+                },
+                generics: generics_empty(),
+                header: FunctionHeader {
+                    is_const: false,
+                    is_unsafe: false,
+                    is_async: false,
+                    abi: Abi::Rust,
+                },
+                has_body: true,
+            }),
+        );
+        let inherent_impl = item(
+            3,
+            None,
+            Visibility::Default,
+            ItemEnum::Impl(Impl {
+                is_unsafe: false,
+                generics: generics_empty(),
+                provided_trait_methods: vec![],
+                trait_: None,
+                for_: Type::ResolvedPath(Path {
+                    path: "Widget".into(),
+                    id: Id(1),
+                    args: None,
+                }),
+                items: vec![Id(2)],
+                is_negative: false,
+                is_synthetic: false,
+                blanket_impl: None,
+            }),
+        );
+        let mut clone_impl = item(
+            4,
+            None,
+            Visibility::Default,
+            ItemEnum::Impl(Impl {
+                is_unsafe: false,
+                generics: generics_empty(),
+                provided_trait_methods: vec![],
+                trait_: Some(Path {
+                    path: "Clone".into(),
+                    id: Id(99),
+                    args: None,
+                }),
+                for_: Type::ResolvedPath(Path {
+                    path: "Widget".into(),
+                    id: Id(1),
+                    args: None,
+                }),
+                items: vec![],
+                is_negative: false,
+                is_synthetic: false,
+                blanket_impl: None,
+            }),
+        );
+        clone_impl.attrs = vec![Attribute::AutomaticallyDerived];
+        let widget = item(
+            1,
+            Some("Widget"),
+            Visibility::Public,
+            ItemEnum::Struct(Struct {
+                kind: StructKind::Unit,
+                generics: generics_empty(),
+                impls: vec![Id(3), Id(4)],
+            }),
+        );
+        let krate = krate(
+            vec![widget.clone(), method, inherent_impl, clone_impl],
+            Id(1),
+        );
+        let doc = format_item(&krate, &widget);
+        assert_eq!(doc.derives, vec!["Clone"]);
+        assert!(
+            doc.methods
+                .iter()
+                .any(|method| method == "pub fn new() -> Self")
+        );
+        assert!(doc.impls.iter().any(|imp| imp == "impl Clone for Widget"));
+    }
+
+    #[test]
     fn type_formatting_handles_common_shapes() {
         assert_eq!(type_str(&Type::Primitive("usize".into())), "usize");
         assert_eq!(
             type_str(&Type::Tuple(vec![Type::Primitive("u8".into())])),
-            "(u8)"
+            "(u8,)"
         );
         assert_eq!(
             type_str(&Type::Slice(Box::new(Type::Primitive("u8".into())))),
@@ -1046,8 +1514,8 @@ mod tests {
             type_str(&Type::FunctionPointer(Box::new(
                 rustdoc_types::FunctionPointer {
                     sig: FunctionSignature {
-                        inputs: vec![],
-                        output: None,
+                        inputs: vec![("x".into(), Type::Primitive("u8".into()))],
+                        output: Some(Type::Primitive("bool".into())),
                         is_c_variadic: false
                     },
                     generic_params: vec![],
@@ -1059,15 +1527,18 @@ mod tests {
                     }
                 }
             ))),
-            "fn(...)"
+            "fn(u8) -> bool"
         );
         assert_eq!(
             type_str(&Type::ResolvedPath(Path {
                 path: "std::vec::Vec".into(),
                 id: Id(1),
-                args: None
+                args: Some(Box::new(GenericArgs::AngleBracketed {
+                    args: vec![GenericArg::Type(Type::Primitive("u8".into()))],
+                    constraints: vec![]
+                }))
             })),
-            "std::vec::Vec"
+            "std::vec::Vec<u8>"
         );
         assert_eq!(
             type_str(&Type::Pat {
@@ -1083,8 +1554,71 @@ mod tests {
                 self_type: Box::new(Type::Generic("T".into())),
                 trait_: None
             }),
-            "Item"
+            "T::Item"
+        );
+        assert_eq!(
+            type_str(&Type::ImplTrait(vec![GenericBound::TraitBound {
+                trait_: Path {
+                    path: "Future".into(),
+                    id: Id(1),
+                    args: Some(Box::new(GenericArgs::AngleBracketed {
+                        args: vec![],
+                        constraints: vec![rustdoc_types::AssocItemConstraint {
+                            name: "Output".into(),
+                            args: None,
+                            binding: AssocItemConstraintKind::Equality(Term::Type(
+                                Type::Primitive("u8".into())
+                            ))
+                        }]
+                    }))
+                },
+                generic_params: vec![],
+                modifier: TraitBoundModifier::None,
+            }])),
+            "impl Future<Output = u8>"
         );
         assert_eq!(generics(&generics_all()), "<'a, T, N>");
+    }
+
+    #[test]
+    fn function_formatting_preserves_abi_and_variadics() {
+        let function = Function {
+            sig: FunctionSignature {
+                inputs: vec![("fmt".into(), Type::Primitive("*const u8".into()))],
+                output: Some(Type::Primitive("i32".into())),
+                is_c_variadic: true,
+            },
+            generics: generics_empty(),
+            header: FunctionHeader {
+                is_const: false,
+                is_unsafe: true,
+                is_async: false,
+                abi: Abi::C { unwind: false },
+            },
+            has_body: false,
+        };
+        assert_eq!(
+            fn_def("printf_like", &function),
+            "pub unsafe extern \"C\" fn printf_like(fmt: *const u8, ...) -> i32"
+        );
+
+        let pointer = Type::FunctionPointer(Box::new(rustdoc_types::FunctionPointer {
+            sig: FunctionSignature {
+                inputs: vec![("fmt".into(), Type::Primitive("*const u8".into()))],
+                output: Some(Type::Primitive("i32".into())),
+                is_c_variadic: true,
+            },
+            generic_params: vec![],
+            header: FunctionHeader {
+                is_const: false,
+                is_unsafe: false,
+                is_async: false,
+                abi: Abi::C { unwind: true },
+            },
+        }));
+        assert_eq!(
+            type_str(&pointer),
+            "extern \"C-unwind\" fn(*const u8, ...) -> i32"
+        );
     }
 }

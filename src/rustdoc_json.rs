@@ -2,9 +2,11 @@ use crate::resolver::package_spec;
 use cargo_metadata::{Metadata, Package, Target};
 use rustdoc_types::{Crate, FORMAT_VERSION};
 use std::env;
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub(crate) fn load_or_generate(
     manifest_path: PathBuf,
@@ -17,14 +19,62 @@ pub(crate) fn load_or_generate(
         .as_std_path()
         .join("doc")
         .join(format!("{}.json", target.name.replace('-', "_")));
+    let _lock = JsonGenerationLock::acquire(json_path.with_extension("json.lock"))?;
 
-    if let Ok(krate) = load_valid_json(&json_path, package) {
-        return Ok((krate, json_path));
-    }
-
+    // Always regenerate. Existing JSON does not encode enough of Cargo's resolved state
+    // to prove it matches the selected package's current features/source graph.
     generate_json(manifest_path, package)?;
     let krate = load_valid_json(&json_path, package)?;
     Ok((krate, json_path))
+
+
+  // NOTE: One explicit tradeoff:
+  // - Correctness now wins over cache speed. Every query regenerates rustdoc JSON. Given your spec says “exact crate version and feature set
+  //   resolved by the target Cargo project,” that is the right default until cache metadata is made genuinely trustworthy.
+}
+
+struct JsonGenerationLock {
+    path: PathBuf,
+}
+
+impl JsonGenerationLock {
+    fn acquire(path: PathBuf) -> Result<Self, String> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "failed to create rustdoc JSON lock directory {}: {err}",
+                    parent.display()
+                )
+            })?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => return Ok(Self { path }),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if Instant::now() >= deadline {
+                        return Err(format!(
+                            "timed out waiting for rustdoc JSON lock {}",
+                            path.display()
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "failed to acquire rustdoc JSON lock {}: {err}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for JsonGenerationLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 fn load_valid_json(path: &PathBuf, package: &Package) -> Result<Crate, String> {
@@ -114,7 +164,6 @@ fn format_generate_error(package: &Package, _toolchain: &str, stderr: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resolver::{package_dependencies, resolve_dependency};
     use cargo_metadata::MetadataCommand;
     use rustdoc_types::{Id, Item, ItemEnum, Module, Target as RustdocTarget, Visibility};
     use std::collections::HashMap;
@@ -271,24 +320,6 @@ mod tests {
             stderr: Vec::new(),
         };
         assert!(handle_generate_output(&pkg, "nightly", ok).is_ok());
-    }
-
-    #[test]
-    fn load_or_generate_uses_existing_json_cache_for_real_dependency() {
-        let metadata = metadata();
-        let root = metadata.root_package().unwrap();
-        let deps = package_dependencies(&metadata, &root.id);
-        let dep = resolve_dependency(&metadata.packages, &deps, "cargo_metadata").unwrap();
-
-        let (krate, path) = load_or_generate(
-            root.manifest_path.as_std_path().to_path_buf(),
-            &metadata,
-            dep.package,
-            dep.target,
-        )
-        .unwrap();
-        assert!(path.ends_with("doc/cargo_metadata.json"));
-        assert_eq!(krate.crate_version.as_deref(), Some("0.18.1"));
     }
 
     #[test]

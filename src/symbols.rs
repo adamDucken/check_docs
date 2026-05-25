@@ -2,7 +2,7 @@ use crate::imports::ImportPath;
 use rustdoc_types::{
     AssocItemConstraintKind, Attribute, Crate, GenericArg, GenericArgs, GenericBound,
     GenericParamDefKind, Id, Item, ItemEnum, MacroKind, StructKind, Term, TraitBoundModifier, Type,
-    VariantKind, Visibility,
+    VariantKind, Visibility, WherePredicate,
 };
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -271,9 +271,10 @@ fn format_item(krate: &Crate, item: &Item) -> SymbolDoc {
         ItemEnum::TypeAlias(t) => (
             "type",
             format!(
-                "pub type {}{} = {};",
+                "pub type {}{}{} = {};",
                 name,
                 generics(&t.generics),
+                where_clause(&t.generics),
                 type_str(&t.type_)
             ),
             Vec::new(),
@@ -435,13 +436,22 @@ fn impls(krate: &Crate, item: &Item) -> Vec<String> {
         let Some(trait_) = &imp.trait_ else {
             continue;
         };
-        let prefix = if imp.is_negative { "impl !" } else { "impl " };
         let safety = if imp.is_unsafe { "unsafe " } else { "" };
-        impls.push(format!(
-            "{safety}{prefix}{} for {}",
-            format_path(trait_),
-            type_str(&imp.for_)
-        ));
+        let generics = generics(&imp.generics);
+        let where_clause = where_clause(&imp.generics);
+        if imp.is_negative {
+            impls.push(format!(
+                "{safety}impl{generics} !{} for {}{where_clause}",
+                format_path(trait_),
+                type_str(&imp.for_)
+            ));
+        } else {
+            impls.push(format!(
+                "{safety}impl{generics} {} for {}{where_clause}",
+                format_path(trait_),
+                type_str(&imp.for_)
+            ));
+        }
     }
     impls.sort();
     impls.dedup();
@@ -476,9 +486,13 @@ fn kind_name(inner: &ItemEnum) -> &'static str {
 
 fn struct_def(krate: &Crate, name: &str, s: &rustdoc_types::Struct) -> String {
     match &s.kind {
-        StructKind::Unit => format!("pub struct {name}{};", generics(&s.generics)),
+        StructKind::Unit => format!(
+            "pub struct {name}{}{};",
+            generics(&s.generics),
+            where_clause(&s.generics)
+        ),
         StructKind::Tuple(fields) => format!(
-            "pub struct {name}{}({});",
+            "pub struct {name}{}({}){};",
             generics(&s.generics),
             fields
                 .iter()
@@ -486,11 +500,13 @@ fn struct_def(krate: &Crate, name: &str, s: &rustdoc_types::Struct) -> String {
                     .and_then(|id| field_type(krate, id))
                     .unwrap_or_else(|| "_".into()))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            where_clause(&s.generics)
         ),
         StructKind::Plain { fields, .. } => format!(
-            "pub struct {name}{} {{ {} }}",
+            "pub struct {name}{}{} {{ {} }}",
             generics(&s.generics),
+            where_clause(&s.generics),
             fields
                 .iter()
                 .filter_map(|id| field_line(krate, *id))
@@ -535,8 +551,9 @@ fn struct_details(krate: &Crate, s: &rustdoc_types::Struct) -> Vec<String> {
 
 fn enum_def(krate: &Crate, name: &str, e: &rustdoc_types::Enum) -> String {
     format!(
-        "pub enum {name}{} {{ {} }}",
+        "pub enum {name}{}{} {{ {} }}",
         generics(&e.generics),
+        where_clause(&e.generics),
         enum_details(krate, e).join(", ")
     )
 }
@@ -588,7 +605,16 @@ fn trait_def(_krate: &Crate, name: &str, t: &rustdoc_types::Trait) -> String {
     } else {
         "pub trait"
     };
-    format!("{prefix} {name}{} {{ ... }}", generics(&t.generics))
+    let bounds = if t.bounds.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", bounds_str(&t.bounds))
+    };
+    format!(
+        "{prefix} {name}{}{bounds}{} {{ ... }}",
+        generics(&t.generics),
+        where_clause(&t.generics)
+    )
 }
 
 fn trait_details(krate: &Crate, t: &rustdoc_types::Trait) -> Vec<String> {
@@ -599,7 +625,11 @@ fn trait_details(krate: &Crate, t: &rustdoc_types::Trait) -> Vec<String> {
             let name = item.name.clone().unwrap_or_default();
             match &item.inner {
                 ItemEnum::Function(f) => Some(fn_def(&name, f)),
-                ItemEnum::AssocType { .. } => Some(format!("type {name};")),
+                ItemEnum::AssocType {
+                    generics,
+                    bounds,
+                    type_,
+                } => Some(assoc_type_def(&name, generics, bounds, type_.as_ref())),
                 ItemEnum::AssocConst { type_, .. } => {
                     Some(format!("const {name}: {};", type_str(type_)))
                 }
@@ -635,16 +665,40 @@ fn fn_def(name: &str, f: &rustdoc_types::Function) -> String {
         .map(|ty| format!(" -> {}", type_str(ty)))
         .unwrap_or_default();
     format!(
-        "{prefix}fn {name}{}({inputs}){output}",
-        generics(&f.generics)
+        "{prefix}fn {name}{}({inputs}){output}{}",
+        generics(&f.generics),
+        where_clause(&f.generics)
     )
 }
 
 fn union_def(krate: &Crate, name: &str, u: &rustdoc_types::Union) -> String {
     format!(
-        "pub union {name}{} {{ {} }}",
+        "pub union {name}{}{} {{ {} }}",
         generics(&u.generics),
+        where_clause(&u.generics),
         union_details(krate, u).join(", ")
+    )
+}
+
+fn assoc_type_def(
+    name: &str,
+    generics: &rustdoc_types::Generics,
+    bounds: &[GenericBound],
+    type_: Option<&Type>,
+) -> String {
+    let bounds = if bounds.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", bounds_str(bounds))
+    };
+    let default = type_
+        .map(|ty| format!(" = {}", type_str(ty)))
+        .unwrap_or_default();
+    format!(
+        "type {name}{}{bounds}{}{};",
+        self::generics(generics),
+        where_clause(generics),
+        default
     )
 }
 
@@ -693,15 +747,105 @@ fn generics(g: &rustdoc_types::Generics) -> String {
                 }
             )
         })
-        .map(|p| match &p.kind {
-            GenericParamDefKind::Lifetime { .. } => lifetime_str(&p.name),
-            GenericParamDefKind::Type { .. } | GenericParamDefKind::Const { .. } => p.name.clone(),
-        })
+        .map(generic_param_decl)
         .collect::<Vec<_>>();
     if params.is_empty() {
         String::new()
     } else {
         format!("<{}>", params.join(", "))
+    }
+}
+
+fn generic_param_decl(p: &rustdoc_types::GenericParamDef) -> String {
+    match &p.kind {
+        GenericParamDefKind::Lifetime { outlives } => {
+            let name = lifetime_str(&p.name);
+            if outlives.is_empty() {
+                name
+            } else {
+                format!(
+                    "{name}: {}",
+                    outlives
+                        .iter()
+                        .map(|l| lifetime_str(l))
+                        .collect::<Vec<_>>()
+                        .join(" + ")
+                )
+            }
+        }
+        GenericParamDefKind::Type {
+            bounds, default, ..
+        } => {
+            let mut param = p.name.clone();
+            if !bounds.is_empty() {
+                param.push_str(&format!(": {}", bounds_str(bounds)));
+            }
+            if let Some(default) = default {
+                param.push_str(&format!(" = {}", type_str(default)));
+            }
+            param
+        }
+        GenericParamDefKind::Const { type_, default } => {
+            let mut param = format!("const {}: {}", p.name, type_str(type_));
+            if let Some(default) = default {
+                param.push_str(&format!(" = {default}"));
+            }
+            param
+        }
+    }
+}
+
+fn where_clause(g: &rustdoc_types::Generics) -> String {
+    let predicates = g
+        .where_predicates
+        .iter()
+        .filter_map(where_predicate_str)
+        .collect::<Vec<_>>();
+    if predicates.is_empty() {
+        String::new()
+    } else {
+        format!(" where {}", predicates.join(", "))
+    }
+}
+
+fn where_predicate_str(predicate: &WherePredicate) -> Option<String> {
+    match predicate {
+        WherePredicate::BoundPredicate {
+            type_,
+            bounds,
+            generic_params,
+        } => {
+            if bounds.is_empty() {
+                return None;
+            }
+            let binder = if generic_params.is_empty() {
+                String::new()
+            } else {
+                format!("for<{}> ", generic_param_decls(generic_params))
+            };
+            Some(format!(
+                "{binder}{}: {}",
+                type_str(type_),
+                bounds_str(bounds)
+            ))
+        }
+        WherePredicate::LifetimePredicate { lifetime, outlives } => {
+            if outlives.is_empty() {
+                return None;
+            }
+            Some(format!(
+                "{}: {}",
+                lifetime_str(lifetime),
+                outlives
+                    .iter()
+                    .map(|l| lifetime_str(l))
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            ))
+        }
+        WherePredicate::EqPredicate { lhs, rhs } => {
+            Some(format!("{} = {}", type_str(lhs), term_str(rhs)))
+        }
     }
 }
 
@@ -891,6 +1035,14 @@ fn generic_param_names(params: &[rustdoc_types::GenericParamDef]) -> String {
         .join(", ")
 }
 
+fn generic_param_decls(params: &[rustdoc_types::GenericParamDef]) -> String {
+    params
+        .iter()
+        .map(generic_param_decl)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn lifetime_str(lifetime: &str) -> String {
     if lifetime.starts_with('\'') {
         lifetime.to_string()
@@ -993,6 +1145,103 @@ mod tests {
                 },
             ],
             where_predicates: Vec::new(),
+        }
+    }
+
+    fn constrained_generics() -> Generics {
+        Generics {
+            params: vec![
+                GenericParamDef {
+                    name: "a".into(),
+                    kind: GenericParamDefKind::Lifetime {
+                        outlives: vec!["b".into()],
+                    },
+                },
+                GenericParamDef {
+                    name: "T".into(),
+                    kind: GenericParamDefKind::Type {
+                        bounds: vec![
+                            GenericBound::TraitBound {
+                                trait_: Path {
+                                    path: "Clone".into(),
+                                    id: Id(1),
+                                    args: None,
+                                },
+                                generic_params: vec![],
+                                modifier: TraitBoundModifier::None,
+                            },
+                            GenericBound::TraitBound {
+                                trait_: Path {
+                                    path: "Send".into(),
+                                    id: Id(2),
+                                    args: None,
+                                },
+                                generic_params: vec![],
+                                modifier: TraitBoundModifier::None,
+                            },
+                        ],
+                        default: Some(Type::Primitive("String".into())),
+                        is_synthetic: false,
+                    },
+                },
+                GenericParamDef {
+                    name: "N".into(),
+                    kind: GenericParamDefKind::Const {
+                        type_: Type::Primitive("usize".into()),
+                        default: Some("32".into()),
+                    },
+                },
+            ],
+            where_predicates: vec![
+                WherePredicate::BoundPredicate {
+                    type_: Type::Generic("T".into()),
+                    bounds: vec![
+                        GenericBound::TraitBound {
+                            trait_: Path {
+                                path: "Sync".into(),
+                                id: Id(3),
+                                args: None,
+                            },
+                            generic_params: vec![],
+                            modifier: TraitBoundModifier::None,
+                        },
+                        GenericBound::Outlives("a".into()),
+                    ],
+                    generic_params: vec![],
+                },
+                WherePredicate::LifetimePredicate {
+                    lifetime: "a".into(),
+                    outlives: vec!["b".into()],
+                },
+                WherePredicate::EqPredicate {
+                    lhs: Type::QualifiedPath {
+                        name: "Item".into(),
+                        args: None,
+                        self_type: Box::new(Type::Generic("T".into())),
+                        trait_: None,
+                    },
+                    rhs: Term::Type(Type::Primitive("u8".into())),
+                },
+                WherePredicate::BoundPredicate {
+                    type_: Type::Generic("T".into()),
+                    bounds: vec![GenericBound::TraitBound {
+                        trait_: Path {
+                            path: "Borrow".into(),
+                            id: Id(4),
+                            args: Some(Box::new(GenericArgs::AngleBracketed {
+                                args: vec![GenericArg::Lifetime("x".into())],
+                                constraints: vec![],
+                            })),
+                        },
+                        generic_params: vec![],
+                        modifier: TraitBoundModifier::None,
+                    }],
+                    generic_params: vec![GenericParamDef {
+                        name: "x".into(),
+                        kind: GenericParamDefKind::Lifetime { outlives: vec![] },
+                    }],
+                },
+            ],
         }
     }
 
@@ -1187,7 +1436,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(direct.kind, "struct");
-        assert!(direct.definition.contains("Config<'a, T, N>"));
+        assert!(direct.definition.contains("Config<'a, T, const N: usize>"));
         assert!(direct.details[0].contains("name: String"));
         assert!(direct.docs.iter().any(|line| line == "docs for Config"));
 
@@ -1820,7 +2069,178 @@ mod tests {
             }])),
             "impl Future<Output = u8>"
         );
-        assert_eq!(generics(&generics_all()), "<'a, T, N>");
+        assert_eq!(generics(&generics_all()), "<'a, T, const N: usize>");
+    }
+
+    #[test]
+    fn generic_formatting_preserves_bounds_defaults_and_where_clauses() {
+        let constrained = constrained_generics();
+
+        assert_eq!(
+            generics(&constrained),
+            "<'a: 'b, T: Clone + Send = String, const N: usize = 32>"
+        );
+        assert_eq!(
+            where_clause(&constrained),
+            " where T: Sync + 'a, 'a: 'b, T::Item = u8, for<'x> T: Borrow<'x>"
+        );
+
+        let field = item(
+            1,
+            Some("value"),
+            Visibility::Public,
+            ItemEnum::StructField(Type::Generic("T".into())),
+        );
+        let cache = item(
+            2,
+            Some("Cache"),
+            Visibility::Public,
+            ItemEnum::Struct(Struct {
+                kind: StructKind::Plain {
+                    fields: vec![Id(1)],
+                    has_stripped_fields: false,
+                },
+                generics: constrained.clone(),
+                impls: vec![],
+            }),
+        );
+        let docs = krate(vec![field, cache.clone()], Id(2));
+        assert_eq!(
+            format_item(&docs, &cache).definition,
+            "pub struct Cache<'a: 'b, T: Clone + Send = String, const N: usize = 32> where T: Sync + 'a, 'a: 'b, T::Item = u8, for<'x> T: Borrow<'x> { value: T }"
+        );
+
+        let alias = item(
+            3,
+            Some("Alias"),
+            Visibility::Public,
+            ItemEnum::TypeAlias(TypeAlias {
+                type_: Type::Generic("T".into()),
+                generics: constrained.clone(),
+            }),
+        );
+        assert_eq!(
+            format_item(&krate(vec![alias.clone()], Id(3)), &alias).definition,
+            "pub type Alias<'a: 'b, T: Clone + Send = String, const N: usize = 32> where T: Sync + 'a, 'a: 'b, T::Item = u8, for<'x> T: Borrow<'x> = T;"
+        );
+
+        let function = Function {
+            sig: FunctionSignature {
+                inputs: vec![("x".into(), Type::Generic("T".into()))],
+                output: Some(Type::Generic("T".into())),
+                is_c_variadic: false,
+            },
+            generics: constrained.clone(),
+            header: FunctionHeader {
+                is_const: false,
+                is_unsafe: false,
+                is_async: false,
+                abi: Abi::Rust,
+            },
+            has_body: true,
+        };
+        assert_eq!(
+            fn_def("load", &function),
+            "pub fn load<'a: 'b, T: Clone + Send = String, const N: usize = 32>(x: T) -> T where T: Sync + 'a, 'a: 'b, T::Item = u8, for<'x> T: Borrow<'x>"
+        );
+
+        let assoc = item(
+            4,
+            Some("Output"),
+            Visibility::Default,
+            ItemEnum::AssocType {
+                generics: constrained.clone(),
+                bounds: vec![GenericBound::TraitBound {
+                    trait_: Path {
+                        path: "Clone".into(),
+                        id: Id(1),
+                        args: None,
+                    },
+                    generic_params: vec![],
+                    modifier: TraitBoundModifier::None,
+                }],
+                type_: Some(Type::Generic("T".into())),
+            },
+        );
+        let trait_item = item(
+            5,
+            Some("Loader"),
+            Visibility::Public,
+            ItemEnum::Trait(Trait {
+                is_auto: false,
+                is_unsafe: false,
+                is_dyn_compatible: true,
+                items: vec![Id(4)],
+                generics: constrained.clone(),
+                bounds: vec![GenericBound::TraitBound {
+                    trait_: Path {
+                        path: "Debug".into(),
+                        id: Id(6),
+                        args: None,
+                    },
+                    generic_params: vec![],
+                    modifier: TraitBoundModifier::None,
+                }],
+                implementations: vec![],
+            }),
+        );
+        let docs = krate(vec![assoc, trait_item.clone()], Id(5));
+        let trait_doc = format_item(&docs, &trait_item);
+        assert_eq!(
+            trait_doc.definition,
+            "pub trait Loader<'a: 'b, T: Clone + Send = String, const N: usize = 32>: Debug where T: Sync + 'a, 'a: 'b, T::Item = u8, for<'x> T: Borrow<'x> { ... }"
+        );
+        assert_eq!(
+            trait_doc.details,
+            vec![
+                "type Output<'a: 'b, T: Clone + Send = String, const N: usize = 32>: Clone where T: Sync + 'a, 'a: 'b, T::Item = u8, for<'x> T: Borrow<'x> = T;"
+            ]
+        );
+
+        let impl_item = item(
+            6,
+            None,
+            Visibility::Default,
+            ItemEnum::Impl(Impl {
+                is_unsafe: true,
+                generics: constrained.clone(),
+                provided_trait_methods: vec![],
+                trait_: Some(Path {
+                    path: "Loader".into(),
+                    id: Id(5),
+                    args: None,
+                }),
+                for_: Type::ResolvedPath(Path {
+                    path: "Cache".into(),
+                    id: Id(2),
+                    args: Some(Box::new(GenericArgs::AngleBracketed {
+                        args: vec![GenericArg::Type(Type::Generic("T".into()))],
+                        constraints: vec![],
+                    })),
+                }),
+                items: vec![],
+                is_negative: false,
+                is_synthetic: false,
+                blanket_impl: None,
+            }),
+        );
+        let cache = item(
+            7,
+            Some("Cache"),
+            Visibility::Public,
+            ItemEnum::Struct(Struct {
+                kind: StructKind::Unit,
+                generics: generics_empty(),
+                impls: vec![Id(6)],
+            }),
+        );
+        let docs = krate(vec![impl_item, cache.clone()], Id(7));
+        assert_eq!(
+            format_item(&docs, &cache).impls,
+            vec![
+                "unsafe impl<'a: 'b, T: Clone + Send = String, const N: usize = 32> Loader for Cache<T> where T: Sync + 'a, 'a: 'b, T::Item = u8, for<'x> T: Borrow<'x>"
+            ]
+        );
     }
 
     #[test]

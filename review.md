@@ -103,7 +103,7 @@ Recommendation:
 - If exactness is required, prefer an actionable error that tells the user to add/query the external crate directly.
 - If transitive traversal is retained, add package identity safeguards and tests with two versions of the same crate in the graph.
 
-### High: reported definitions are not exact for generics and where clauses
+### Fixed: reported definitions are not exact for generics and where clauses
 
 References:
 

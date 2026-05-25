@@ -80,7 +80,7 @@ pub(crate) fn library_target(package: &Package) -> Result<&Target, String> {
 }
 
 pub(crate) fn package_spec(package: &Package) -> String {
-    format!("{}@{}", package.name, package.version)
+    package.id.to_string()
 }
 
 #[cfg(test)]
@@ -116,6 +116,23 @@ mod tests {
         let dep = resolve_dependency(&metadata.packages, &deps, "cargo_metadata").unwrap();
         assert_eq!(dep.package.name, "cargo_metadata");
         assert!(library_target(dep.package).is_ok());
+    }
+
+    #[test]
+    fn package_spec_preserves_resolved_package_identity() {
+        let metadata = metadata();
+        let package = package_for_manifest(&metadata, Path::new("Cargo.toml")).unwrap();
+        let deps = package_dependencies(&metadata, &package.id);
+        let dep = resolve_dependency(&metadata.packages, &deps, "cargo_metadata").unwrap();
+        let spec = package_spec(dep.package);
+
+        assert_eq!(spec, dep.package.id.to_string());
+        assert_ne!(
+            spec,
+            format!("{}@{}", dep.package.name, dep.package.version)
+        );
+        assert!(spec.contains("registry+"));
+        assert!(spec.contains("#cargo_metadata@"));
     }
 
     #[test]

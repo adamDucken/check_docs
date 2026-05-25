@@ -146,7 +146,7 @@ Recommendation:
 - Render `WherePredicate::{BoundPredicate, LifetimePredicate, EqPredicate}`.
 - Add tests with constrained type params, const generics, defaults, and where clauses.
 
-### High: Cargo package selection loses package identity
+### Fixed: Cargo package selection loses package identity
 
 References:
 

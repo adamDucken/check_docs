@@ -66,34 +66,6 @@ pub(crate) fn resolve_dependency<'a>(
     Ok(ResolvedDependency { package, target })
 }
 
-pub(crate) fn resolve_metadata_package<'a>(
-    packages: &'a [Package],
-    crate_name: &str,
-) -> Result<ResolvedDependency<'a>, String> {
-    let mut matches = packages
-        .iter()
-        .filter_map(|package| {
-            library_target(package)
-                .ok()
-                .filter(|target| {
-                    target.name.replace('-', "_") == crate_name
-                        || package.name.replace('-', "_") == crate_name
-                })
-                .map(|target| ResolvedDependency { package, target })
-        })
-        .collect::<Vec<_>>();
-
-    match matches.len() {
-        0 => Err(format!(
-            "crate '{crate_name}' was not found in cargo metadata packages"
-        )),
-        1 => Ok(matches.remove(0)),
-        _ => Err(format!(
-            "crate '{crate_name}' matched multiple packages in cargo metadata"
-        )),
-    }
-}
-
 pub(crate) fn library_target(package: &Package) -> Result<&Target, String> {
     package
         .targets
@@ -144,9 +116,6 @@ mod tests {
         let dep = resolve_dependency(&metadata.packages, &deps, "cargo_metadata").unwrap();
         assert_eq!(dep.package.name, "cargo_metadata");
         assert!(library_target(dep.package).is_ok());
-
-        let transitive = resolve_metadata_package(&metadata.packages, "cargo_metadata").unwrap();
-        assert_eq!(transitive.package.name, "cargo_metadata");
     }
 
     #[test]
@@ -163,10 +132,6 @@ mod tests {
         broken_deps.insert("missing_dep".into(), deps["cargo_metadata"].clone());
         let missing_metadata = resolve_dependency(&[], &broken_deps, "missing_dep").unwrap_err();
         assert!(missing_metadata.contains("missing from cargo metadata"));
-
-        let missing_transitive =
-            resolve_metadata_package(&metadata.packages, "definitely_missing_crate").unwrap_err();
-        assert!(missing_transitive.contains("not found in cargo metadata"));
 
         let no_lib = library_target(package).unwrap_err();
         assert!(no_lib.contains("no doc-able library target"));

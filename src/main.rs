@@ -9,7 +9,6 @@ use cli::parse_args;
 use imports::ImportPath;
 use resolver::{
     is_rust_library_crate, package_dependencies, package_for_manifest, resolve_dependency,
-    resolve_metadata_package,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -86,14 +85,17 @@ fn run() -> Result<(), String> {
                         Some(&err),
                     ));
                 };
-                let external_dep =
-                    resolve_metadata_package(&metadata.packages, &external.crate_name)
-                        .map_err(|dep_err| {
-                            format!(
-                                "item '{}' is re-exported from external crate '{}' but that crate is not queryable from cargo metadata: {dep_err}",
-                                import.item, external.crate_name
-                            )
-                        })?;
+                let external_dep = resolve_dependency(
+                    &metadata.packages,
+                    &root_dependencies,
+                    &external.crate_name,
+                )
+                .map_err(|dep_err| {
+                    format!(
+                        "item '{}' is re-exported from external crate '{}' but exact docs require that crate to be a direct dependency of the selected package; add/query '{}' directly: {dep_err}",
+                        import.item, external.crate_name, external.crate_name
+                    )
+                })?;
                 let (external_krate, external_json_path) = rustdoc_json::load_or_generate(
                     manifest_path.clone(),
                     &metadata,

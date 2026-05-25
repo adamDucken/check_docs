@@ -79,6 +79,8 @@ Recommendation:
 
 ### High: external re-export package resolution can select the wrong crate or violate the direct-dependency contract
 
+Status: issue:closed - fixed
+
 References:
 
 - `src/main.rs:89-98`

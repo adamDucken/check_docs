@@ -21,6 +21,24 @@ pub(crate) struct SymbolDoc {
     pub(crate) impls: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExternalReexport {
+    pub(crate) crate_name: String,
+    pub(crate) path: Vec<String>,
+}
+
+impl ExternalReexport {
+    pub(crate) fn import_path(&self) -> Option<ImportPath> {
+        let (item, segments) = self.path.split_last()?;
+        ImportPath {
+            crate_name: self.crate_name.clone(),
+            segments: segments.to_vec(),
+            item: item.clone(),
+        }
+        .into()
+    }
+}
+
 pub(crate) fn find_symbol(krate: &Crate, import: &ImportPath) -> Result<SymbolDoc, String> {
     let mut current = krate.root;
     let mut parts = import.segments.clone();
@@ -37,6 +55,86 @@ pub(crate) fn find_symbol(krate: &Crate, import: &ImportPath) -> Result<SymbolDo
 
     let item = item(krate, current)?;
     Ok(format_item(krate, item))
+}
+
+pub(crate) fn external_reexport(
+    krate: &Crate,
+    import: &ImportPath,
+) -> Result<Option<ExternalReexport>, String> {
+    let mut current = krate.root;
+    let mut parts = import.segments.clone();
+    parts.push(import.item.clone());
+
+    for (index, part) in parts.iter().enumerate() {
+        let is_last = index + 1 == parts.len();
+        let Ok(child_id) = find_child(krate, current, part, is_last, &mut HashSet::new()) else {
+            return Ok(None);
+        };
+        match follow_use_or_external(krate, child_id, &mut HashSet::new())? {
+            Followed::External(external) if is_last => return Ok(Some(external)),
+            Followed::External(mut external) => {
+                external.path.extend(parts[index + 1..].iter().cloned());
+                return Ok(Some(external));
+            }
+            Followed::Local(id) => {
+                current = id;
+                if !is_last && !matches!(item(krate, current)?.inner, ItemEnum::Module(_)) {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+enum Followed {
+    Local(Id),
+    External(ExternalReexport),
+}
+
+fn follow_use_or_external(
+    krate: &Crate,
+    mut id: Id,
+    visited: &mut HashSet<Id>,
+) -> Result<Followed, String> {
+    loop {
+        if let Some(external) = external_from_id(krate, id) {
+            return Ok(Followed::External(external));
+        }
+        if !visited.insert(id) {
+            return Err("cycle while following rustdoc use item".to_string());
+        }
+        let current = item(krate, id)?;
+        let ItemEnum::Use(use_item) = &current.inner else {
+            return Ok(Followed::Local(id));
+        };
+        let Some(next) = use_item.id else {
+            return Err(format!("use '{}' has no resolved id", use_item.source));
+        };
+        id = next;
+    }
+}
+
+fn external_from_id(krate: &Crate, id: Id) -> Option<ExternalReexport> {
+    let summary = krate.paths.get(&id)?;
+    let external = krate.external_crates.get(&summary.crate_id)?;
+    let path = if summary.path.len() == 1 && summary.path.first() == Some(&external.name) {
+        Vec::new()
+    } else if summary.path.first() == Some(&external.name) {
+        summary.path[1..].to_vec()
+    } else {
+        summary.path.clone()
+    };
+    Some(ExternalReexport {
+        crate_name: external.name.clone(),
+        path,
+    })
+}
+
+pub(crate) fn format_crate_root(krate: &Crate) -> Result<SymbolDoc, String> {
+    let root = item(krate, krate.root)?;
+    Ok(format_item(krate, root))
 }
 
 fn find_child(
@@ -857,9 +955,9 @@ fn abi_str(abi: &rustdoc_types::Abi) -> String {
 mod tests {
     use super::*;
     use rustdoc_types::{
-        Abi, Attribute, Constant, Enum, Function, FunctionHeader, FunctionSignature,
-        GenericParamDef, GenericParamDefKind, Generics, Impl, Item, Module, Path, ProcMacro,
-        Static, Struct, Trait, TypeAlias, Union, Use, Variant,
+        Abi, Attribute, Constant, Enum, ExternalCrate, Function, FunctionHeader, FunctionSignature,
+        GenericParamDef, GenericParamDefKind, Generics, Impl, Item, ItemKind, ItemSummary, Module,
+        Path, ProcMacro, Static, Struct, Trait, TypeAlias, Union, Use, Variant,
     };
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -1153,6 +1251,151 @@ mod tests {
             super::item(&krate, Id(999))
                 .unwrap_err()
                 .contains("missing")
+        );
+    }
+
+    #[test]
+    fn detects_external_reexport_path_from_rustdoc_summary() {
+        let root = item(
+            1,
+            Some("fixture"),
+            Visibility::Public,
+            ItemEnum::Module(Module {
+                is_crate: true,
+                items: vec![Id(2)],
+                is_stripped: false,
+            }),
+        );
+        let reexport = item(
+            2,
+            Some("Thing"),
+            Visibility::Public,
+            ItemEnum::Use(Use {
+                source: "dep_crate::module::Thing".into(),
+                name: "Thing".into(),
+                id: Some(Id(99)),
+                is_glob: false,
+            }),
+        );
+        let mut krate = krate(vec![root, reexport], Id(1));
+        krate.external_crates.insert(
+            7,
+            ExternalCrate {
+                name: "dep_crate".into(),
+                html_root_url: None,
+            },
+        );
+        krate.paths.insert(
+            Id(99),
+            ItemSummary {
+                crate_id: 7,
+                path: vec!["dep_crate".into(), "module".into(), "Thing".into()],
+                kind: ItemKind::Struct,
+            },
+        );
+
+        let external = external_reexport(
+            &krate,
+            &ImportPath {
+                crate_name: "fixture".into(),
+                segments: vec![],
+                item: "Thing".into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            external,
+            ExternalReexport {
+                crate_name: "dep_crate".into(),
+                path: vec!["module".into(), "Thing".into()],
+            }
+        );
+        assert_eq!(
+            external.import_path().unwrap().full_path(),
+            "dep_crate::module::Thing"
+        );
+    }
+
+    #[test]
+    fn detects_external_crate_root_and_appends_unresolved_tail() {
+        let root = item(
+            1,
+            Some("fixture"),
+            Visibility::Public,
+            ItemEnum::Module(Module {
+                is_crate: true,
+                items: vec![Id(2)],
+                is_stripped: false,
+            }),
+        );
+        let reexport = item(
+            2,
+            Some("dep"),
+            Visibility::Public,
+            ItemEnum::Use(Use {
+                source: "dep_crate".into(),
+                name: "dep".into(),
+                id: Some(Id(99)),
+                is_glob: false,
+            }),
+        );
+        let mut krate = krate(vec![root, reexport], Id(1));
+        krate.external_crates.insert(
+            7,
+            ExternalCrate {
+                name: "dep_crate".into(),
+                html_root_url: None,
+            },
+        );
+        krate.paths.insert(
+            Id(99),
+            ItemSummary {
+                crate_id: 7,
+                path: vec!["dep_crate".into()],
+                kind: ItemKind::Module,
+            },
+        );
+
+        let root_external = external_reexport(
+            &krate,
+            &ImportPath {
+                crate_name: "fixture".into(),
+                segments: vec![],
+                item: "dep".into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            root_external,
+            ExternalReexport {
+                crate_name: "dep_crate".into(),
+                path: Vec::new(),
+            }
+        );
+        assert!(root_external.import_path().is_none());
+
+        let tailed_external = external_reexport(
+            &krate,
+            &ImportPath {
+                crate_name: "fixture".into(),
+                segments: vec!["dep".into()],
+                item: "Thing".into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            tailed_external,
+            ExternalReexport {
+                crate_name: "dep_crate".into(),
+                path: vec!["Thing".into()],
+            }
+        );
+        assert_eq!(
+            tailed_external.import_path().unwrap().full_path(),
+            "dep_crate::Thing"
         );
     }
 

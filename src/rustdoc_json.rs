@@ -23,14 +23,9 @@ pub(crate) fn load_or_generate(
 
     // Always regenerate. Existing JSON does not encode enough of Cargo's resolved state
     // to prove it matches the selected package's current features/source graph.
-    generate_json(manifest_path, package)?;
+    generate_json(manifest_path, package, target)?;
     let krate = load_valid_json(&json_path, package)?;
     Ok((krate, json_path))
-
-
-  // NOTE: One explicit tradeoff:
-  // - Correctness now wins over cache speed. Every query regenerates rustdoc JSON. Given your spec says “exact crate version and feature set
-  //   resolved by the target Cargo project,” that is the right default until cache metadata is made genuinely trustworthy.
 }
 
 struct JsonGenerationLock {
@@ -99,30 +94,26 @@ fn load_valid_json(path: &PathBuf, package: &Package) -> Result<Crate, String> {
     Ok(krate)
 }
 
-fn generate_json(manifest_path: PathBuf, package: &Package) -> Result<(), String> {
+fn generate_json(manifest_path: PathBuf, package: &Package, target: &Target) -> Result<(), String> {
     let toolchain = env::var("CHECK_DOCS_TOOLCHAIN").unwrap_or_else(|_| "nightly".to_string());
-    generate_json_with_toolchain(manifest_path, package, &toolchain)
+    generate_json_with_toolchain(manifest_path, package, target, &toolchain)
 }
 
 fn generate_json_with_toolchain(
     manifest_path: PathBuf,
     package: &Package,
+    target: &Target,
     toolchain: &str,
 ) -> Result<(), String> {
     let spec = package_spec(package);
+    let selector = target_selector(target)?;
     let output = Command::new("cargo")
         .arg(format!("+{toolchain}"))
         .args(["rustdoc", "--manifest-path"])
         .arg(&manifest_path)
-        .args([
-            "-p",
-            &spec,
-            "--",
-            "-Z",
-            "unstable-options",
-            "--output-format",
-            "json",
-        ])
+        .args(["-p", &spec])
+        .args(selector)
+        .args(["--", "-Z", "unstable-options", "--output-format", "json"])
         .output()
         .map_err(|err| {
             format!(
@@ -131,6 +122,32 @@ fn generate_json_with_toolchain(
             )
         })?;
     handle_generate_output(package, toolchain, output)
+}
+
+fn target_selector(target: &Target) -> Result<Vec<String>, String> {
+    if target
+        .kind
+        .iter()
+        .any(|kind| kind == "lib" || kind == "proc-macro")
+    {
+        return Ok(vec!["--lib".to_string()]);
+    }
+    if target.kind.iter().any(|kind| kind == "bin") {
+        return Ok(vec!["--bin".to_string(), target.name.clone()]);
+    }
+    if target.kind.iter().any(|kind| kind == "example") {
+        return Ok(vec!["--example".to_string(), target.name.clone()]);
+    }
+    if target.kind.iter().any(|kind| kind == "test") {
+        return Ok(vec!["--test".to_string(), target.name.clone()]);
+    }
+    if target.kind.iter().any(|kind| kind == "bench") {
+        return Ok(vec!["--bench".to_string(), target.name.clone()]);
+    }
+    Err(format!(
+        "target {} has unsupported rustdoc target kind {:?}",
+        target.name, target.kind
+    ))
 }
 
 fn handle_generate_output(
@@ -323,11 +340,36 @@ mod tests {
     }
 
     #[test]
+    fn target_selector_filters_cargo_rustdoc_to_one_target() {
+        let pkg = package();
+        let mut target = pkg.targets[0].clone();
+
+        target.kind = vec!["lib".into()];
+        assert_eq!(target_selector(&target).unwrap(), vec!["--lib"]);
+
+        target.kind = vec!["proc-macro".into()];
+        assert_eq!(target_selector(&target).unwrap(), vec!["--lib"]);
+
+        target.kind = vec!["bin".into()];
+        target.name = "tool".into();
+        assert_eq!(target_selector(&target).unwrap(), vec!["--bin", "tool"]);
+
+        target.kind = vec!["custom-build".into()];
+        assert!(
+            target_selector(&target)
+                .unwrap_err()
+                .contains("unsupported")
+        );
+    }
+
+    #[test]
     fn generate_json_reports_missing_toolchain() {
         let pkg = package();
+        let target = pkg.targets[0].clone();
         let err = generate_json_with_toolchain(
             PathBuf::from("Cargo.toml"),
             &pkg,
+            &target,
             "definitely_missing_check_docs_toolchain",
         )
         .unwrap_err();

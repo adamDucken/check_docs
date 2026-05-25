@@ -67,13 +67,14 @@ check-docs 'use tokio::sync::{Mutex, RwLock, Semaphore};' --root .
 - External crate paths: `use serde::Serialize;`
 - Multi-item brace imports: `use tokio::sync::{Mutex, RwLock, Semaphore};`
 - Single-item brace imports: `use syn::{File};`
+- Nested brace imports: `use tower::{service_fn, util::{MapResponseLayer}};`
 - Renamed imports resolve original item: `use syn::File as SynFile;`
+- `self` imports inside non-root braces: `use tokio::sync::{self, mpsc};`
 - Modules are supported and labeled: `use tokio::sync::watch;` -> `item: module watch`
 
 Unsupported:
 
 - glob imports: `use syn::*;`
-- nested brace imports: `use tower::{service_fn, util::{MapResponseLayer}};`
 - absolute leading paths: `use ::syn::File;`
 - local paths: `use crate::Thing;`
 
@@ -150,7 +151,6 @@ Use a nightly compatible with the pinned `rustdoc-types` schema.
 - `not a direct dependency`: add dependency to `Cargo.toml` or query from project where it is direct.
 - `Rust standard library`: use <https://doc.rust-lang.org/std/>.
 - `glob imports are not supported`: query concrete item path.
-- `nested brace imports are not supported`: split nested brace query or flatten into multiple commands.
 - `public re-export with unsupported rustdoc external id`: item is re-exported from another crate and full item data is absent from current crate JSON. Add/query the external crate directly if possible.
 - `failed to generate rustdoc JSON`: install/use nightly, run `cargo check`, inspect Cargo/Rustdoc stderr.
 - `item not found`: likely wrong path, private item, disabled feature, or unsupported Rustdoc shape.

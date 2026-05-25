@@ -218,7 +218,7 @@ Recommendation:
 - Clone or scope `visited` per branch while keeping cycle detection inside each branch.
 - Accumulate branch errors for diagnostics only after all candidates fail.
 
-### Medium: the `use` parser rejects common valid Rust imports
+### Fixed: the `use` parser rejects common valid Rust imports
 
 References:
 

@@ -1,3 +1,5 @@
+use syn::{ItemUse, UseTree};
+
 #[derive(Debug, Clone)]
 pub(crate) struct ImportPath {
     pub(crate) crate_name: String,
@@ -25,72 +27,86 @@ pub(crate) fn parse_use_line(line: &str) -> Result<ImportPath, String> {
 }
 
 pub(crate) fn parse_use_lines(line: &str) -> Result<Vec<ImportPath>, String> {
-    let mut text = line.trim().to_string();
-    if let Some(rest) = text.strip_prefix("use ") {
-        text = rest.trim().to_string();
-    }
-    if let Some(rest) = text.strip_suffix(';') {
-        text = rest.trim().to_string();
-    }
-    if let Some((before_as, _)) = text.rsplit_once(" as ") {
-        text = before_as.trim().to_string();
-    }
-    if text.starts_with("::") {
+    let item = parse_item_use(line)?;
+    if item.leading_colon.is_some() {
         return Err("absolute use paths with leading `::` are not supported".to_string());
     }
-    if text.contains('*') {
-        return Err("glob imports are not supported".to_string());
-    }
 
-    expand_brace_paths(&text)?
-        .into_iter()
-        .map(|path| parse_path(&path, line))
-        .collect()
+    let mut imports = Vec::new();
+    collect_use_tree(&item.tree, &mut Vec::new(), &mut imports)?;
+    if imports.is_empty() {
+        return Err(format!("expected external use path, got '{line}'"));
+    }
+    Ok(imports)
 }
 
-fn parse_path(text: &str, original: &str) -> Result<ImportPath, String> {
-    let raw_parts = text.split("::").map(str::trim).collect::<Vec<_>>();
-    if raw_parts.iter().any(|part| part.is_empty()) {
-        return Err(format!("invalid empty use path segment in '{original}'"));
+fn parse_item_use(line: &str) -> Result<ItemUse, String> {
+    let text = line.trim();
+    let candidate = if starts_like_use_item(text) {
+        if text.ends_with(';') {
+            text.to_string()
+        } else {
+            format!("{text};")
+        }
+    } else if text.ends_with(';') {
+        format!("use {text}")
+    } else {
+        format!("use {text};")
+    };
+    syn::parse_str::<ItemUse>(&candidate).map_err(|err| format!("invalid use import syntax: {err}"))
+}
+
+fn starts_like_use_item(text: &str) -> bool {
+    text.starts_with("use ") || text.starts_with("pub ")
+}
+
+fn collect_use_tree(
+    tree: &UseTree,
+    prefix: &mut Vec<String>,
+    imports: &mut Vec<ImportPath>,
+) -> Result<(), String> {
+    match tree {
+        UseTree::Path(path) => {
+            prefix.push(path.ident.to_string());
+            let result = collect_use_tree(&path.tree, prefix, imports);
+            prefix.pop();
+            result
+        }
+        UseTree::Name(name) => emit_path(prefix, name.ident.to_string(), imports),
+        UseTree::Rename(rename) => emit_path(prefix, rename.ident.to_string(), imports),
+        UseTree::Glob(_) => Err("glob imports are not supported".to_string()),
+        UseTree::Group(group) => {
+            for item in &group.items {
+                collect_use_tree(item, prefix, imports)?;
+            }
+            Ok(())
+        }
     }
-    let parts: Vec<String> = raw_parts.into_iter().map(ToOwned::to_owned).collect();
+}
+
+fn emit_path(prefix: &[String], item: String, imports: &mut Vec<ImportPath>) -> Result<(), String> {
+    let mut parts = prefix.to_vec();
+    if item == "self" {
+        if parts.len() < 2 {
+            return Err("expected external use path, got crate root `self` import".to_string());
+        }
+    } else {
+        parts.push(item);
+    }
+
     if parts.len() < 2 {
-        return Err(format!("expected external use path, got '{original}'"));
+        return Err("expected external use path".to_string());
     }
     if matches!(parts[0].as_str(), "crate" | "self" | "super") {
         return Err("only external crate use paths are supported".to_string());
     }
 
-    Ok(ImportPath {
+    imports.push(ImportPath {
         crate_name: parts[0].replace('-', "_"),
         segments: parts[1..parts.len() - 1].to_vec(),
         item: parts.last().expect("parts has len >= 2").clone(),
-    })
-}
-
-fn expand_brace_paths(text: &str) -> Result<Vec<String>, String> {
-    let Some(open) = text.find('{') else {
-        return Ok(vec![text.to_string()]);
-    };
-    let Some(close) = text.rfind('}') else {
-        return Err(format!("expected external use path, got '{text}'"));
-    };
-    if text[open + 1..close].contains('{') || !text[close + 1..].trim().is_empty() {
-        return Err("nested brace imports are not supported for now".to_string());
-    }
-    let prefix = text[..open].trim_end_matches("::").trim();
-    let inner = text[open + 1..close].trim();
-    if inner.is_empty() {
-        return Err("brace imports must contain at least one item".to_string());
-    }
-    let items = inner.split(',').map(str::trim).collect::<Vec<_>>();
-    if items.iter().any(|item| item.is_empty()) {
-        return Err("brace imports must not contain empty items".to_string());
-    }
-    items
-        .into_iter()
-        .map(|item| Ok(format!("{prefix}::{item}")))
-        .collect()
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -103,6 +119,9 @@ mod tests {
         assert_eq!(import.crate_name, "syn");
         assert_eq!(import.segments, Vec::<String>::new());
         assert_eq!(import.item, "ItemUse");
+
+        let import = parse_use_line("use syn::ItemUse").unwrap();
+        assert_eq!(import.full_path(), "syn::ItemUse");
     }
 
     #[test]
@@ -110,6 +129,24 @@ mod tests {
         let import = parse_use_line("syn::ItemUse as IU").unwrap();
         assert_eq!(import.crate_name, "syn");
         assert_eq!(import.item, "ItemUse");
+    }
+
+    #[test]
+    fn parses_alias_inside_braces() {
+        let imports = parse_use_lines("use syn::{ItemUse as IU, UseTree};").unwrap();
+        assert_eq!(
+            imports
+                .iter()
+                .map(ImportPath::full_path)
+                .collect::<Vec<_>>(),
+            vec!["syn::ItemUse", "syn::UseTree"]
+        );
+    }
+
+    #[test]
+    fn parses_alias_to_underscore() {
+        let import = parse_use_line("use syn::ItemUse as _;").unwrap();
+        assert_eq!(import.full_path(), "syn::ItemUse");
     }
 
     #[test]
@@ -133,6 +170,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_nested_groups_comments_trailing_commas_and_self() {
+        let imports = parse_use_lines(
+            "use tokio::{
+                sync::{
+                    self,
+                    Mutex, // shared lock
+                    mpsc::Sender,
+                },
+                task::JoinHandle,
+            };",
+        )
+        .unwrap();
+        assert_eq!(
+            imports
+                .iter()
+                .map(ImportPath::full_path)
+                .collect::<Vec<_>>(),
+            vec![
+                "tokio::sync",
+                "tokio::sync::Mutex",
+                "tokio::sync::mpsc::Sender",
+                "tokio::task::JoinHandle"
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_glob_use() {
         let err = parse_use_line("use syn::*;").unwrap_err();
         assert_eq!(err, "glob imports are not supported");
@@ -151,15 +215,18 @@ mod tests {
 
         let err = parse_use_line("use self::Thing;").unwrap_err();
         assert_eq!(err, "only external crate use paths are supported");
+
+        let err = parse_use_line("use syn::{self};").unwrap_err();
+        assert!(err.contains("crate root `self` import"));
     }
 
     #[test]
     fn rejects_empty_path_segments_and_empty_brace_items() {
         let err = parse_use_line("use syn::::ItemUse;").unwrap_err();
-        assert!(err.contains("invalid empty use path segment"));
+        assert!(err.contains("invalid use import syntax"));
 
         let err = parse_use_lines("use syn::{ItemUse,,UseTree};").unwrap_err();
-        assert_eq!(err, "brace imports must not contain empty items");
+        assert!(err.contains("invalid use import syntax"));
     }
 
     #[test]

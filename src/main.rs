@@ -4,15 +4,25 @@ mod resolver;
 mod rustdoc_json;
 mod symbols;
 
-use cargo_metadata::MetadataCommand;
+use cargo_metadata::{Metadata, MetadataCommand, Package, PackageId, Target};
 use cli::parse_args;
 use imports::ImportPath;
 use resolver::{
     is_rust_library_crate, package_dependencies, package_for_manifest, resolve_dependency,
 };
+use std::collections::HashMap;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use symbols::SymbolDoc;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RustdocCacheKey {
+    package_id: PackageId,
+    target_name: String,
+}
+
+type RustdocCache = HashMap<RustdocCacheKey, (rustdoc_types::Crate, PathBuf)>;
 
 fn main() -> ExitCode {
     match run() {
@@ -51,13 +61,15 @@ fn run() -> Result<(), String> {
 
     let root_package = package_for_manifest(&metadata, &manifest_path)?;
     let root_dependencies = package_dependencies(&metadata, &root_package.id);
+    let mut rustdoc_cache = RustdocCache::new();
     for (index, import) in imports.iter().enumerate() {
         if index > 0 {
             println!();
         }
         let dep = resolve_dependency(&metadata.packages, &root_dependencies, &import.crate_name)?;
-        let (krate, json_path) = rustdoc_json::load_or_generate(
-            manifest_path.clone(),
+        let (krate, json_path) = load_docs_cached(
+            &mut rustdoc_cache,
+            &manifest_path,
             &metadata,
             dep.package,
             dep.target,
@@ -96,8 +108,9 @@ fn run() -> Result<(), String> {
                         import.item, external.crate_name, external.crate_name
                     )
                 })?;
-                let (external_krate, external_json_path) = rustdoc_json::load_or_generate(
-                    manifest_path.clone(),
+                let (external_krate, external_json_path) = load_docs_cached(
+                    &mut rustdoc_cache,
+                    &manifest_path,
                     &metadata,
                     external_dep.package,
                     external_dep.target,
@@ -133,6 +146,31 @@ fn run() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn load_docs_cached(
+    cache: &mut RustdocCache,
+    manifest_path: &Path,
+    metadata: &Metadata,
+    package: &Package,
+    target: &Target,
+) -> Result<(rustdoc_types::Crate, PathBuf), String> {
+    let key = rustdoc_cache_key(package, target);
+    if let Some(cached) = cache.get(&key) {
+        return Ok(cached.clone());
+    }
+
+    let loaded =
+        rustdoc_json::load_or_generate(manifest_path.to_path_buf(), metadata, package, target)?;
+    cache.insert(key, loaded.clone());
+    Ok(loaded)
+}
+
+fn rustdoc_cache_key(package: &Package, target: &Target) -> RustdocCacheKey {
+    RustdocCacheKey {
+        package_id: package.id.clone(),
+        target_name: target.name.clone(),
+    }
 }
 
 fn find_external_symbol_with_fallback(
@@ -295,6 +333,7 @@ fn looks_like_module_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cargo_metadata::MetadataCommand;
     use rustdoc_types::{Crate, Id, Item, ItemEnum, Module, Struct, StructKind, Visibility};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -327,6 +366,21 @@ mod tests {
             deprecation: None,
             inner,
         }
+    }
+
+    #[test]
+    fn rustdoc_cache_key_uses_package_identity_and_target_name() {
+        let metadata = MetadataCommand::new()
+            .manifest_path("Cargo.toml")
+            .exec()
+            .unwrap();
+        let package = package_for_manifest(&metadata, Path::new("Cargo.toml")).unwrap();
+        let deps = package_dependencies(&metadata, &package.id);
+        let dep = resolve_dependency(&metadata.packages, &deps, "cargo_metadata").unwrap();
+        let key = rustdoc_cache_key(dep.package, dep.target);
+
+        assert_eq!(&key.package_id, &dep.package.id);
+        assert_eq!(&key.target_name, &dep.target.name);
     }
 
     #[test]

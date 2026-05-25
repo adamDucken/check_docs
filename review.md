@@ -162,7 +162,7 @@ Recommendation:
 - Use the most specific package ID spec Cargo accepts from `cargo_metadata::PackageId`, not just `name@version`.
 - Add a fixture with source/path ambiguity if Cargo permits it in one resolution; otherwise add a regression test around the exact package-id string used for rustdoc invocation.
 
-### Medium: batch imports regenerate the same rustdoc JSON repeatedly
+### Fixed: batch imports regenerate the same rustdoc JSON repeatedly
 
 References:
 
@@ -185,7 +185,7 @@ Recommendation:
 - Cache `(package_id, target_name) -> (Crate, json_path)` inside `run`.
 - Keep the "always regenerate per invocation" policy if desired, but do not regenerate per item.
 
-### Medium: lock files can become stale and block generation
+### Fixed: lock files can become stale and block generation
 
 References:
 
@@ -202,7 +202,7 @@ Recommendation:
 - Or use an advisory file-lock crate with well-understood stale-lock behavior.
 - Include the stale lock path and remediation in the timeout error if this simple lock stays.
 
-### Medium: glob traversal can return false negatives
+### Fixed: glob traversal can return false negatives
 
 References:
 

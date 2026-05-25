@@ -155,6 +155,7 @@ fn find_child(
         ));
     };
 
+    let mut glob_errors = Vec::new();
     for child_id in &module.items {
         let child = item(krate, *child_id)?;
         if !is_public(child) {
@@ -175,27 +176,48 @@ fn find_child(
         };
         if use_item.is_glob {
             let Some(glob_id) = use_item.id else {
-                if is_last {
-                    return Err(format!(
-                        "glob import '{}' has no resolved id",
-                        use_item.source
-                    ));
-                }
+                glob_errors.push(format!(
+                    "glob import '{}' has no resolved id",
+                    use_item.source
+                ));
                 continue;
             };
-            let target = follow_use(krate, glob_id, &mut HashSet::new())?;
-            if matches!(item(krate, target)?.inner, ItemEnum::Module(_))
-                && let Ok(found) = find_child(krate, target, name, is_last, visited)
-            {
-                return Ok(found);
+            match follow_use(krate, glob_id, &mut HashSet::new()) {
+                Ok(target) => match item(krate, target) {
+                    Ok(target_item) if matches!(target_item.inner, ItemEnum::Module(_)) => {
+                        let mut branch_visited = visited.clone();
+                        match find_child(krate, target, name, is_last, &mut branch_visited) {
+                            Ok(found) => return Ok(found),
+                            Err(err) => glob_errors.push(format!(
+                                "glob import '{}' did not resolve '{name}': {err}",
+                                use_item.source
+                            )),
+                        }
+                    }
+                    Ok(target_item) => glob_errors.push(format!(
+                        "glob import '{}' resolved to non-module '{}'",
+                        use_item.source,
+                        target_item.name.clone().unwrap_or_default()
+                    )),
+                    Err(err) => glob_errors.push(format!(
+                        "glob import '{}' resolved to missing target: {err}",
+                        use_item.source
+                    )),
+                },
+                Err(err) => glob_errors.push(format!(
+                    "glob import '{}' could not be followed: {err}",
+                    use_item.source
+                )),
             }
         }
     }
 
-    Err(format!(
-        "'{name}' not found under {}",
-        path_label(krate, module_id)
-    ))
+    let mut message = format!("'{name}' not found under {}", path_label(krate, module_id));
+    if !glob_errors.is_empty() {
+        message.push_str("; glob branches failed: ");
+        message.push_str(&glob_errors.join("; "));
+    }
+    Err(message)
 }
 
 fn follow_use(krate: &Crate, mut id: Id, visited: &mut HashSet<Id>) -> Result<Id, String> {
@@ -1310,7 +1332,7 @@ mod tests {
             Visibility::Public,
             ItemEnum::Module(Module {
                 is_crate: true,
-                items: vec![Id(2), Id(8), Id(9), Id(10)],
+                items: vec![Id(2), Id(10), Id(8), Id(9)],
                 is_stripped: false,
             }),
         );
@@ -1501,6 +1523,123 @@ mod tests {
                 .unwrap_err()
                 .contains("missing")
         );
+    }
+
+    #[test]
+    fn glob_resolution_keeps_searching_after_failed_branch() {
+        let root = item(
+            1,
+            Some("fixture"),
+            Visibility::Public,
+            ItemEnum::Module(Module {
+                is_crate: true,
+                items: vec![Id(8), Id(3), Id(4), Id(5)],
+                is_stripped: false,
+            }),
+        );
+        let cyclic_mod = item(
+            2,
+            Some("cyclic"),
+            Visibility::Public,
+            ItemEnum::Module(Module {
+                is_crate: false,
+                items: vec![Id(6)],
+                is_stripped: false,
+            }),
+        );
+        let cyclic_glob = item(
+            6,
+            Some("cycle"),
+            Visibility::Public,
+            ItemEnum::Use(Use {
+                source: "cyclic::*".into(),
+                name: "cycle".into(),
+                id: Some(Id(2)),
+                is_glob: true,
+            }),
+        );
+        let root_cyclic_glob = item(
+            8,
+            Some("root_cycle"),
+            Visibility::Public,
+            ItemEnum::Use(Use {
+                source: "cyclic::*".into(),
+                name: "root_cycle".into(),
+                id: Some(Id(2)),
+                is_glob: true,
+            }),
+        );
+        let bad_glob = item(
+            3,
+            Some("bad"),
+            Visibility::Public,
+            ItemEnum::Use(Use {
+                source: "missing::*".into(),
+                name: "bad".into(),
+                id: None,
+                is_glob: true,
+            }),
+        );
+        let good_mod = item(
+            4,
+            Some("good"),
+            Visibility::Public,
+            ItemEnum::Module(Module {
+                is_crate: false,
+                items: vec![Id(7)],
+                is_stripped: false,
+            }),
+        );
+        let good_glob = item(
+            5,
+            Some("good_glob"),
+            Visibility::Public,
+            ItemEnum::Use(Use {
+                source: "good::*".into(),
+                name: "good_glob".into(),
+                id: Some(Id(4)),
+                is_glob: true,
+            }),
+        );
+        let hit = item(
+            7,
+            Some("Hit"),
+            Visibility::Public,
+            ItemEnum::Struct(Struct {
+                kind: StructKind::Unit,
+                generics: generics_empty(),
+                impls: vec![],
+            }),
+        );
+        let krate = krate(
+            vec![
+                root,
+                cyclic_mod,
+                bad_glob,
+                good_mod,
+                good_glob,
+                cyclic_glob,
+                hit,
+                root_cyclic_glob,
+            ],
+            Id(1),
+        );
+
+        let found = find_symbol(
+            &krate,
+            &ImportPath {
+                crate_name: "x".into(),
+                segments: vec![],
+                item: "Hit".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(found.name, "Hit");
+
+        let err = find_child(&krate, Id(1), "Miss", true, &mut HashSet::new()).unwrap_err();
+        assert!(err.contains("glob branches failed"));
+        assert!(err.contains("missing::*"));
+        assert!(err.contains("cyclic::*"));
     }
 
     #[test]

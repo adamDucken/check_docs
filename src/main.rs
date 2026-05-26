@@ -150,7 +150,7 @@ fn run() -> Result<(), String> {
                         Some(&selected_target),
                     )?;
                     let found = if let Some(external_import) = external.import_path() {
-                        find_external_symbol_with_fallback(
+                        find_external_symbol(
                             &external_krate,
                             &external_import,
                             &external_dep.package.name,
@@ -252,42 +252,15 @@ fn rustdoc_cache_key(
     }
 }
 
-fn find_external_symbol_with_fallback(
+fn find_external_symbol(
     krate: &rustdoc_types::Crate,
     import: &ImportPath,
     crate_name: &str,
     version: &str,
     json_path: &Path,
 ) -> Result<SymbolReport, String> {
-    match symbols::find_symbol_report(krate, import) {
-        Ok(found) => Ok(found),
-        Err(first_err) if !import.segments.is_empty() => {
-            let root_import = ImportPath {
-                crate_name: import.crate_name.clone(),
-                segments: Vec::new(),
-                item: import.item.clone(),
-            };
-            symbols::find_symbol_report(krate, &root_import).map_err(|second_err| {
-                not_found_message(
-                    import,
-                    crate_name,
-                    Some(version),
-                    json_path,
-                    Some(&format!(
-                        "{first_err}; also failed root re-export fallback '{}': {second_err}",
-                        root_import.item
-                    )),
-                )
-            })
-        }
-        Err(err) => Err(not_found_message(
-            import,
-            crate_name,
-            Some(version),
-            json_path,
-            Some(&err),
-        )),
-    }
+    symbols::find_symbol_report(krate, import)
+        .map_err(|err| not_found_message(import, crate_name, Some(version), json_path, Some(&err)))
 }
 
 fn format_use(import: &ImportPath) -> String {
@@ -540,8 +513,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn external_lookup_falls_back_to_root_reexport_name() {
+    fn root_mac_crate() -> Crate {
         let root = rustdoc_item(
             1,
             "digest",
@@ -563,7 +535,7 @@ mod tests {
                 impls: Vec::new(),
             }),
         );
-        let krate = Crate {
+        Crate {
             root: Id(1),
             crate_version: Some("1.0.0".into()),
             includes_private: false,
@@ -575,16 +547,37 @@ mod tests {
                 target_features: Vec::new(),
             },
             format_version: rustdoc_types::FORMAT_VERSION,
-        };
+        }
+    }
+
+    #[test]
+    fn external_lookup_does_not_fall_back_to_root_reexport_name() {
+        let krate = root_mac_crate();
         let import = ImportPath {
             crate_name: "digest".into(),
             segments: vec!["mac".into()],
             item: "Mac".into(),
         };
 
+        let err =
+            find_external_symbol(&krate, &import, "digest", "1.0.0", Path::new("/x")).unwrap_err();
+
+        assert!(err.contains("'mac' not found under digest"));
+        assert!(!err.contains("root re-export fallback"));
+    }
+
+    #[test]
+    fn external_lookup_reports_exact_root_item() {
+        let krate = root_mac_crate();
+        let import = ImportPath {
+            crate_name: "digest".into(),
+            segments: Vec::new(),
+            item: "Mac".into(),
+        };
+
         let found =
-            find_external_symbol_with_fallback(&krate, &import, "digest", "1.0.0", Path::new("/x"))
-                .unwrap();
+            find_external_symbol(&krate, &import, "digest", "1.0.0", Path::new("/x")).unwrap();
+
         assert_eq!(found.imported.name, "Mac");
     }
 }

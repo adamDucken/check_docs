@@ -70,7 +70,7 @@ Recommendation:
 - Add a regression test for `use serde::Serialize;` because this repo already has `serde` as a direct dependency.
 
 ### High: external re-export fallback can report the wrong item
-status: issue:open
+status: issue:closed - fixed
 
 References:
 

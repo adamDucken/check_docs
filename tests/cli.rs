@@ -1,4 +1,6 @@
+use std::fs;
 use std::process::Command;
+use tempfile::TempDir;
 
 #[test]
 fn binary_reports_dependency_item() {
@@ -81,6 +83,70 @@ fn binary_reports_direct_dependency_reexport_from_transitive_crate() {
     assert!(stdout.contains("crate: serde_core"));
     assert!(stdout.contains("import: use serde::Serialize;"));
     assert!(stdout.contains("resolved item: trait Serialize"));
+}
+
+#[test]
+fn binary_supports_virtual_workspace_package_selection() {
+    let workspace = TempDir::new().unwrap();
+    fs::create_dir_all(workspace.path().join("app/src")).unwrap();
+    fs::create_dir_all(workspace.path().join("dep_crate/src")).unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        r#"
+[workspace]
+members = ["app", "dep_crate"]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("app/Cargo.toml"),
+        r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dep_crate = { path = "../dep_crate" }
+"#,
+    )
+    .unwrap();
+    fs::write(workspace.path().join("app/src/lib.rs"), "").unwrap();
+    fs::write(
+        workspace.path().join("dep_crate/Cargo.toml"),
+        r#"
+[package]
+name = "dep_crate"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("dep_crate/src/lib.rs"),
+        "pub struct Thing;\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use dep_crate::Thing;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("crate: dep_crate"));
+    assert!(stdout.contains("item: struct Thing"));
 }
 
 #[test]

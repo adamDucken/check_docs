@@ -197,24 +197,53 @@ pub(crate) fn is_rust_library_crate(crate_name: &str) -> bool {
     matches!(crate_name, "std" | "core" | "alloc")
 }
 
-pub(crate) fn package_for_manifest<'a>(
+pub(crate) fn select_package<'a>(
     metadata: &'a Metadata,
     manifest_path: &Path,
+    package_selector: Option<&str>,
 ) -> Result<&'a Package, String> {
-    let manifest_path = manifest_path
-        .canonicalize()
-        .map_err(|err| format!("failed to canonicalize {}: {err}", manifest_path.display()))?;
+    if let Some(selector) = package_selector {
+        let mut matches = metadata
+            .workspace_members
+            .iter()
+            .filter_map(|id| package_by_id(&metadata.packages, id))
+            .filter(|package| package.name == selector || package.id.to_string() == selector)
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| left.id.repr.cmp(&right.id.repr));
+        return match matches.as_slice() {
+            [] => Err(format!("package '{selector}' not found in workspace")),
+            [package] => Ok(*package),
+            packages => {
+                let candidates = packages
+                    .iter()
+                    .map(|package| package.id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(format!(
+                    "package '{selector}' matched multiple workspace packages: {candidates}"
+                ))
+            }
+        };
+    }
 
-    metadata
-        .packages
-        .iter()
-        .find(|package| package.manifest_path.as_std_path() == manifest_path)
-        .ok_or_else(|| {
-            format!(
-                "package for manifest {} not found in cargo metadata",
-                manifest_path.display()
-            )
-        })
+    if let Some(package) = metadata.root_package() {
+        return Ok(package);
+    }
+
+    let root = manifest_path
+        .parent()
+        .unwrap_or(manifest_path)
+        .canonicalize()
+        .unwrap_or_else(|_| {
+            manifest_path
+                .parent()
+                .unwrap_or(manifest_path)
+                .to_path_buf()
+        });
+    Err(format!(
+        "virtual workspace root {} has no root package; pass --package <name-or-id>",
+        root.display()
+    ))
 }
 
 pub(crate) fn package_dependencies(
@@ -310,6 +339,7 @@ pub(crate) fn package_spec(package: &Package) -> String {
 mod tests {
     use super::*;
     use cargo_metadata::MetadataCommand;
+    use std::fs;
     use tempfile::TempDir;
 
     fn metadata() -> Metadata {
@@ -326,6 +356,50 @@ mod tests {
         }
     }
 
+    fn virtual_workspace() -> TempDir {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join("member_a/src")).unwrap();
+        fs::create_dir_all(temp.path().join("member_b/src")).unwrap();
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            r#"
+[workspace]
+members = ["member_a", "member_b"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("member_a/Cargo.toml"),
+            r#"
+[package]
+name = "member_a"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .unwrap();
+        fs::write(temp.path().join("member_a/src/lib.rs"), "").unwrap();
+        fs::write(
+            temp.path().join("member_b/Cargo.toml"),
+            r#"
+[package]
+name = "member_b"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .unwrap();
+        fs::write(temp.path().join("member_b/src/lib.rs"), "").unwrap();
+        temp
+    }
+
+    fn metadata_for(manifest_path: &Path) -> Metadata {
+        MetadataCommand::new()
+            .manifest_path(manifest_path)
+            .exec()
+            .unwrap()
+    }
+
     #[test]
     fn detects_unsupported_rust_library_crates() {
         assert!(is_rust_library_crate("std"));
@@ -337,7 +411,7 @@ mod tests {
     #[test]
     fn resolves_package_for_exact_manifest_and_its_dependencies() {
         let metadata = metadata();
-        let package = package_for_manifest(&metadata, Path::new("Cargo.toml")).unwrap();
+        let package = select_package(&metadata, Path::new("Cargo.toml"), None).unwrap();
         assert_eq!(package.name, "check_docs");
 
         let deps = package_dependencies(&metadata, &package.id, default_filter());
@@ -349,9 +423,44 @@ mod tests {
     }
 
     #[test]
+    fn selects_workspace_member_by_package_name_or_id() {
+        let temp = virtual_workspace();
+        let manifest_path = temp.path().join("Cargo.toml");
+        let metadata = metadata_for(&manifest_path);
+
+        let member_a = select_package(&metadata, &manifest_path, Some("member_a")).unwrap();
+        assert_eq!(member_a.name, "member_a");
+
+        let by_id =
+            select_package(&metadata, &manifest_path, Some(&member_a.id.to_string())).unwrap();
+        assert_eq!(by_id.id, member_a.id);
+    }
+
+    #[test]
+    fn virtual_workspace_requires_package_selector() {
+        let temp = virtual_workspace();
+        let manifest_path = temp.path().join("Cargo.toml");
+        let metadata = metadata_for(&manifest_path);
+
+        let err = select_package(&metadata, &manifest_path, None).unwrap_err();
+        assert!(err.contains("virtual workspace root"));
+        assert!(err.contains("pass --package <name-or-id>"));
+    }
+
+    #[test]
+    fn unknown_package_selector_reports_workspace_miss() {
+        let temp = virtual_workspace();
+        let manifest_path = temp.path().join("Cargo.toml");
+        let metadata = metadata_for(&manifest_path);
+
+        let err = select_package(&metadata, &manifest_path, Some("missing")).unwrap_err();
+        assert_eq!(err, "package 'missing' not found in workspace");
+    }
+
+    #[test]
     fn package_spec_preserves_resolved_package_identity() {
         let metadata = metadata();
-        let package = package_for_manifest(&metadata, Path::new("Cargo.toml")).unwrap();
+        let package = select_package(&metadata, Path::new("Cargo.toml"), None).unwrap();
         let deps = package_dependencies(&metadata, &package.id, default_filter());
         let dep = resolve_dependency(&metadata.packages, &deps, "cargo_metadata").unwrap();
         let spec = package_spec(dep.package);
@@ -368,7 +477,7 @@ mod tests {
     #[test]
     fn resolver_error_paths_are_explicit() {
         let metadata = metadata();
-        let package = package_for_manifest(&metadata, Path::new("Cargo.toml")).unwrap();
+        let package = select_package(&metadata, Path::new("Cargo.toml"), None).unwrap();
         let deps = package_dependencies(&metadata, &package.id, default_filter());
 
         let missing =
@@ -388,10 +497,6 @@ mod tests {
 
         let no_lib = library_target(package).unwrap_err();
         assert!(no_lib.contains("no doc-able library target"));
-
-        let temp = TempDir::new().unwrap();
-        let bad = package_for_manifest(&metadata, &temp.path().join("Cargo.toml")).unwrap_err();
-        assert!(bad.contains("failed to canonicalize"));
     }
 
     #[test]
@@ -406,7 +511,7 @@ mod tests {
     #[test]
     fn filters_dev_dependencies_by_default() {
         let metadata = metadata();
-        let package = package_for_manifest(&metadata, Path::new("Cargo.toml")).unwrap();
+        let package = select_package(&metadata, Path::new("Cargo.toml"), None).unwrap();
 
         let default_deps = package_dependencies(&metadata, &package.id, default_filter());
         assert!(!default_deps.contains_key("tempfile"));
@@ -431,7 +536,7 @@ mod tests {
     #[test]
     fn resolves_reexport_target_from_direct_dependency_graph() {
         let metadata = metadata();
-        let package = package_for_manifest(&metadata, Path::new("Cargo.toml")).unwrap();
+        let package = select_package(&metadata, Path::new("Cargo.toml"), None).unwrap();
         let deps = package_dependencies(&metadata, &package.id, default_filter());
         let serde = resolve_dependency(&metadata.packages, &deps, "serde").unwrap();
 
@@ -450,7 +555,7 @@ mod tests {
     #[test]
     fn duplicate_dependency_contexts_are_rejected() {
         let metadata = metadata();
-        let package = package_for_manifest(&metadata, Path::new("Cargo.toml")).unwrap();
+        let package = select_package(&metadata, Path::new("Cargo.toml"), None).unwrap();
         let mut deps = package_dependencies(&metadata, &package.id, default_filter());
         let duplicate = deps.entries["cargo_metadata"][0].clone();
         deps.insert("cargo_metadata".into(), duplicate);

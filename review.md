@@ -89,7 +89,7 @@ Recommendation:
 - If keeping fallback, print it as an explicit heuristic and keep the original lookup failure visible.
 
 ### Medium: virtual workspace roots are unsupported
-status: issue:open
+status: issue:closed - fixed
 
 References:
 

@@ -9,7 +9,7 @@ use cli::parse_args;
 use imports::ImportPath;
 use resolver::{
     DependencyContext, DependencyFilter, is_rust_library_crate, package_dependencies,
-    package_for_manifest, resolve_dependency, resolve_dependency_from_package,
+    resolve_dependency, resolve_dependency_from_package, select_package,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -71,7 +71,7 @@ fn run() -> Result<(), String> {
         .exec()
         .map_err(|err| format!("failed to read cargo metadata: {err}"))?;
 
-    let root_package = package_for_manifest(&metadata, &manifest_path)?;
+    let root_package = select_package(&metadata, &manifest_path, args.package.as_deref())?;
     let dependency_filter = DependencyFilter {
         include_dev: args.include_dev,
         include_build: args.include_build,
@@ -451,7 +451,7 @@ mod tests {
             .manifest_path("Cargo.toml")
             .exec()
             .unwrap();
-        let package = package_for_manifest(&metadata, Path::new("Cargo.toml")).unwrap();
+        let package = select_package(&metadata, Path::new("Cargo.toml"), None).unwrap();
         let deps = package_dependencies(
             &metadata,
             &package.id,

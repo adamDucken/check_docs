@@ -714,7 +714,7 @@ fn trait_details(krate: &Crate, t: &rustdoc_types::Trait) -> Vec<String> {
         .filter_map(|item| {
             let name = item.name.clone().unwrap_or_default();
             match &item.inner {
-                ItemEnum::Function(f) => Some(fn_def(&name, f)),
+                ItemEnum::Function(f) => Some(trait_fn_def(&name, f)),
                 ItemEnum::AssocType {
                     generics,
                     bounds,
@@ -730,7 +730,24 @@ fn trait_details(krate: &Crate, t: &rustdoc_types::Trait) -> Vec<String> {
 }
 
 fn fn_def(name: &str, f: &rustdoc_types::Function) -> String {
-    let mut prefix = String::from("pub ");
+    function_def(name, f, FunctionContext::PublicItem)
+}
+
+fn trait_fn_def(name: &str, f: &rustdoc_types::Function) -> String {
+    function_def(name, f, FunctionContext::TraitItem)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FunctionContext {
+    PublicItem,
+    TraitItem,
+}
+
+fn function_def(name: &str, f: &rustdoc_types::Function, context: FunctionContext) -> String {
+    let mut prefix = String::new();
+    if matches!(context, FunctionContext::PublicItem) {
+        prefix.push_str("pub ");
+    }
     if f.header.is_const {
         prefix.push_str("const ");
     }
@@ -754,11 +771,19 @@ fn fn_def(name: &str, f: &rustdoc_types::Function) -> String {
         .as_ref()
         .map(|ty| format!(" -> {}", type_str(ty)))
         .unwrap_or_default();
-    format!(
+    let mut rendered = format!(
         "{prefix}fn {name}{}({inputs}){output}{}",
         generics(&f.generics),
         where_clause(&f.generics)
-    )
+    );
+    if matches!(context, FunctionContext::TraitItem) {
+        if f.has_body {
+            rendered.push_str(" { ... }");
+        } else {
+            rendered.push(';');
+        }
+    }
+    rendered
 }
 
 fn union_def(krate: &Crate, name: &str, u: &rustdoc_types::Union) -> String {
@@ -2391,6 +2416,24 @@ mod tests {
                 type_: Some(Type::Generic("T".into())),
             },
         );
+        let required_method = item(
+            8,
+            Some("load"),
+            Visibility::Default,
+            ItemEnum::Function(Function {
+                has_body: false,
+                ..function.clone()
+            }),
+        );
+        let provided_method = item(
+            9,
+            Some("load_default"),
+            Visibility::Default,
+            ItemEnum::Function(Function {
+                has_body: true,
+                ..function.clone()
+            }),
+        );
         let trait_item = item(
             5,
             Some("Loader"),
@@ -2399,7 +2442,7 @@ mod tests {
                 is_auto: false,
                 is_unsafe: false,
                 is_dyn_compatible: true,
-                items: vec![Id(4)],
+                items: vec![Id(4), Id(8), Id(9)],
                 generics: constrained.clone(),
                 bounds: vec![GenericBound::TraitBound {
                     trait_: Path {
@@ -2413,7 +2456,10 @@ mod tests {
                 implementations: vec![],
             }),
         );
-        let docs = krate(vec![assoc, trait_item.clone()], Id(5));
+        let docs = krate(
+            vec![assoc, required_method, provided_method, trait_item.clone()],
+            Id(5),
+        );
         let trait_doc = format_item(&docs, &trait_item);
         assert_eq!(
             trait_doc.definition,
@@ -2422,7 +2468,9 @@ mod tests {
         assert_eq!(
             trait_doc.details,
             vec![
-                "type Output<'a: 'b, T: Clone + Send = String, const N: usize = 32>: Clone where T: Sync + 'a, 'a: 'b, T::Item = u8, for<'x> T: Borrow<'x> = T;"
+                "type Output<'a: 'b, T: Clone + Send = String, const N: usize = 32>: Clone where T: Sync + 'a, 'a: 'b, T::Item = u8, for<'x> T: Borrow<'x> = T;",
+                "fn load<'a: 'b, T: Clone + Send = String, const N: usize = 32>(x: T) -> T where T: Sync + 'a, 'a: 'b, T::Item = u8, for<'x> T: Borrow<'x>;",
+                "fn load_default<'a: 'b, T: Clone + Send = String, const N: usize = 32>(x: T) -> T where T: Sync + 'a, 'a: 'b, T::Item = u8, for<'x> T: Borrow<'x> { ... }"
             ]
         );
 

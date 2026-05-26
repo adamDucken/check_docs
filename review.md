@@ -152,7 +152,7 @@ Recommendation:
 - Add tests for `pub(crate) use syn::ItemUse;` and `pub(super) use ...`.
 
 ### Medium: trait item formatting is syntactically wrong
-status: issue:open
+status: issue:closed - fixed
 
 References:
 

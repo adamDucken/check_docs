@@ -102,6 +102,22 @@ fn binary_reports_visible_use_item() {
 }
 
 #[test]
+fn binary_formats_trait_methods_without_pub() {
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args(["use syn::parse::Parse;", "--root", "."])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("fn parse(input: ParseStream<'_>) -> Result<Self>;"));
+    assert!(!stdout.contains("pub fn parse(input: ParseStream<'_>) -> Result<Self>"));
+}
+
+#[test]
 fn binary_supports_virtual_workspace_package_selection() {
     let workspace = TempDir::new().unwrap();
     fs::create_dir_all(workspace.path().join("app/src")).unwrap();

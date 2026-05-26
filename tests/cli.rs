@@ -35,29 +35,52 @@ fn binary_reports_batch_brace_imports() {
 }
 
 #[test]
-fn binary_rejects_transitive_item_through_external_module_reexport() {
+fn binary_reports_transitive_item_through_external_module_reexport() {
     let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
         .args(["use cargo_metadata::camino::Utf8PathBuf;", "--root", "."])
         .output()
         .unwrap();
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("re-exported from external crate 'camino'"));
-    assert!(stderr.contains("direct dependency"));
-    assert!(stderr.contains("add/query 'camino' directly"));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("crate: camino"));
+    assert!(stdout.contains("item: struct Utf8PathBuf"));
 }
 
 #[test]
-fn binary_rejects_transitive_external_crate_root_reexport() {
+fn binary_reports_transitive_external_crate_root_reexport() {
     let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
         .args(["use cargo_metadata::camino;", "--root", "."])
         .output()
         .unwrap();
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("re-exported from external crate 'camino'"));
-    assert!(stderr.contains("direct dependency"));
-    assert!(stderr.contains("add/query 'camino' directly"));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("crate: camino"));
+    assert!(stdout.contains("item: module camino"));
+}
+
+#[test]
+fn binary_reports_direct_dependency_reexport_from_transitive_crate() {
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args(["use serde::Serialize;", "--root", "."])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("crate: serde_core"));
+    assert!(stdout.contains("import: use serde::Serialize;"));
+    assert!(stdout.contains("resolved item: trait Serialize"));
 }
 
 #[test]

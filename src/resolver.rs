@@ -19,6 +19,7 @@ pub(crate) struct DependencyFilter {
 pub(crate) struct DependencyContext {
     pub(crate) kind: DependencyKind,
     pub(crate) target: Option<String>,
+    pub(crate) via: Option<String>,
 }
 
 impl DependencyContext {
@@ -29,9 +30,137 @@ impl DependencyContext {
             DependencyKind::Build => "build",
             _ => "unknown",
         };
-        match &self.target {
+        let label = match &self.target {
             Some(target) => format!("{kind} ({target})"),
             None => kind.to_string(),
+        };
+        match &self.via {
+            Some(via) => format!("transitive via {via} ({label})"),
+            None => label,
+        }
+    }
+}
+
+fn transitive_context(
+    kind: DependencyKind,
+    target: Option<String>,
+    source_crate: &str,
+) -> DependencyContext {
+    DependencyContext {
+        kind,
+        target,
+        via: Some(source_crate.to_string()),
+    }
+}
+
+fn normalized_crate_name(name: &str) -> String {
+    name.replace('-', "_")
+}
+
+fn package_by_id<'a>(packages: &'a [Package], package_id: &PackageId) -> Option<&'a Package> {
+    packages.iter().find(|pkg| &pkg.id == package_id)
+}
+
+fn dependency_matches_crate_name(
+    packages: &[Package],
+    dep: &cargo_metadata::NodeDep,
+    crate_name: &str,
+) -> bool {
+    if normalized_crate_name(&dep.name) == crate_name {
+        return true;
+    }
+    let Some(package) = package_by_id(packages, &dep.pkg) else {
+        return false;
+    };
+    normalized_crate_name(&package.name) == crate_name
+        || library_target(package)
+            .map(|target| normalized_crate_name(&target.name) == crate_name)
+            .unwrap_or(false)
+}
+
+pub(crate) fn resolve_dependency_from_package<'a>(
+    metadata: &Metadata,
+    packages: &'a [Package],
+    source_package: &Package,
+    crate_name: &str,
+) -> Result<ResolvedDependency<'a>, String> {
+    let Some(resolve) = metadata.resolve.as_ref() else {
+        return Err("cargo metadata did not include a dependency graph".to_string());
+    };
+    let Some(node) = resolve
+        .nodes
+        .iter()
+        .find(|node| node.id == source_package.id)
+    else {
+        return Err(format!(
+            "package '{}' missing from cargo metadata dependency graph",
+            source_package.name
+        ));
+    };
+
+    let mut matches = Vec::<DependencyEntry>::new();
+    for dep in &node.deps {
+        if !dependency_matches_crate_name(packages, dep, crate_name) {
+            continue;
+        }
+        for dep_kind in &dep.dep_kinds {
+            if matches
+                .iter()
+                .any(|entry| entry.package_id == dep.pkg && entry.context.kind == dep_kind.kind)
+            {
+                continue;
+            }
+            matches.push(DependencyEntry {
+                package_id: dep.pkg.clone(),
+                context: transitive_context(
+                    dep_kind.kind,
+                    dep_kind.target.as_ref().map(ToString::to_string),
+                    &source_package.name,
+                ),
+            });
+        }
+    }
+
+    let mut package_ids = matches
+        .iter()
+        .map(|entry| entry.package_id.clone())
+        .collect::<Vec<_>>();
+    package_ids.sort_by(|left, right| left.repr.cmp(&right.repr));
+    package_ids.dedup();
+
+    match package_ids.as_slice() {
+        [] => Err(format!(
+            "crate '{crate_name}' is not a dependency of direct dependency '{}'",
+            source_package.name
+        )),
+        [_] => {
+            let entry = matches
+                .iter()
+                .find(|entry| entry.package_id == package_ids[0])
+                .expect("entry exists for deduplicated package id");
+            let package = package_by_id(packages, &entry.package_id).ok_or_else(|| {
+                format!(
+                    "dependency '{crate_name}' of '{}' missing from cargo metadata",
+                    source_package.name
+                )
+            })?;
+            let target = library_target(package)?;
+            Ok(ResolvedDependency {
+                package,
+                target,
+                context: entry.context.clone(),
+            })
+        }
+        _ => {
+            let candidates = package_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!(
+                "crate '{crate_name}' matched multiple dependencies of '{}': {candidates}",
+                source_package.name
+            ))
         }
     }
 }
@@ -110,6 +239,7 @@ pub(crate) fn package_dependencies(
                         context: DependencyContext {
                             kind: dep_kind.kind,
                             target: dep_kind.target.as_ref().map(ToString::to_string),
+                            via: None,
                         },
                     });
             }
@@ -149,9 +279,7 @@ pub(crate) fn resolve_dependency<'a>(
     }
     let entry = &entries[0];
 
-    let package = packages
-        .iter()
-        .find(|pkg| pkg.id == entry.package_id)
+    let package = package_by_id(packages, &entry.package_id)
         .ok_or_else(|| format!("direct dependency '{crate_name}' missing from cargo metadata"))?;
     let target = library_target(package)?;
     Ok(ResolvedDependency {
@@ -298,6 +426,25 @@ mod tests {
         );
         let dep = resolve_dependency(&metadata.packages, &dev_deps, "tempfile").unwrap();
         assert_eq!(dep.context.kind, DependencyKind::Development);
+    }
+
+    #[test]
+    fn resolves_reexport_target_from_direct_dependency_graph() {
+        let metadata = metadata();
+        let package = package_for_manifest(&metadata, Path::new("Cargo.toml")).unwrap();
+        let deps = package_dependencies(&metadata, &package.id, default_filter());
+        let serde = resolve_dependency(&metadata.packages, &deps, "serde").unwrap();
+
+        let serde_core = resolve_dependency_from_package(
+            &metadata,
+            &metadata.packages,
+            serde.package,
+            "serde_core",
+        )
+        .unwrap();
+
+        assert_eq!(serde_core.package.name, "serde_core");
+        assert_eq!(serde_core.context.label(), "transitive via serde (normal)");
     }
 
     #[test]

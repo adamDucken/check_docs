@@ -9,7 +9,7 @@ use cli::parse_args;
 use imports::ImportPath;
 use resolver::{
     DependencyContext, DependencyFilter, is_rust_library_crate, package_dependencies,
-    package_for_manifest, resolve_dependency,
+    package_for_manifest, resolve_dependency, resolve_dependency_from_package,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -117,17 +117,30 @@ fn run() -> Result<(), String> {
                             Some(&err),
                         ));
                     };
-                    let external_dep = resolve_dependency(
-                    &metadata.packages,
-                    &root_dependencies,
-                    &external.crate_name,
-                )
-                .map_err(|dep_err| {
-                    format!(
-                        "item '{}' is re-exported from external crate '{}' but exact docs require that crate to be a direct dependency of the selected package; add/query '{}' directly: {dep_err}",
-                        import.item, external.crate_name, external.crate_name
-                    )
-                })?;
+                    let external_dep =
+                        match resolve_dependency(&metadata.packages, &root_dependencies, &external.crate_name) {
+                            Ok(dep) => dep,
+                            Err(dep_err) if dep_err.contains("not a direct dependency") => {
+                                resolve_dependency_from_package(
+                                    &metadata,
+                                    &metadata.packages,
+                                    dep.package,
+                                    &external.crate_name,
+                                )
+                                .map_err(|graph_err| {
+                                    format!(
+                                        "item '{}' is re-exported from external crate '{}' but exact docs could not resolve that crate through direct dependency '{}': {graph_err}",
+                                        import.item, external.crate_name, dep.package.name
+                                    )
+                                })?
+                            }
+                            Err(dep_err) => {
+                                return Err(format!(
+                                    "item '{}' is re-exported from external crate '{}' but exact docs could not resolve that crate: {dep_err}",
+                                    import.item, external.crate_name
+                                ));
+                            }
+                        };
                     let (external_krate, external_json_path) = load_docs_cached(
                         &mut rustdoc_cache,
                         &manifest_path,
@@ -440,6 +453,7 @@ mod tests {
         DependencyContext {
             kind: cargo_metadata::DependencyKind::Normal,
             target: None,
+            via: None,
         }
     }
 

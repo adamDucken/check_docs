@@ -17,17 +17,20 @@ pub(crate) fn load_or_generate(
     metadata: &Metadata,
     package: &Package,
     target: &Target,
+    target_triple: Option<&str>,
 ) -> Result<(Crate, PathBuf), String> {
-    let json_path = metadata
-        .target_directory
-        .as_std_path()
+    let mut doc_dir = metadata.target_directory.as_std_path().to_path_buf();
+    if let Some(target_triple) = target_triple {
+        doc_dir.push(target_triple);
+    }
+    let json_path = doc_dir
         .join("doc")
         .join(format!("{}.json", target.name.replace('-', "_")));
     let _lock = JsonGenerationLock::acquire(json_path.with_extension("json.lock"))?;
 
     // Always regenerate. Existing JSON does not encode enough of Cargo's resolved state
     // to prove it matches the selected package's current features/source graph.
-    generate_json(manifest_path, package, target)?;
+    generate_json(manifest_path, package, target, target_triple)?;
     let krate = load_valid_json(&json_path, package)?;
     Ok((krate, json_path))
 }
@@ -162,24 +165,35 @@ fn load_valid_json(path: &PathBuf, package: &Package) -> Result<Crate, String> {
     Ok(krate)
 }
 
-fn generate_json(manifest_path: PathBuf, package: &Package, target: &Target) -> Result<(), String> {
+fn generate_json(
+    manifest_path: PathBuf,
+    package: &Package,
+    target: &Target,
+    target_triple: Option<&str>,
+) -> Result<(), String> {
     let toolchain = env::var("CHECK_DOCS_TOOLCHAIN").unwrap_or_else(|_| "nightly".to_string());
-    generate_json_with_toolchain(manifest_path, package, target, &toolchain)
+    generate_json_with_toolchain(manifest_path, package, target, target_triple, &toolchain)
 }
 
 fn generate_json_with_toolchain(
     manifest_path: PathBuf,
     package: &Package,
     target: &Target,
+    target_triple: Option<&str>,
     toolchain: &str,
 ) -> Result<(), String> {
     let spec = package_spec(package);
     let selector = target_selector(target)?;
-    let output = Command::new("cargo")
+    let mut command = Command::new("cargo");
+    command
         .arg(format!("+{toolchain}"))
         .args(["rustdoc", "--manifest-path"])
         .arg(&manifest_path)
-        .args(["-p", &spec])
+        .args(["-p", &spec]);
+    if let Some(target_triple) = target_triple {
+        command.args(["--target", target_triple]);
+    }
+    let output = command
         .args(selector)
         .args(["--", "-Z", "unstable-options", "--output-format", "json"])
         .output()
@@ -438,6 +452,7 @@ mod tests {
             PathBuf::from("Cargo.toml"),
             &pkg,
             &target,
+            None,
             "definitely_missing_check_docs_toolchain",
         )
         .unwrap_err();

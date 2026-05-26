@@ -8,18 +8,20 @@ use cargo_metadata::{Metadata, MetadataCommand, Package, PackageId, Target};
 use cli::parse_args;
 use imports::ImportPath;
 use resolver::{
-    is_rust_library_crate, package_dependencies, package_for_manifest, resolve_dependency,
+    DependencyContext, DependencyFilter, is_rust_library_crate, package_dependencies,
+    package_for_manifest, resolve_dependency,
 };
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::ExitCode;
-use symbols::SymbolDoc;
+use std::process::{Command, ExitCode};
+use symbols::{SymbolDoc, SymbolReport};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RustdocCacheKey {
     package_id: PackageId,
     target_name: String,
+    target_triple: Option<String>,
 }
 
 type RustdocCache = HashMap<RustdocCacheKey, (rustdoc_types::Crate, PathBuf)>;
@@ -54,13 +56,27 @@ fn run() -> Result<(), String> {
             manifest_path.display()
         ));
     }
-    let metadata = MetadataCommand::new()
-        .manifest_path(&manifest_path)
+    let selected_target = match args.target {
+        Some(target) => target,
+        None => host_target_triple()?,
+    };
+
+    let mut metadata_command = MetadataCommand::new();
+    metadata_command.manifest_path(&manifest_path);
+    metadata_command.other_options(vec![
+        "--filter-platform".to_string(),
+        selected_target.clone(),
+    ]);
+    let metadata = metadata_command
         .exec()
         .map_err(|err| format!("failed to read cargo metadata: {err}"))?;
 
     let root_package = package_for_manifest(&metadata, &manifest_path)?;
-    let root_dependencies = package_dependencies(&metadata, &root_package.id);
+    let dependency_filter = DependencyFilter {
+        include_dev: args.include_dev,
+        include_build: args.include_build,
+    };
+    let root_dependencies = package_dependencies(&metadata, &root_package.id, dependency_filter);
     let mut rustdoc_cache = RustdocCache::new();
     for (index, import) in imports.iter().enumerate() {
         if index > 0 {
@@ -73,31 +89,35 @@ fn run() -> Result<(), String> {
             &metadata,
             dep.package,
             dep.target,
+            Some(&selected_target),
         )?;
-        let (found, report_crate, report_version, report_json_path) = match symbols::find_symbol(
-            &krate, import,
-        ) {
-            Ok(found) => (
-                found,
-                dep.package.name.clone(),
-                dep.package.version.to_string(),
-                json_path,
-            ),
-            Err(err) => {
-                let Some(external) =
-                    symbols::external_reexport(&krate, import).map_err(|external_err| {
-                        format!("{err}; failed to inspect external re-export: {external_err}")
-                    })?
-                else {
-                    return Err(not_found_message(
-                        import,
-                        &dep.package.name,
-                        Some(&dep.package.version.to_string()),
-                        &json_path,
-                        Some(&err),
-                    ));
-                };
-                let external_dep = resolve_dependency(
+        let (found, report_crate, report_version, report_json_path, context, target_triple) =
+            match symbols::find_symbol_report(&krate, import) {
+                Ok(found) => (
+                    found,
+                    dep.package.name.clone(),
+                    dep.package.version.to_string(),
+                    json_path,
+                    dep.context,
+                    krate.target.triple.clone(),
+                ),
+                Err(err) => {
+                    let imported_reexport =
+                        symbols::imported_reexport(&krate, import).ok().flatten();
+                    let Some(external) =
+                        symbols::external_reexport(&krate, import).map_err(|external_err| {
+                            format!("{err}; failed to inspect external re-export: {external_err}")
+                        })?
+                    else {
+                        return Err(not_found_message(
+                            import,
+                            &dep.package.name,
+                            Some(&dep.package.version.to_string()),
+                            &json_path,
+                            Some(&err),
+                        ));
+                    };
+                    let external_dep = resolve_dependency(
                     &metadata.packages,
                     &root_dependencies,
                     &external.crate_name,
@@ -108,44 +128,79 @@ fn run() -> Result<(), String> {
                         import.item, external.crate_name, external.crate_name
                     )
                 })?;
-                let (external_krate, external_json_path) = load_docs_cached(
-                    &mut rustdoc_cache,
-                    &manifest_path,
-                    &metadata,
-                    external_dep.package,
-                    external_dep.target,
-                )?;
-                let found = if let Some(external_import) = external.import_path() {
-                    find_external_symbol_with_fallback(
-                        &external_krate,
-                        &external_import,
-                        &external_dep.package.name,
-                        &external_dep.package.version.to_string(),
-                        &external_json_path,
-                    )?
-                } else {
-                    symbols::format_crate_root(&external_krate)?
-                };
-                (
-                    found,
-                    external_dep.package.name.clone(),
-                    external_dep.package.version.to_string(),
-                    external_json_path,
-                )
-            }
-        };
+                    let (external_krate, external_json_path) = load_docs_cached(
+                        &mut rustdoc_cache,
+                        &manifest_path,
+                        &metadata,
+                        external_dep.package,
+                        external_dep.target,
+                        Some(&selected_target),
+                    )?;
+                    let found = if let Some(external_import) = external.import_path() {
+                        find_external_symbol_with_fallback(
+                            &external_krate,
+                            &external_import,
+                            &external_dep.package.name,
+                            &external_dep.package.version.to_string(),
+                            &external_json_path,
+                        )?
+                    } else {
+                        SymbolReport {
+                            imported: symbols::format_crate_root(&external_krate)?,
+                            resolved: None,
+                        }
+                    };
+                    let found = if let Some(imported) = imported_reexport {
+                        let resolved = found.resolved.unwrap_or(found.imported);
+                        SymbolReport {
+                            imported,
+                            resolved: Some(resolved),
+                        }
+                    } else {
+                        found
+                    };
+                    (
+                        found,
+                        external_dep.package.name.clone(),
+                        external_dep.package.version.to_string(),
+                        external_json_path,
+                        external_dep.context,
+                        external_krate.target.triple.clone(),
+                    )
+                }
+            };
 
         print_report(
             &report_crate,
             Some(&report_version),
             &report_json_path,
             &format_use(import),
-            import,
+            &context,
+            &target_triple,
             &found,
         );
     }
 
     Ok(())
+}
+
+fn host_target_triple() -> Result<String, String> {
+    let output = Command::new("rustc")
+        .arg("-vV")
+        .output()
+        .map_err(|err| format!("failed to run rustc -vV to detect host target: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to detect host target with rustc -vV: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(str::to_string)
+        .ok_or_else(|| "failed to parse host target from rustc -vV output".to_string())
 }
 
 fn load_docs_cached(
@@ -154,22 +209,33 @@ fn load_docs_cached(
     metadata: &Metadata,
     package: &Package,
     target: &Target,
+    target_triple: Option<&str>,
 ) -> Result<(rustdoc_types::Crate, PathBuf), String> {
-    let key = rustdoc_cache_key(package, target);
+    let key = rustdoc_cache_key(package, target, target_triple);
     if let Some(cached) = cache.get(&key) {
         return Ok(cached.clone());
     }
 
-    let loaded =
-        rustdoc_json::load_or_generate(manifest_path.to_path_buf(), metadata, package, target)?;
+    let loaded = rustdoc_json::load_or_generate(
+        manifest_path.to_path_buf(),
+        metadata,
+        package,
+        target,
+        target_triple,
+    )?;
     cache.insert(key, loaded.clone());
     Ok(loaded)
 }
 
-fn rustdoc_cache_key(package: &Package, target: &Target) -> RustdocCacheKey {
+fn rustdoc_cache_key(
+    package: &Package,
+    target: &Target,
+    target_triple: Option<&str>,
+) -> RustdocCacheKey {
     RustdocCacheKey {
         package_id: package.id.clone(),
         target_name: target.name.clone(),
+        target_triple: target_triple.map(str::to_string),
     }
 }
 
@@ -179,8 +245,8 @@ fn find_external_symbol_with_fallback(
     crate_name: &str,
     version: &str,
     json_path: &Path,
-) -> Result<SymbolDoc, String> {
-    match symbols::find_symbol(krate, import) {
+) -> Result<SymbolReport, String> {
+    match symbols::find_symbol_report(krate, import) {
         Ok(found) => Ok(found),
         Err(first_err) if !import.segments.is_empty() => {
             let root_import = ImportPath {
@@ -188,7 +254,7 @@ fn find_external_symbol_with_fallback(
                 segments: Vec::new(),
                 item: import.item.clone(),
             };
-            symbols::find_symbol(krate, &root_import).map_err(|second_err| {
+            symbols::find_symbol_report(krate, &root_import).map_err(|second_err| {
                 not_found_message(
                     import,
                     crate_name,
@@ -223,17 +289,27 @@ fn print_report(
     version: Option<&str>,
     source: &Path,
     use_line: &str,
-    _import: &ImportPath,
-    found: &SymbolDoc,
+    context: &DependencyContext,
+    target_triple: &str,
+    report: &SymbolReport,
 ) {
     if let Some(version) = version {
         println!("crate: {crate_name} {version}");
     } else {
         println!("crate: {crate_name}");
     }
+    println!("dependency: {}", context.label());
+    println!("target: {target_triple}");
     println!("source: {}", source.display());
     println!("import: {}", use_line.trim());
-    println!("item: {} {}", found.kind, found.name);
+    print_doc("item", &report.imported);
+    if let Some(resolved) = &report.resolved {
+        print_doc("resolved item", resolved);
+    }
+}
+
+fn print_doc(label: &str, found: &SymbolDoc) {
+    println!("{label}: {} {}", found.kind, found.name);
     if found.path.as_os_str().is_empty() {
         println!("location: (unknown)");
     } else {
@@ -353,6 +429,20 @@ mod tests {
         }
     }
 
+    fn report(doc: SymbolDoc) -> SymbolReport {
+        SymbolReport {
+            imported: doc,
+            resolved: None,
+        }
+    }
+
+    fn dependency_context() -> DependencyContext {
+        DependencyContext {
+            kind: cargo_metadata::DependencyKind::Normal,
+            target: None,
+        }
+    }
+
     fn rustdoc_item(id: u32, name: &str, inner: ItemEnum) -> Item {
         Item {
             id: Id(id),
@@ -375,9 +465,16 @@ mod tests {
             .exec()
             .unwrap();
         let package = package_for_manifest(&metadata, Path::new("Cargo.toml")).unwrap();
-        let deps = package_dependencies(&metadata, &package.id);
+        let deps = package_dependencies(
+            &metadata,
+            &package.id,
+            DependencyFilter {
+                include_dev: false,
+                include_build: false,
+            },
+        );
         let dep = resolve_dependency(&metadata.packages, &deps, "cargo_metadata").unwrap();
-        let key = rustdoc_cache_key(dep.package, dep.target);
+        let key = rustdoc_cache_key(dep.package, dep.target, None);
 
         assert_eq!(&key.package_id, &dep.package.id);
         assert_eq!(&key.target_name, &dep.target.name);
@@ -408,27 +505,24 @@ mod tests {
 
     #[test]
     fn print_report_covers_output_branches() {
-        let import = ImportPath {
-            crate_name: "x".into(),
-            segments: vec![],
-            item: "Thing".into(),
-        };
         let src = Path::new("/tmp/src");
         print_report(
             "x",
             Some("1.2.3"),
             src,
             "use x::Thing;",
-            &import,
-            &doc("Thing", vec!["docs".into()]),
+            &dependency_context(),
+            "x86_64-unknown-linux-gnu",
+            &report(doc("Thing", vec!["docs".into()])),
         );
         print_report(
             "x",
             None,
             src,
             "use x::Thing;",
-            &import,
-            &doc("Thing", Vec::new()),
+            &dependency_context(),
+            "x86_64-unknown-linux-gnu",
+            &report(doc("Thing", Vec::new())),
         );
     }
 
@@ -477,6 +571,6 @@ mod tests {
         let found =
             find_external_symbol_with_fallback(&krate, &import, "digest", "1.0.0", Path::new("/x"))
                 .unwrap();
-        assert_eq!(found.name, "Mac");
+        assert_eq!(found.imported.name, "Mac");
     }
 }

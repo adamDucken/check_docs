@@ -242,6 +242,8 @@ Recommendation:
 
 ### Medium: dependency-kind and target filters are ignored
 
+Status: issue:closed - fixed
+
 References:
 
 - `src/resolver.rs:35-47`
@@ -257,6 +259,8 @@ Recommendation:
 - If they are not in scope, filter by `dep_kinds` and selected target.
 
 ### Medium: re-export alias docs and alias names are discarded
+
+Status: issue:closed - fixed
 
 References:
 

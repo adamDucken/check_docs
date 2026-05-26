@@ -21,6 +21,12 @@ pub(crate) struct SymbolDoc {
     pub(crate) impls: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SymbolReport {
+    pub(crate) imported: SymbolDoc,
+    pub(crate) resolved: Option<SymbolDoc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExternalReexport {
     pub(crate) crate_name: String,
@@ -39,6 +45,7 @@ impl ExternalReexport {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn find_symbol(krate: &Crate, import: &ImportPath) -> Result<SymbolDoc, String> {
     let mut current = krate.root;
     let mut parts = import.segments.clone();
@@ -55,6 +62,68 @@ pub(crate) fn find_symbol(krate: &Crate, import: &ImportPath) -> Result<SymbolDo
 
     let item = item(krate, current)?;
     Ok(format_item(krate, item))
+}
+
+pub(crate) fn find_symbol_report(
+    krate: &Crate,
+    import: &ImportPath,
+) -> Result<SymbolReport, String> {
+    let mut current = krate.root;
+    let mut parts = import.segments.clone();
+    parts.push(import.item.clone());
+
+    for (index, part) in parts.iter().enumerate() {
+        let is_last = index + 1 == parts.len();
+        let child_id = find_child(krate, current, part, is_last, &mut HashSet::new())?;
+        let child = item(krate, child_id)?;
+        if is_last {
+            if matches!(child.inner, ItemEnum::Use(_)) {
+                let imported = format_item(krate, child);
+                let resolved_id = follow_use(krate, child_id, &mut HashSet::new())?;
+                let resolved = format_item(krate, item(krate, resolved_id)?);
+                return Ok(SymbolReport {
+                    imported,
+                    resolved: Some(resolved),
+                });
+            }
+            let id = follow_use(krate, child_id, &mut HashSet::new())?;
+            return Ok(SymbolReport {
+                imported: format_item(krate, item(krate, id)?),
+                resolved: None,
+            });
+        }
+
+        current = follow_use(krate, child_id, &mut HashSet::new())?;
+        if !matches!(item(krate, current)?.inner, ItemEnum::Module(_)) {
+            return Err(format!("path segment '{part}' resolved to non-module item"));
+        }
+    }
+
+    Err("empty import path".to_string())
+}
+
+pub(crate) fn imported_reexport(
+    krate: &Crate,
+    import: &ImportPath,
+) -> Result<Option<SymbolDoc>, String> {
+    let mut current = krate.root;
+    let mut parts = import.segments.clone();
+    parts.push(import.item.clone());
+
+    for (index, part) in parts.iter().enumerate() {
+        let is_last = index + 1 == parts.len();
+        let child_id = find_child(krate, current, part, is_last, &mut HashSet::new())?;
+        let child = item(krate, child_id)?;
+        if is_last {
+            return Ok(matches!(child.inner, ItemEnum::Use(_)).then(|| format_item(krate, child)));
+        }
+        current = follow_use(krate, child_id, &mut HashSet::new())?;
+        if !matches!(item(krate, current)?.inner, ItemEnum::Module(_)) {
+            return Ok(None);
+        }
+    }
+
+    Ok(None)
 }
 
 pub(crate) fn external_reexport(
@@ -1472,6 +1541,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(via_use.name, "Config");
+
+        let via_use_report = find_symbol_report(
+            &krate,
+            &ImportPath {
+                crate_name: "x".into(),
+                segments: vec!["api".into()],
+                item: "Alias".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(via_use_report.imported.kind, "use");
+        assert_eq!(via_use_report.imported.name, "Alias");
+        assert!(
+            via_use_report
+                .imported
+                .docs
+                .iter()
+                .any(|line| line == "docs for Alias")
+        );
+        let resolved = via_use_report.resolved.unwrap();
+        assert_eq!(resolved.kind, "struct");
+        assert_eq!(resolved.name, "Config");
 
         let via_glob = find_symbol(
             &krate,

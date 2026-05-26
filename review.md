@@ -128,7 +128,7 @@ Recommendation:
 - Only fail when one import name maps to different package IDs or different library targets.
 
 ### Medium: parser rejects valid visible use items
-status: issue:open
+status: issue:closed - fixed
 
 References:
 

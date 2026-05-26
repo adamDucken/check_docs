@@ -86,6 +86,22 @@ fn binary_reports_direct_dependency_reexport_from_transitive_crate() {
 }
 
 #[test]
+fn binary_reports_visible_use_item() {
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args(["pub(crate) use syn::ItemUse;", "--root", "."])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("crate: syn"));
+    assert!(stdout.contains("item: struct ItemUse"));
+}
+
+#[test]
 fn binary_supports_virtual_workspace_package_selection() {
     let workspace = TempDir::new().unwrap();
     fs::create_dir_all(workspace.path().join("app/src")).unwrap();

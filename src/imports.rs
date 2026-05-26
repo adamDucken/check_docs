@@ -42,13 +42,16 @@ pub(crate) fn parse_use_lines(line: &str) -> Result<Vec<ImportPath>, String> {
 
 fn parse_item_use(line: &str) -> Result<ItemUse, String> {
     let text = line.trim();
-    let candidate = if starts_like_use_item(text) {
-        if text.ends_with(';') {
-            text.to_string()
-        } else {
-            format!("{text};")
+    let raw_item = with_semicolon(text);
+    match syn::parse_str::<ItemUse>(&raw_item) {
+        Ok(item) => return Ok(item),
+        Err(raw_err) if starts_like_use_item(text) => {
+            return Err(format!("invalid use import syntax: {raw_err}"));
         }
-    } else if text.ends_with(';') {
+        Err(_) => {}
+    }
+
+    let candidate = if text.ends_with(';') {
         format!("use {text}")
     } else {
         format!("use {text};")
@@ -57,7 +60,15 @@ fn parse_item_use(line: &str) -> Result<ItemUse, String> {
 }
 
 fn starts_like_use_item(text: &str) -> bool {
-    text.starts_with("use ") || text.starts_with("pub ")
+    text.starts_with("use ") || text.starts_with("pub ") || text.starts_with("pub(")
+}
+
+fn with_semicolon(text: &str) -> String {
+    if text.ends_with(';') {
+        text.to_string()
+    } else {
+        format!("{text};")
+    }
 }
 
 fn collect_use_tree(
@@ -122,6 +133,19 @@ mod tests {
 
         let import = parse_use_line("use syn::ItemUse").unwrap();
         assert_eq!(import.full_path(), "syn::ItemUse");
+    }
+
+    #[test]
+    fn parses_visible_use_items() {
+        for line in [
+            "pub(crate) use syn::ItemUse;",
+            "pub(super) use syn::ItemUse;",
+            "pub(in crate::module) use syn::ItemUse;",
+            "pub(crate) use syn::ItemUse",
+        ] {
+            let import = parse_use_line(line).unwrap();
+            assert_eq!(import.full_path(), "syn::ItemUse");
+        }
     }
 
     #[test]

@@ -203,7 +203,7 @@ Recommendation:
 - Add Clippy to CI if this project has CI.
 
 ### Low: help exits inside the parser
-status: issue:open
+status: issue:closed - fixed
 
 References:
 
@@ -219,7 +219,7 @@ Recommendation:
 - Let `main` own process exit behavior.
 
 ### Low: output and tests are too string-fragile
-status: issue:open
+status: issue:closed - fixed
 
 References:
 

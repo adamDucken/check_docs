@@ -11,11 +11,17 @@ pub(crate) struct Args {
     pub(crate) include_build: bool,
 }
 
-pub(crate) fn parse_args() -> Result<Args, String> {
-    parse_args_from(env::args().skip(1))
+#[derive(Debug)]
+pub(crate) enum ParsedCommand {
+    Run(Args),
+    Help,
 }
 
-fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
+pub(crate) fn parse_command() -> Result<ParsedCommand, String> {
+    parse_command_from(env::args().skip(1))
+}
+
+fn parse_command_from(args: impl IntoIterator<Item = String>) -> Result<ParsedCommand, String> {
     let mut root = PathBuf::from(".");
     let mut package = None;
     let mut target = None;
@@ -45,27 +51,24 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args, Strin
             }
             "--include-dev" => include_dev = true,
             "--include-build" => include_build = true,
-            "-h" | "--help" => {
-                println!("{}", usage());
-                std::process::exit(0);
-            }
+            "-h" | "--help" => return Ok(ParsedCommand::Help),
             value if use_line.is_none() => use_line = Some(value.to_string()),
             other => return Err(format!("unknown argument: {other}\n{}", usage())),
         }
     }
 
     let use_line = use_line.ok_or_else(usage)?;
-    Ok(Args {
+    Ok(ParsedCommand::Run(Args {
         root,
         use_line,
         package,
         target,
         include_dev,
         include_build,
-    })
+    }))
 }
 
-fn usage() -> String {
+pub(crate) fn usage() -> String {
     "usage: check-docs '<use crate_name::module::item;>' [--root PATH] [--package NAME_OR_ID] [--target TRIPLE] [--include-dev] [--include-build]".to_string()
 }
 
@@ -74,7 +77,10 @@ mod tests {
     use super::*;
 
     fn args(values: &[&str]) -> Result<Args, String> {
-        parse_args_from(values.iter().map(|value| value.to_string()))
+        match parse_command_from(values.iter().map(|value| value.to_string()))? {
+            ParsedCommand::Run(args) => Ok(args),
+            ParsedCommand::Help => Err("expected run command".to_string()),
+        }
     }
 
     #[test]
@@ -105,6 +111,18 @@ mod tests {
         let parsed = args(&["use serde::Serialize;", "-p", "member_a"]).unwrap();
 
         assert_eq!(parsed.package.as_deref(), Some("member_a"));
+    }
+
+    #[test]
+    fn parses_help_without_exiting() {
+        assert!(matches!(
+            parse_command_from(["--help".to_string()]).unwrap(),
+            ParsedCommand::Help
+        ));
+        assert!(matches!(
+            parse_command_from(["-h".to_string()]).unwrap(),
+            ParsedCommand::Help
+        ));
     }
 
     #[test]

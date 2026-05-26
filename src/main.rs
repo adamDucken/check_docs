@@ -5,7 +5,7 @@ mod rustdoc_json;
 mod symbols;
 
 use cargo_metadata::{Metadata, MetadataCommand, Package, PackageId, Target};
-use cli::parse_args;
+use cli::{ParsedCommand, parse_command};
 use imports::ImportPath;
 use resolver::{
     DependencyContext, DependencyFilter, is_rust_library_crate, package_dependencies,
@@ -26,6 +26,17 @@ struct RustdocCacheKey {
 
 type RustdocCache = HashMap<RustdocCacheKey, (rustdoc_types::Crate, PathBuf)>;
 
+#[derive(Debug)]
+struct OutputReport {
+    crate_name: String,
+    version: Option<String>,
+    dependency: String,
+    target_triple: String,
+    source: PathBuf,
+    import_line: String,
+    symbols: SymbolReport,
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -37,7 +48,13 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let args = parse_args()?;
+    let args = match parse_command()? {
+        ParsedCommand::Run(args) => args,
+        ParsedCommand::Help => {
+            println!("{}", cli::usage());
+            return Ok(());
+        }
+    };
     let imports = imports::parse_use_lines(&args.use_line)?;
 
     for import in &imports {
@@ -183,15 +200,16 @@ fn run() -> Result<(), String> {
                 }
             };
 
-        print_report(
-            &report_crate,
-            Some(&report_version),
-            &report_json_path,
-            &format_use(import),
-            &contexts,
-            &target_triple,
-            &found,
-        );
+        let output = OutputReport {
+            crate_name: report_crate,
+            version: Some(report_version),
+            dependency: format_dependency_contexts(&contexts),
+            target_triple,
+            source: report_json_path,
+            import_line: format_use(import),
+            symbols: found,
+        };
+        print_report(&output);
     }
 
     Ok(())
@@ -270,28 +288,26 @@ fn format_use(import: &ImportPath) -> String {
     format!("use {};", parts.join("::"))
 }
 
-fn print_report(
-    crate_name: &str,
-    version: Option<&str>,
-    source: &Path,
-    use_line: &str,
-    contexts: &[DependencyContext],
-    target_triple: &str,
-    report: &SymbolReport,
-) {
-    if let Some(version) = version {
-        println!("crate: {crate_name} {version}");
+fn print_report(report: &OutputReport) {
+    print!("{}", render_report(report));
+}
+
+fn render_report(report: &OutputReport) -> String {
+    let mut output = String::new();
+    if let Some(version) = &report.version {
+        output.push_str(&format!("crate: {} {version}\n", report.crate_name));
     } else {
-        println!("crate: {crate_name}");
+        output.push_str(&format!("crate: {}\n", report.crate_name));
     }
-    println!("dependency: {}", format_dependency_contexts(contexts));
-    println!("target: {target_triple}");
-    println!("source: {}", source.display());
-    println!("import: {}", use_line.trim());
-    print_doc("item", &report.imported);
-    if let Some(resolved) = &report.resolved {
-        print_doc("resolved item", resolved);
+    output.push_str(&format!("dependency: {}\n", report.dependency));
+    output.push_str(&format!("target: {}\n", report.target_triple));
+    output.push_str(&format!("source: {}\n", report.source.display()));
+    output.push_str(&format!("import: {}\n", report.import_line.trim()));
+    push_doc(&mut output, "item", &report.symbols.imported);
+    if let Some(resolved) = &report.symbols.resolved {
+        push_doc(&mut output, "resolved item", resolved);
     }
+    output
 }
 
 fn format_dependency_contexts(contexts: &[DependencyContext]) -> String {
@@ -302,41 +318,45 @@ fn format_dependency_contexts(contexts: &[DependencyContext]) -> String {
         .join(", ")
 }
 
-fn print_doc(label: &str, found: &SymbolDoc) {
-    println!("{label}: {} {}", found.kind, found.name);
+fn push_doc(output: &mut String, label: &str, found: &SymbolDoc) {
+    output.push_str(&format!("{label}: {} {}\n", found.kind, found.name));
     if found.path.as_os_str().is_empty() {
-        println!("location: (unknown)");
+        output.push_str("location: (unknown)\n");
     } else {
-        println!("location: {}:{}", found.path.display(), found.line);
+        output.push_str(&format!(
+            "location: {}:{}\n",
+            found.path.display(),
+            found.line
+        ));
     }
-    println!("definition: {}", found.definition);
+    output.push_str(&format!("definition: {}\n", found.definition));
     if !found.derives.is_empty() {
-        println!("derives: {}", found.derives.join(", "));
+        output.push_str(&format!("derives: {}\n", found.derives.join(", ")));
     }
     if !found.details.is_empty() {
-        println!("details:");
+        output.push_str("details:\n");
         for line in &found.details {
-            println!("  {line}");
+            output.push_str(&format!("  {line}\n"));
         }
     }
     if !found.methods.is_empty() {
-        println!("methods:");
+        output.push_str("methods:\n");
         for line in &found.methods {
-            println!("  {line}");
+            output.push_str(&format!("  {line}\n"));
         }
     }
     if !found.impls.is_empty() {
-        println!("impls:");
+        output.push_str("impls:\n");
         for line in &found.impls {
-            println!("  {line}");
+            output.push_str(&format!("  {line}\n"));
         }
     }
     if found.docs.is_empty() {
-        println!("docs: (none)");
+        output.push_str("docs: (none)\n");
     } else {
-        println!("docs:");
+        output.push_str("docs:\n");
         for line in &found.docs {
-            println!("  {line}");
+            output.push_str(&format!("  {line}\n"));
         }
     }
 }
@@ -499,26 +519,49 @@ mod tests {
     }
 
     #[test]
-    fn print_report_covers_output_branches() {
-        let src = Path::new("/tmp/src");
-        print_report(
-            "x",
-            Some("1.2.3"),
-            src,
-            "use x::Thing;",
-            &[dependency_context()],
-            "x86_64-unknown-linux-gnu",
-            &report(doc("Thing", vec!["docs".into()])),
-        );
-        print_report(
-            "x",
-            None,
-            src,
-            "use x::Thing;",
-            &[dependency_context()],
-            "x86_64-unknown-linux-gnu",
-            &report(doc("Thing", Vec::new())),
-        );
+    fn output_report_preserves_structured_fields_and_renders_text() {
+        let output = OutputReport {
+            crate_name: "x".into(),
+            version: Some("1.2.3".into()),
+            dependency: dependency_context().label(),
+            target_triple: "x86_64-unknown-linux-gnu".into(),
+            source: PathBuf::from("/tmp/src"),
+            import_line: "use x::Thing;".into(),
+            symbols: report(doc("Thing", vec!["docs".into()])),
+        };
+
+        assert_eq!(output.crate_name, "x");
+        assert_eq!(output.version.as_deref(), Some("1.2.3"));
+        assert_eq!(output.dependency, "normal");
+        assert_eq!(output.target_triple, "x86_64-unknown-linux-gnu");
+        assert_eq!(output.import_line, "use x::Thing;");
+
+        let rendered = render_report(&output);
+        assert!(rendered.contains("crate: x 1.2.3\n"));
+        assert!(rendered.contains("dependency: normal\n"));
+        assert!(rendered.contains("item: struct Thing\n"));
+        assert!(rendered.contains("docs:\n  docs\n"));
+    }
+
+    #[test]
+    fn output_report_renders_resolved_items_and_empty_docs() {
+        let output = OutputReport {
+            crate_name: "x".into(),
+            version: None,
+            dependency: dependency_context().label(),
+            target_triple: "x86_64-unknown-linux-gnu".into(),
+            source: PathBuf::from("/tmp/src"),
+            import_line: "use x::Thing;".into(),
+            symbols: SymbolReport {
+                imported: doc("Thing", Vec::new()),
+                resolved: Some(doc("ResolvedThing", Vec::new())),
+            },
+        };
+
+        let rendered = render_report(&output);
+        assert!(rendered.starts_with("crate: x\n"));
+        assert!(rendered.contains("docs: (none)\n"));
+        assert!(rendered.contains("resolved item: struct ResolvedThing\n"));
     }
 
     #[test]

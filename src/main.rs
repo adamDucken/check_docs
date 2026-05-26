@@ -91,14 +91,14 @@ fn run() -> Result<(), String> {
             dep.target,
             Some(&selected_target),
         )?;
-        let (found, report_crate, report_version, report_json_path, context, target_triple) =
+        let (found, report_crate, report_version, report_json_path, contexts, target_triple) =
             match symbols::find_symbol_report(&krate, import) {
                 Ok(found) => (
                     found,
                     dep.package.name.clone(),
                     dep.package.version.to_string(),
                     json_path,
-                    dep.context,
+                    dep.contexts,
                     krate.target.triple.clone(),
                 ),
                 Err(err) => {
@@ -177,7 +177,7 @@ fn run() -> Result<(), String> {
                         external_dep.package.name.clone(),
                         external_dep.package.version.to_string(),
                         external_json_path,
-                        external_dep.context,
+                        external_dep.contexts,
                         external_krate.target.triple.clone(),
                     )
                 }
@@ -188,7 +188,7 @@ fn run() -> Result<(), String> {
             Some(&report_version),
             &report_json_path,
             &format_use(import),
-            &context,
+            &contexts,
             &target_triple,
             &found,
         );
@@ -275,7 +275,7 @@ fn print_report(
     version: Option<&str>,
     source: &Path,
     use_line: &str,
-    context: &DependencyContext,
+    contexts: &[DependencyContext],
     target_triple: &str,
     report: &SymbolReport,
 ) {
@@ -284,7 +284,7 @@ fn print_report(
     } else {
         println!("crate: {crate_name}");
     }
-    println!("dependency: {}", context.label());
+    println!("dependency: {}", format_dependency_contexts(contexts));
     println!("target: {target_triple}");
     println!("source: {}", source.display());
     println!("import: {}", use_line.trim());
@@ -292,6 +292,14 @@ fn print_report(
     if let Some(resolved) = &report.resolved {
         print_doc("resolved item", resolved);
     }
+}
+
+fn format_dependency_contexts(contexts: &[DependencyContext]) -> String {
+    contexts
+        .iter()
+        .map(DependencyContext::label)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn print_doc(label: &str, found: &SymbolDoc) {
@@ -498,7 +506,7 @@ mod tests {
             Some("1.2.3"),
             src,
             "use x::Thing;",
-            &dependency_context(),
+            &[dependency_context()],
             "x86_64-unknown-linux-gnu",
             &report(doc("Thing", vec!["docs".into()])),
         );
@@ -507,9 +515,30 @@ mod tests {
             None,
             src,
             "use x::Thing;",
-            &dependency_context(),
+            &[dependency_context()],
             "x86_64-unknown-linux-gnu",
             &report(doc("Thing", Vec::new())),
+        );
+    }
+
+    #[test]
+    fn dependency_context_output_supports_multiple_contexts() {
+        let contexts = [
+            DependencyContext {
+                kind: cargo_metadata::DependencyKind::Normal,
+                target: None,
+                via: None,
+            },
+            DependencyContext {
+                kind: cargo_metadata::DependencyKind::Development,
+                target: Some("cfg(test)".into()),
+                via: None,
+            },
+        ];
+
+        assert_eq!(
+            format_dependency_contexts(&contexts),
+            "normal, dev (cfg(test))"
         );
     }
 

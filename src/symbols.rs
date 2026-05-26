@@ -53,7 +53,7 @@ pub(crate) fn find_symbol(krate: &Crate, import: &ImportPath) -> Result<SymbolDo
 
     for (index, part) in parts.iter().enumerate() {
         let is_last = index + 1 == parts.len();
-        current = find_child(krate, current, part, is_last, &mut HashSet::new())?;
+        current = find_child(krate, current, part, &mut HashSet::new())?;
         current = follow_use(krate, current, &mut HashSet::new())?;
         if !is_last && !matches!(item(krate, current)?.inner, ItemEnum::Module(_)) {
             return Err(format!("path segment '{part}' resolved to non-module item"));
@@ -74,7 +74,7 @@ pub(crate) fn find_symbol_report(
 
     for (index, part) in parts.iter().enumerate() {
         let is_last = index + 1 == parts.len();
-        let child_id = find_child(krate, current, part, is_last, &mut HashSet::new())?;
+        let child_id = find_child(krate, current, part, &mut HashSet::new())?;
         let child = item(krate, child_id)?;
         if is_last {
             if matches!(child.inner, ItemEnum::Use(_)) {
@@ -112,7 +112,7 @@ pub(crate) fn imported_reexport(
 
     for (index, part) in parts.iter().enumerate() {
         let is_last = index + 1 == parts.len();
-        let child_id = find_child(krate, current, part, is_last, &mut HashSet::new())?;
+        let child_id = find_child(krate, current, part, &mut HashSet::new())?;
         let child = item(krate, child_id)?;
         if is_last {
             return Ok(matches!(child.inner, ItemEnum::Use(_)).then(|| format_item(krate, child)));
@@ -136,7 +136,7 @@ pub(crate) fn external_reexport(
 
     for (index, part) in parts.iter().enumerate() {
         let is_last = index + 1 == parts.len();
-        let Ok(child_id) = find_child(krate, current, part, is_last, &mut HashSet::new()) else {
+        let Ok(child_id) = find_child(krate, current, part, &mut HashSet::new()) else {
             return Ok(None);
         };
         match follow_use_or_external(krate, child_id, &mut HashSet::new())? {
@@ -210,7 +210,6 @@ fn find_child(
     krate: &Crate,
     module_id: Id,
     name: &str,
-    is_last: bool,
     visited: &mut HashSet<Id>,
 ) -> Result<Id, String> {
     if !visited.insert(module_id) {
@@ -255,7 +254,7 @@ fn find_child(
                 Ok(target) => match item(krate, target) {
                     Ok(target_item) if matches!(target_item.inner, ItemEnum::Module(_)) => {
                         let mut branch_visited = visited.clone();
-                        match find_child(krate, target, name, is_last, &mut branch_visited) {
+                        match find_child(krate, target, name, &mut branch_visited) {
                             Ok(found) => return Ok(found),
                             Err(err) => glob_errors.push(format!(
                                 "glob import '{}' did not resolve '{name}': {err}",
@@ -1600,12 +1599,12 @@ mod tests {
             .contains("cycle")
         );
         assert!(
-            find_child(&krate, Id(1), "Nope", true, &mut HashSet::new())
+            find_child(&krate, Id(1), "Nope", &mut HashSet::new())
                 .unwrap_err()
                 .contains("glob import")
         );
         assert!(
-            find_child(&krate, Id(5), "Nope", true, &mut HashSet::new())
+            find_child(&krate, Id(5), "Nope", &mut HashSet::new())
                 .unwrap_err()
                 .contains("not a module")
         );
@@ -1727,7 +1726,7 @@ mod tests {
         .unwrap();
         assert_eq!(found.name, "Hit");
 
-        let err = find_child(&krate, Id(1), "Miss", true, &mut HashSet::new()).unwrap_err();
+        let err = find_child(&krate, Id(1), "Miss", &mut HashSet::new()).unwrap_err();
         assert!(err.contains("glob branches failed"));
         assert!(err.contains("missing::*"));
         assert!(err.contains("cyclic::*"));

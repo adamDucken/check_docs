@@ -4,7 +4,7 @@ use rustdoc_types::{Crate, FORMAT_VERSION};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -130,7 +130,7 @@ fn parse_lock_created_secs(text: &str) -> Option<u64> {
         .and_then(|value| value.trim().parse().ok())
 }
 
-fn lock_timeout_message(path: &PathBuf) -> String {
+fn lock_timeout_message(path: &Path) -> String {
     format!(
         "timed out waiting for rustdoc JSON lock {}; if no cargo rustdoc process is running, remove this stale lock file and retry",
         path.display()

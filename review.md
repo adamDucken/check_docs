@@ -107,7 +107,7 @@ Recommendation:
 - Emit a specific virtual-workspace error instead of "package for manifest not found."
 
 ### Medium: duplicate dependency contexts are treated as fatal ambiguity
-status: issue:open
+status: issue:closed - fixed
 
 References:
 
@@ -178,7 +178,7 @@ Recommendation:
 - Add a regression test using `syn::parse::Parse`.
 
 ### Medium: Clippy fails with warnings denied
-status: issue:open
+status: issue:closed - fixed
 
 References:
 

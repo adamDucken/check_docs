@@ -330,6 +330,24 @@ fn push_doc(output: &mut String, label: &str, found: &SymbolDoc) {
         ));
     }
     output.push_str(&format!("definition: {}\n", found.definition));
+    if let Some(deprecation) = &found.deprecation {
+        output.push_str("deprecation:\n");
+        if let Some(since) = &deprecation.since {
+            output.push_str(&format!("  since: {since}\n"));
+        }
+        if let Some(note) = &deprecation.note {
+            output.push_str(&format!("  note: {note}\n"));
+        }
+        if deprecation.since.is_none() && deprecation.note.is_none() {
+            output.push_str("  (no details)\n");
+        }
+    }
+    if !found.attributes.is_empty() {
+        output.push_str("attributes:\n");
+        for attribute in &found.attributes {
+            output.push_str(&format!("  {}\n", attribute.render()));
+        }
+    }
     if !found.derives.is_empty() {
         output.push_str(&format!("derives: {}\n", found.derives.join(", ")));
     }
@@ -435,6 +453,8 @@ mod tests {
             kind: "struct",
             name: name.into(),
             definition: format!("pub struct {name};"),
+            deprecation: None,
+            attributes: Vec::new(),
             details: vec!["field: usize".into()],
             docs,
             derives: vec!["Debug".into()],
@@ -520,6 +540,17 @@ mod tests {
 
     #[test]
     fn output_report_preserves_structured_fields_and_renders_text() {
+        let mut symbol = doc("Thing", vec!["docs".into()]);
+        symbol.deprecation = Some(symbols::DeprecationDoc {
+            since: Some("1.2.3".into()),
+            note: Some("use NewThing".into()),
+        });
+        symbol.attributes = vec![
+            symbols::ReportedAttribute::NonExhaustive,
+            symbols::ReportedAttribute::MustUse {
+                reason: Some("inspect the value".into()),
+            },
+        ];
         let output = OutputReport {
             crate_name: "x".into(),
             version: Some("1.2.3".into()),
@@ -527,7 +558,7 @@ mod tests {
             target_triple: "x86_64-unknown-linux-gnu".into(),
             source: PathBuf::from("/tmp/src"),
             import_line: "use x::Thing;".into(),
-            symbols: report(doc("Thing", vec!["docs".into()])),
+            symbols: report(symbol),
         };
 
         assert_eq!(output.crate_name, "x");
@@ -540,6 +571,9 @@ mod tests {
         assert!(rendered.contains("crate: x 1.2.3\n"));
         assert!(rendered.contains("dependency: normal\n"));
         assert!(rendered.contains("item: struct Thing\n"));
+        assert!(rendered.contains(
+            "deprecation:\n  since: 1.2.3\n  note: use NewThing\nattributes:\n  #[non_exhaustive]\n  #[must_use = \"inspect the value\"]\n"
+        ));
         assert!(rendered.contains("docs:\n  docs\n"));
     }
 

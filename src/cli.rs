@@ -52,6 +52,9 @@ fn parse_command_from(args: impl IntoIterator<Item = String>) -> Result<ParsedCo
             "--include-dev" => include_dev = true,
             "--include-build" => include_build = true,
             "-h" | "--help" => return Ok(ParsedCommand::Help),
+            option if option.starts_with('-') => {
+                return Err(format!("unknown argument: {option}\n{}", usage()));
+            }
             value if use_line.is_none() => use_line = Some(value.to_string()),
             other => return Err(format!("unknown argument: {other}\n{}", usage())),
         }
@@ -146,5 +149,12 @@ mod tests {
                 .unwrap_err()
                 .contains("--package requires NAME_OR_ID")
         );
+    }
+
+    #[test]
+    fn reports_unknown_option_before_use_line() {
+        let error = args(&["--bad"]).unwrap_err();
+
+        assert_eq!(error, format!("unknown argument: --bad\n{}", usage()));
     }
 }

@@ -13,6 +13,8 @@ It reports:
 - item kind/name, including modules
 - file + line where declared when available
 - definition/signature
+- deprecation details (`since` and `note`) when present
+- semantic attributes: `repr`, `non_exhaustive`, and `must_use`
 - struct/union fields, plus `private/stripped` note when fields are hidden
 - enum variants
 - trait associated items

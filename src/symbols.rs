@@ -1,8 +1,8 @@
 use crate::imports::ImportPath;
 use rustdoc_types::{
-    AssocItemConstraintKind, Attribute, Crate, GenericArg, GenericArgs, GenericBound,
-    GenericParamDefKind, Id, Item, ItemEnum, MacroKind, StructKind, Term, TraitBoundModifier, Type,
-    VariantKind, Visibility, WherePredicate,
+    AssocItemConstraintKind, Attribute, AttributeRepr, Crate, GenericArg, GenericArgs,
+    GenericBound, GenericParamDefKind, Id, Item, ItemEnum, MacroKind, ReprKind, StructKind, Term,
+    TraitBoundModifier, Type, VariantKind, Visibility, WherePredicate,
 };
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -14,11 +14,39 @@ pub(crate) struct SymbolDoc {
     pub(crate) kind: &'static str,
     pub(crate) name: String,
     pub(crate) definition: String,
+    pub(crate) deprecation: Option<DeprecationDoc>,
+    pub(crate) attributes: Vec<ReportedAttribute>,
     pub(crate) details: Vec<String>,
     pub(crate) docs: Vec<String>,
     pub(crate) derives: Vec<String>,
     pub(crate) methods: Vec<String>,
     pub(crate) impls: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeprecationDoc {
+    pub(crate) since: Option<String>,
+    pub(crate) note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReportedAttribute {
+    Repr(AttributeRepr),
+    NonExhaustive,
+    MustUse { reason: Option<String> },
+}
+
+impl ReportedAttribute {
+    pub(crate) fn render(&self) -> String {
+        match self {
+            Self::Repr(repr) => repr_attribute(repr),
+            Self::NonExhaustive => "#[non_exhaustive]".to_string(),
+            Self::MustUse { reason: None } => "#[must_use]".to_string(),
+            Self::MustUse {
+                reason: Some(reason),
+            } => format!("#[must_use = {reason:?}]"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -416,6 +444,11 @@ fn format_item(krate: &Crate, item: &Item) -> SymbolDoc {
         kind,
         name,
         definition,
+        deprecation: item.deprecation.as_ref().map(|deprecation| DeprecationDoc {
+            since: deprecation.since.clone(),
+            note: deprecation.note.clone(),
+        }),
+        attributes: reported_attributes(&item.attrs),
         details,
         docs: item
             .docs
@@ -429,6 +462,43 @@ fn format_item(krate: &Crate, item: &Item) -> SymbolDoc {
         methods: methods(krate, item),
         impls: impls(krate, item),
     }
+}
+
+fn reported_attributes(attrs: &[Attribute]) -> Vec<ReportedAttribute> {
+    attrs
+        .iter()
+        .filter_map(|attr| match attr {
+            Attribute::Repr(repr) => Some(ReportedAttribute::Repr(repr.clone())),
+            Attribute::NonExhaustive => Some(ReportedAttribute::NonExhaustive),
+            Attribute::MustUse { reason } => Some(ReportedAttribute::MustUse {
+                reason: reason.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn repr_attribute(repr: &AttributeRepr) -> String {
+    let mut arguments = Vec::new();
+    match repr.kind {
+        ReprKind::Rust if repr.int.is_none() && repr.align.is_none() && repr.packed.is_none() => {
+            arguments.push("Rust".to_string());
+        }
+        ReprKind::Rust => {}
+        ReprKind::C => arguments.push("C".to_string()),
+        ReprKind::Transparent => arguments.push("transparent".to_string()),
+        ReprKind::Simd => arguments.push("simd".to_string()),
+    }
+    if let Some(int) = &repr.int {
+        arguments.push(int.clone());
+    }
+    if let Some(packed) = repr.packed {
+        arguments.push(format!("packed({packed})"));
+    }
+    if let Some(align) = repr.align {
+        arguments.push(format!("align({align})"));
+    }
+    format!("#[repr({})]", arguments.join(", "))
 }
 
 fn derives(krate: &Crate, item: &Item) -> Vec<String> {
@@ -2235,6 +2305,67 @@ mod tests {
                 .any(|method| method == "pub fn new() -> Self")
         );
         assert!(doc.impls.iter().any(|imp| imp == "impl Clone for Widget"));
+    }
+
+    #[test]
+    fn formatter_reports_deprecation_and_semantic_attributes() {
+        let mut annotated = item(
+            1,
+            Some("Annotated"),
+            Visibility::Public,
+            ItemEnum::Struct(Struct {
+                kind: StructKind::Unit,
+                generics: generics_empty(),
+                impls: vec![],
+            }),
+        );
+        annotated.deprecation = Some(rustdoc_types::Deprecation {
+            since: Some("1.2.3".into()),
+            note: Some("use Replacement".into()),
+        });
+        annotated.attrs = vec![
+            Attribute::Repr(AttributeRepr {
+                kind: ReprKind::C,
+                align: Some(8),
+                packed: None,
+                int: None,
+            }),
+            Attribute::Repr(AttributeRepr {
+                kind: ReprKind::Rust,
+                align: None,
+                packed: None,
+                int: Some("u8".into()),
+            }),
+            Attribute::NonExhaustive,
+            Attribute::MustUse {
+                reason: Some("inspect the value".into()),
+            },
+            Attribute::MustUse { reason: None },
+        ];
+
+        let doc = format_item(&krate(vec![annotated.clone()], Id(1)), &annotated);
+
+        assert_eq!(
+            doc.deprecation,
+            Some(DeprecationDoc {
+                since: Some("1.2.3".into()),
+                note: Some("use Replacement".into()),
+            })
+        );
+        assert_eq!(
+            doc.attributes
+                .iter()
+                .map(ReportedAttribute::render)
+                .collect::<Vec<_>>(),
+            vec![
+                "#[repr(C, align(8))]",
+                "#[repr(u8)]",
+                "#[non_exhaustive]",
+                "#[must_use = \"inspect the value\"]",
+                "#[must_use]",
+            ]
+        );
+        assert!(doc.derives.is_empty());
     }
 
     #[test]

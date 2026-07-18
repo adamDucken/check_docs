@@ -182,6 +182,81 @@ edition = "2024"
 }
 
 #[test]
+fn binary_reports_deprecation_and_semantic_attributes() {
+    let workspace = TempDir::new().unwrap();
+    fs::create_dir_all(workspace.path().join("app/src")).unwrap();
+    fs::create_dir_all(workspace.path().join("metadata_dep/src")).unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        r#"
+[workspace]
+members = ["app", "metadata_dep"]
+resolver = "3"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("app/Cargo.toml"),
+        r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+metadata_dep = { path = "../metadata_dep" }
+"#,
+    )
+    .unwrap();
+    fs::write(workspace.path().join("app/src/lib.rs"), "").unwrap();
+    fs::write(
+        workspace.path().join("metadata_dep/Cargo.toml"),
+        r#"
+[package]
+name = "metadata_dep"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("metadata_dep/src/lib.rs"),
+        r#"
+#[deprecated(since = "1.2.3", note = "use Replacement")]
+#[must_use = "inspect the value"]
+#[non_exhaustive]
+#[repr(C, align(8))]
+pub struct Annotated {
+    pub value: u8,
+}
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use metadata_dep::Annotated;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("deprecation:\n  since: 1.2.3\n  note: use Replacement\n"));
+    assert!(stdout.contains("  #[must_use = \"inspect the value\"]\n"));
+    assert!(stdout.contains("  #[non_exhaustive]\n"));
+    assert!(stdout.contains("  #[repr(C, align(8))]\n"));
+}
+
+#[test]
 fn binary_rejects_bad_import() {
     let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
         .arg("use crate::local::Thing;")
@@ -211,12 +286,17 @@ fn binary_rejects_rust_standard_library_items() {
 
 #[test]
 fn binary_reports_unknown_argument() {
-    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
-        .args(["use syn::ItemUse;", "--bad"])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown argument"));
+    for args in [["--bad", ""], ["use syn::ItemUse;", "--bad"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+            .args(args.into_iter().filter(|arg| !arg.is_empty()))
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "check-docs: unknown argument: --bad\nusage: check-docs '<use crate_name::module::item;>' [--root PATH] [--package NAME_OR_ID] [--target TRIPLE] [--include-dev] [--include-build]\n"
+        );
+    }
 }
 
 #[test]

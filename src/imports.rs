@@ -11,7 +11,6 @@ pub(crate) fn identifier_key(name: &str) -> &str {
     name.strip_prefix("r#").unwrap_or(name)
 }
 
-#[cfg(test)]
 impl ImportPath {
     pub(crate) fn full_path(&self) -> String {
         let mut parts = vec![self.crate_name.clone()];

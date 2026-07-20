@@ -69,20 +69,23 @@ fn binary_reports_transitive_external_crate_root_reexport() {
 }
 
 #[test]
-fn binary_reports_direct_dependency_reexport_from_transitive_crate() {
+fn binary_rejects_same_spelling_across_rust_namespaces_as_ambiguous() {
     let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
         .args(["use serde::Serialize;", "--root", "."])
         .output()
         .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        stderr.contains("ambiguous import 'serde::Serialize'"),
+        "{stderr}"
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("crate: serde_core"));
-    assert!(stdout.contains("import: use serde::Serialize;"));
-    assert!(stdout.contains("resolved item: trait Serialize"));
+    assert!(
+        stderr.contains("ambiguous across Rust namespaces"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Trait Serialize"), "{stderr}");
+    assert!(stderr.contains("ProcDerive Serialize"), "{stderr}");
 }
 
 #[test]
@@ -490,6 +493,298 @@ pub mod api {}
     assert!(stdout.contains("definition: pub trait Alias = Send + Sync;\n"));
     assert!(stdout.contains("definition: pub auto trait Marker { ... }\n"));
     assert!(stdout.contains("definition: pub mod api;\n"));
+}
+
+#[test]
+fn binary_accepts_explicit_library_crate_types() {
+    let workspace = TempDir::new().unwrap();
+    for member in ["app", "facade"] {
+        fs::create_dir_all(workspace.path().join(member).join("src")).unwrap();
+    }
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        r#"
+[workspace]
+members = ["app", "facade"]
+resolver = "3"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("app/Cargo.toml"),
+        r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+facade = { path = "../facade" }
+"#,
+    )
+    .unwrap();
+    fs::write(workspace.path().join("app/src/lib.rs"), "").unwrap();
+    fs::write(
+        workspace.path().join("facade/Cargo.toml"),
+        r#"
+[package]
+name = "facade"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("facade/src/lib.rs"),
+        "pub struct Thing;\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use facade::Thing;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("item: struct Thing"));
+}
+
+#[test]
+fn binary_walks_multi_hop_external_reexports_and_external_globs() {
+    let workspace = TempDir::new().unwrap();
+    for member in ["app", "facade", "middle", "origin"] {
+        fs::create_dir_all(workspace.path().join(member).join("src")).unwrap();
+    }
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        r#"
+[workspace]
+members = ["app", "facade", "middle", "origin"]
+resolver = "3"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("app/Cargo.toml"),
+        r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+facade = { path = "../facade" }
+"#,
+    )
+    .unwrap();
+    fs::write(workspace.path().join("app/src/lib.rs"), "").unwrap();
+    fs::write(
+        workspace.path().join("facade/Cargo.toml"),
+        r#"
+[package]
+name = "facade"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+middle = { path = "../middle" }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("facade/src/lib.rs"),
+        r#"
+pub use middle::Thing;
+pub mod globbed {
+    pub use middle::*;
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("middle/Cargo.toml"),
+        r#"
+[package]
+name = "middle"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+origin = { path = "../origin" }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("middle/src/lib.rs"),
+        "pub use origin::Thing;\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("origin/Cargo.toml"),
+        r#"
+[package]
+name = "origin"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("origin/src/lib.rs"),
+        "pub struct Thing;\n",
+    )
+    .unwrap();
+
+    for import in ["use facade::Thing;", "use facade::globbed::Thing;"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+            .args([
+                import,
+                "--root",
+                workspace.path().to_str().unwrap(),
+                "--package",
+                "app",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "import: {import}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("crate: origin 0.1.0"), "{stdout}");
+        assert!(
+            stdout.contains("item: struct Thing") || stdout.contains("resolved item: struct Thing"),
+            "{stdout}"
+        );
+    }
+}
+
+#[test]
+fn binary_preserves_high_risk_definition_semantics() {
+    let workspace = TempDir::new().unwrap();
+    for member in ["app", "definitions"] {
+        fs::create_dir_all(workspace.path().join(member).join("src")).unwrap();
+    }
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        r#"
+[workspace]
+members = ["app", "definitions"]
+resolver = "3"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("app/Cargo.toml"),
+        r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+definitions = { path = "../definitions" }
+"#,
+    )
+    .unwrap();
+    fs::write(workspace.path().join("app/src/lib.rs"), "").unwrap();
+    fs::write(
+        workspace.path().join("definitions/Cargo.toml"),
+        r#"
+[package]
+name = "definitions"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("definitions/src/lib.rs"),
+        r#"
+pub type Callback = for<'a> fn(&'a str) -> &'a str;
+
+pub struct Named {
+    pub value: u8,
+    hidden: u16,
+}
+
+pub struct Tuple(pub u8, u16);
+
+pub union Choice {
+    pub byte: u8,
+    pub word: u16,
+}
+
+#[repr(u8)]
+pub enum Number {
+    One = 1,
+    Five = 5,
+}
+
+pub const COUNT: usize = 1 + 2;
+pub static READY: bool = true;
+
+pub trait Defaults {
+    const VALUE: u8 = 7;
+}
+
+unsafe extern "C" {
+    pub static FOREIGN: u8;
+    pub safe static SAFE_FOREIGN: u8;
+}
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use definitions::{Callback, Named, Tuple, Choice, Number, COUNT, READY, Defaults, FOREIGN, SAFE_FOREIGN};",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "definition: pub type Callback = for<'a> fn(&'a str) -> &'a str;",
+        "definition: pub struct Named { pub value: u8 }",
+        "definition: pub struct Tuple(pub u8, _);",
+        "definition: pub union Choice { pub byte: u8, pub word: u16 }",
+        "definition: pub enum Number { One = 1, Five = 5 }",
+        "definition: pub const COUNT: usize = 3usize;",
+        "definition: pub static READY: bool = true;",
+        "  const VALUE: u8 = 7;",
+        "definition: definition rendering unsupported as standalone Rust for unsafe extern static; declaration inside extern block: static FOREIGN: u8;",
+        "definition: definition rendering unsupported as standalone Rust for safe extern static; declaration inside extern block: static SAFE_FOREIGN: u8;",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
+    }
+    assert!(stdout.contains("fields: private/stripped"), "{stdout}");
 }
 
 #[test]

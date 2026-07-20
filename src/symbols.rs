@@ -12,6 +12,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SymbolError {
     NotFound(String),
+    Ambiguous(String),
     ExternalReexport(String),
     InvalidRustdoc(String),
 }
@@ -20,6 +21,7 @@ impl fmt::Display for SymbolError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotFound(message)
+            | Self::Ambiguous(message)
             | Self::ExternalReexport(message)
             | Self::InvalidRustdoc(message) => formatter.write_str(message),
         }
@@ -186,35 +188,107 @@ pub(crate) fn imported_reexport(
     Ok(None)
 }
 
+pub(crate) fn external_reexports(
+    krate: &Crate,
+    import: &ImportPath,
+) -> Result<Vec<ExternalReexport>, SymbolError> {
+    let mut parts = import.segments.clone();
+    parts.push(import.item.clone());
+    external_candidates(krate, krate.root, &parts, &mut HashSet::new())
+}
+
+#[cfg(test)]
 pub(crate) fn external_reexport(
     krate: &Crate,
     import: &ImportPath,
 ) -> Result<Option<ExternalReexport>, SymbolError> {
-    let mut current = krate.root;
-    let mut parts = import.segments.clone();
-    parts.push(import.item.clone());
+    let candidates = external_reexports(krate, import)?;
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [candidate] => Ok(Some(candidate.clone())),
+        _ => Err(SymbolError::Ambiguous(format!(
+            "imported name '{}' has multiple external re-export candidates",
+            import.item
+        ))),
+    }
+}
 
-    for (index, part) in parts.iter().enumerate() {
-        let is_last = index + 1 == parts.len();
-        let Ok(child_id) = find_child(krate, current, part, &mut HashSet::new()) else {
-            return Ok(None);
+fn external_candidates(
+    krate: &Crate,
+    container_id: Id,
+    parts: &[String],
+    visited: &mut HashSet<Id>,
+) -> Result<Vec<ExternalReexport>, SymbolError> {
+    let Some((part, tail)) = parts.split_first() else {
+        return Ok(Vec::new());
+    };
+    if !visited.insert(container_id) {
+        return Ok(Vec::new());
+    }
+    let container = item(krate, container_id)?;
+    let children = container_children(container).ok_or_else(|| {
+        SymbolError::NotFound(format!(
+            "item '{}' cannot contain imported names",
+            container.name.clone().unwrap_or_default()
+        ))
+    })?;
+
+    let direct = direct_matching_children(krate, children, part)?;
+    let mut candidates = Vec::new();
+    if !direct.is_empty() {
+        for child_id in direct {
+            match follow_use_or_external(krate, child_id, &mut HashSet::new())? {
+                Followed::External(mut external) => {
+                    external.path.extend(tail.iter().cloned());
+                    push_external_candidate(&mut candidates, external);
+                }
+                Followed::Local(id) if !tail.is_empty() => {
+                    if item(krate, id).is_ok_and(is_path_container) {
+                        let mut branch_visited = visited.clone();
+                        for external in external_candidates(krate, id, tail, &mut branch_visited)? {
+                            push_external_candidate(&mut candidates, external);
+                        }
+                    }
+                }
+                Followed::Local(_) => {}
+            }
+        }
+        return Ok(candidates);
+    }
+
+    for child_id in children {
+        let child = item(krate, *child_id)?;
+        let ItemEnum::Use(use_item) = &child.inner else {
+            continue;
         };
-        match follow_use_or_external(krate, child_id, &mut HashSet::new())? {
-            Followed::External(external) if is_last => return Ok(Some(external)),
+        if !is_public(child) || !use_item.is_glob {
+            continue;
+        }
+        let Some(glob_id) = use_item.id else {
+            continue;
+        };
+        match follow_use_or_external(krate, glob_id, &mut HashSet::new())? {
             Followed::External(mut external) => {
-                external.path.extend(parts[index + 1..].iter().cloned());
-                return Ok(Some(external));
+                external.path.extend(parts.iter().cloned());
+                push_external_candidate(&mut candidates, external);
             }
             Followed::Local(id) => {
-                current = id;
-                if !is_last && !is_path_container(item(krate, current)?) {
-                    return Ok(None);
+                if item(krate, id).is_ok_and(is_path_container) {
+                    let mut branch_visited = visited.clone();
+                    for external in external_candidates(krate, id, parts, &mut branch_visited)? {
+                        push_external_candidate(&mut candidates, external);
+                    }
                 }
             }
         }
     }
+    Ok(candidates)
+}
 
-    Ok(None)
+fn push_external_candidate(candidates: &mut Vec<ExternalReexport>, candidate: ExternalReexport) {
+    if !candidates.contains(&candidate) {
+        candidates.push(candidate);
+    }
 }
 
 enum Followed {
@@ -290,20 +364,15 @@ fn find_child(
         ))
     })?;
 
-    let mut glob_errors = Vec::new();
-    for child_id in children {
-        let child = item(krate, *child_id)?;
-        if !is_public(child) {
-            continue;
-        }
-        if exported_name(child)
-            .as_deref()
-            .is_some_and(|exported| identifier_key(exported) == identifier_key(name))
-        {
-            return Ok(*child_id);
-        }
+    let direct_matches = direct_matching_children(krate, children, name)?;
+    match direct_matches.as_slice() {
+        [child_id] => return Ok(*child_id),
+        [] => {}
+        _ => return Err(ambiguous_symbol(krate, name, &direct_matches)),
     }
 
+    let mut glob_errors = Vec::new();
+    let mut glob_matches = Vec::new();
     for child_id in children {
         let child = item(krate, *child_id)?;
         if !is_public(child) {
@@ -325,7 +394,11 @@ fn find_child(
                     Ok(target_item) if is_path_container(target_item) => {
                         let mut branch_visited = visited.clone();
                         match find_child(krate, target, name, &mut branch_visited) {
-                            Ok(found) => return Ok(found),
+                            Ok(found) => {
+                                if !glob_matches.contains(&found) {
+                                    glob_matches.push(found);
+                                }
+                            }
                             Err(err) => glob_errors.push(format!(
                                 "glob import '{}' did not resolve '{name}': {err}",
                                 use_item.source
@@ -350,12 +423,64 @@ fn find_child(
         }
     }
 
+    match glob_matches.as_slice() {
+        [child_id] => return Ok(*child_id),
+        [] => {}
+        _ => return Err(ambiguous_symbol(krate, name, &glob_matches)),
+    }
+
     let mut message = format!("'{name}' not found under {}", path_label(krate, module_id));
     if !glob_errors.is_empty() {
         message.push_str("; glob branches failed: ");
         message.push_str(&glob_errors.join("; "));
     }
     Err(SymbolError::NotFound(message))
+}
+
+fn direct_matching_children(
+    krate: &Crate,
+    children: &[Id],
+    name: &str,
+) -> Result<Vec<Id>, SymbolError> {
+    let mut matches = Vec::new();
+    for child_id in children {
+        let child = item(krate, *child_id)?;
+        if is_public(child)
+            && exported_name(child)
+                .as_deref()
+                .is_some_and(|exported| identifier_key(exported) == identifier_key(name))
+        {
+            matches.push(*child_id);
+        }
+    }
+    Ok(matches)
+}
+
+fn ambiguous_symbol(krate: &Crate, name: &str, ids: &[Id]) -> SymbolError {
+    let candidates = ids
+        .iter()
+        .filter_map(|id| krate.index.get(id))
+        .map(|item| {
+            format!(
+                "{} {}",
+                ambiguity_kind(krate, item),
+                exported_name(item).unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    SymbolError::Ambiguous(format!(
+        "imported name '{name}' is ambiguous across Rust namespaces ({candidates}); query a namespace-specific canonical path"
+    ))
+}
+
+fn ambiguity_kind(krate: &Crate, item: &Item) -> String {
+    if let ItemEnum::Use(use_item) = &item.inner
+        && let Some(summary) = use_item.id.and_then(|id| krate.paths.get(&id))
+    {
+        return format!("{:?}", summary.kind);
+    }
+    kind_name(&item.inner).to_string()
 }
 
 fn follow_use(krate: &Crate, mut id: Id, visited: &mut HashSet<Id>) -> Result<Id, SymbolError> {
@@ -460,20 +585,10 @@ fn format_item(krate: &Crate, item: &Item) -> SymbolDoc {
             ),
             Vec::new(),
         ),
-        ItemEnum::Constant { type_, .. } => (
-            "const",
-            format!("pub const {name}: {} = ...;", type_str(type_)),
-            Vec::new(),
-        ),
-        ItemEnum::Static(s) => (
-            "static",
-            format!(
-                "pub static {}{name}: {} = ...;",
-                if s.is_mutable { "mut " } else { "" },
-                type_str(&s.type_)
-            ),
-            Vec::new(),
-        ),
+        ItemEnum::Constant { type_, const_ } => {
+            ("const", constant_def(&name, type_, const_), Vec::new())
+        }
+        ItemEnum::Static(s) => ("static", static_def(&name, s), Vec::new()),
         ItemEnum::Union(u) => ("union", union_def(krate, &name, u), union_details(krate, u)),
         ItemEnum::Variant(variant) => ("variant", variant_def(krate, &name, variant), Vec::new()),
         ItemEnum::Macro(source) => ("macro", format!("macro_rules! {name} {source}"), Vec::new()),
@@ -755,15 +870,28 @@ fn kind_name(inner: &ItemEnum) -> &'static str {
         ItemEnum::Module(_) => "module",
         ItemEnum::ExternCrate { .. } => "extern crate",
         ItemEnum::Use(_) => "use",
+        ItemEnum::Struct(_) => "struct",
+        ItemEnum::Union(_) => "union",
+        ItemEnum::Enum(_) => "enum",
+        ItemEnum::Function(_) => "fn",
+        ItemEnum::Trait(_) => "trait",
         ItemEnum::StructField(_) => "field",
         ItemEnum::Variant(_) => "variant",
         ItemEnum::TraitAlias(_) => "trait alias",
         ItemEnum::Impl(_) => "impl",
+        ItemEnum::TypeAlias(_) => "type",
+        ItemEnum::Constant { .. } => "const",
+        ItemEnum::Static(_) => "static",
+        ItemEnum::Macro(_) => "macro",
+        ItemEnum::ProcMacro(proc_macro) => match proc_macro.kind {
+            MacroKind::Bang => "proc macro",
+            MacroKind::Attr => "attribute macro",
+            MacroKind::Derive => "derive macro",
+        },
         ItemEnum::ExternType => "extern type",
         ItemEnum::Primitive(_) => "primitive",
         ItemEnum::AssocConst { .. } => "assoc const",
         ItemEnum::AssocType { .. } => "assoc type",
-        _ => "item",
     }
 }
 
@@ -780,7 +908,7 @@ fn struct_def(krate: &Crate, name: &str, s: &rustdoc_types::Struct) -> String {
             fields
                 .iter()
                 .map(|id| id
-                    .and_then(|id| field_type(krate, id))
+                    .and_then(|id| field_type(krate, id, FieldContext::TypeDefinition))
                     .unwrap_or_else(|| "_".into()))
                 .collect::<Vec<_>>()
                 .join(", "),
@@ -792,7 +920,7 @@ fn struct_def(krate: &Crate, name: &str, s: &rustdoc_types::Struct) -> String {
             where_clause(&s.generics),
             fields
                 .iter()
-                .filter_map(|id| field_line(krate, *id))
+                .filter_map(|id| field_line(krate, *id, FieldContext::TypeDefinition))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -807,7 +935,7 @@ fn struct_details(krate: &Crate, s: &rustdoc_types::Struct) -> Vec<String> {
         } => {
             let mut details = fields
                 .iter()
-                .filter_map(|id| field_line(krate, *id))
+                .filter_map(|id| field_line(krate, *id, FieldContext::TypeDefinition))
                 .collect::<Vec<_>>();
             if *has_stripped_fields {
                 details.push("fields: private/stripped".to_string());
@@ -819,7 +947,7 @@ fn struct_details(krate: &Crate, s: &rustdoc_types::Struct) -> Vec<String> {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, id)| {
-                    id.and_then(|id| field_type(krate, id))
+                    id.and_then(|id| field_type(krate, id, FieldContext::TypeDefinition))
                         .map(|ty| format!("#{i}: {ty}"))
                 })
                 .collect::<Vec<_>>();
@@ -851,29 +979,7 @@ fn enum_details(krate: &Crate, e: &rustdoc_types::Enum) -> Vec<String> {
             let ItemEnum::Variant(v) = &item.inner else {
                 return Some(name);
             };
-            Some(match &v.kind {
-                VariantKind::Plain => name,
-                VariantKind::Tuple(fields) => format!(
-                    "{}({})",
-                    name,
-                    fields
-                        .iter()
-                        .map(|id| id
-                            .and_then(|id| field_type(krate, id))
-                            .unwrap_or_else(|| "_".into()))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                VariantKind::Struct { fields, .. } => format!(
-                    "{} {{ {} }}",
-                    name,
-                    fields
-                        .iter()
-                        .filter_map(|id| field_line(krate, *id))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            })
+            Some(variant_def(krate, &name, v))
         })
         .collect::<Vec<_>>();
     if e.has_stripped_variants {
@@ -911,14 +1017,14 @@ fn trait_alias_def(name: &str, alias: &rustdoc_types::TraitAlias) -> String {
 }
 
 fn variant_def(krate: &Crate, name: &str, variant: &rustdoc_types::Variant) -> String {
-    match &variant.kind {
+    let definition = match &variant.kind {
         VariantKind::Plain => name.to_string(),
         VariantKind::Tuple(fields) => format!(
             "{name}({})",
             fields
                 .iter()
                 .map(|field| field
-                    .and_then(|id| field_type(krate, id))
+                    .and_then(|id| field_type(krate, id, FieldContext::EnumVariant))
                     .unwrap_or_else(|| "_".to_string()))
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -927,10 +1033,14 @@ fn variant_def(krate: &Crate, name: &str, variant: &rustdoc_types::Variant) -> S
             "{name} {{ {} }}",
             fields
                 .iter()
-                .filter_map(|id| field_line(krate, *id))
+                .filter_map(|id| field_line(krate, *id, FieldContext::EnumVariant))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+    };
+    match &variant.discriminant {
+        Some(discriminant) => format!("{definition} = {}", discriminant.expr),
+        None => definition,
     }
 }
 
@@ -947,8 +1057,8 @@ fn trait_details(krate: &Crate, t: &rustdoc_types::Trait) -> Vec<String> {
                     bounds,
                     type_,
                 } => Some(assoc_type_def(&name, generics, bounds, type_.as_ref())),
-                ItemEnum::AssocConst { type_, .. } => {
-                    Some(format!("const {name}: {};", type_str(type_)))
+                ItemEnum::AssocConst { type_, value } => {
+                    Some(assoc_const_def(&name, type_, value.as_deref()))
                 }
                 _ => None,
             }
@@ -1048,7 +1158,7 @@ fn union_details(krate: &Crate, u: &rustdoc_types::Union) -> Vec<String> {
     let mut details = u
         .fields
         .iter()
-        .filter_map(|id| field_line(krate, *id))
+        .filter_map(|id| field_line(krate, *id, FieldContext::TypeDefinition))
         .collect::<Vec<_>>();
     if u.has_stripped_fields {
         details.push("fields: private/stripped".to_string());
@@ -1056,24 +1166,99 @@ fn union_details(krate: &Crate, u: &rustdoc_types::Union) -> Vec<String> {
     details
 }
 
-fn field_line(krate: &Crate, id: Id) -> Option<String> {
+#[derive(Debug, Clone, Copy)]
+enum FieldContext {
+    TypeDefinition,
+    EnumVariant,
+}
+
+fn field_line(krate: &Crate, id: Id, context: FieldContext) -> Option<String> {
     let field = krate.index.get(&id)?;
     let ItemEnum::StructField(ty) = &field.inner else {
         return None;
     };
     Some(format!(
-        "{}: {}",
+        "{}{}: {}",
+        field_visibility(&field.visibility, context),
         field.name.clone().unwrap_or_else(|| "_".into()),
         type_str(ty)
     ))
 }
 
-fn field_type(krate: &Crate, id: Id) -> Option<String> {
+fn field_type(krate: &Crate, id: Id, context: FieldContext) -> Option<String> {
     let field = krate.index.get(&id)?;
     let ItemEnum::StructField(ty) = &field.inner else {
         return None;
     };
-    Some(type_str(ty))
+    Some(format!(
+        "{}{}",
+        field_visibility(&field.visibility, context),
+        type_str(ty)
+    ))
+}
+
+fn field_visibility(visibility: &Visibility, context: FieldContext) -> String {
+    if matches!(context, FieldContext::EnumVariant) {
+        return String::new();
+    }
+    match visibility {
+        Visibility::Public => "pub ".to_string(),
+        Visibility::Default => String::new(),
+        Visibility::Crate => "pub(crate) ".to_string(),
+        Visibility::Restricted { path, .. } => format!("pub(in {path}) "),
+    }
+}
+
+fn assoc_const_def(name: &str, type_: &Type, value: Option<&str>) -> String {
+    format!(
+        "const {name}: {}{};",
+        type_str(type_),
+        value.map(|value| format!(" = {value}")).unwrap_or_default()
+    )
+}
+
+fn constant_initializer(constant: &rustdoc_types::Constant) -> Option<&str> {
+    if matches!(constant.expr.as_str(), "_" | "{ _ }") {
+        constant.value.as_deref()
+    } else {
+        Some(&constant.expr)
+    }
+}
+
+fn constant_def(name: &str, type_: &Type, constant: &rustdoc_types::Constant) -> String {
+    match constant_initializer(constant) {
+        Some(initializer) => format!("pub const {name}: {} = {initializer};", type_str(type_)),
+        None => format!(
+            "definition rendering unsupported for constant initializer; item: const {name}: {}",
+            type_str(type_)
+        ),
+    }
+}
+
+fn static_def(name: &str, static_: &rustdoc_types::Static) -> String {
+    let mutable = if static_.is_mutable { "mut " } else { "" };
+    if static_.is_unsafe || static_.expr.is_empty() {
+        let safety = if static_.is_unsafe {
+            "unsafe "
+        } else {
+            "safe "
+        };
+        return format!(
+            "definition rendering unsupported as standalone Rust for {safety}extern static; declaration inside extern block: static {mutable}{name}: {};",
+            type_str(&static_.type_)
+        );
+    }
+    if matches!(static_.expr.as_str(), "_" | "{ _ }") {
+        return format!(
+            "definition rendering unsupported for static initializer; item: static {mutable}{name}: {}",
+            type_str(&static_.type_)
+        );
+    }
+    format!(
+        "pub static {mutable}{name}: {} = {};",
+        type_str(&static_.type_),
+        static_.expr
+    )
 }
 
 fn generics(g: &rustdoc_types::Generics) -> String {
@@ -1397,6 +1582,11 @@ fn lifetime_str(lifetime: &str) -> String {
 }
 
 fn fn_pointer_str(fp: &rustdoc_types::FunctionPointer) -> String {
+    let binder = if fp.generic_params.is_empty() {
+        String::new()
+    } else {
+        format!("for<{}> ", generic_param_decls(&fp.generic_params))
+    };
     let prefix = if fp.header.is_unsafe { "unsafe " } else { "" };
     let abi = abi_str(&fp.header.abi);
     let inputs = fp
@@ -1412,7 +1602,7 @@ fn fn_pointer_str(fp: &rustdoc_types::FunctionPointer) -> String {
         .as_ref()
         .map(|ty| format!(" -> {}", type_str(ty)))
         .unwrap_or_default();
-    format!("{prefix}{abi}fn({inputs}){output}")
+    format!("{binder}{prefix}{abi}fn({inputs}){output}")
 }
 
 fn signature_inputs(mut inputs: Vec<String>, is_c_variadic: bool) -> String {
@@ -2133,6 +2323,63 @@ mod tests {
     }
 
     #[test]
+    fn external_glob_appends_the_concrete_requested_tail() {
+        let root = item(
+            1,
+            Some("fixture"),
+            Visibility::Public,
+            ItemEnum::Module(Module {
+                is_crate: true,
+                items: vec![Id(2)],
+                is_stripped: false,
+            }),
+        );
+        let glob = item(
+            2,
+            Some("glob"),
+            Visibility::Public,
+            ItemEnum::Use(Use {
+                source: "middle::api::*".into(),
+                name: "glob".into(),
+                id: Some(Id(99)),
+                is_glob: true,
+            }),
+        );
+        let mut docs = krate(vec![root, glob], Id(1));
+        docs.external_crates.insert(
+            7,
+            ExternalCrate {
+                name: "middle".into(),
+                html_root_url: None,
+            },
+        );
+        docs.paths.insert(
+            Id(99),
+            ItemSummary {
+                crate_id: 7,
+                path: vec!["middle".into(), "api".into()],
+                kind: ItemKind::Module,
+            },
+        );
+
+        assert_eq!(
+            external_reexports(
+                &docs,
+                &ImportPath {
+                    crate_name: "fixture".into(),
+                    segments: vec![],
+                    item: "Thing".into(),
+                },
+            )
+            .unwrap(),
+            vec![ExternalReexport {
+                crate_name: "middle".into(),
+                path: vec!["api".into(), "Thing".into()],
+            }]
+        );
+    }
+
+    #[test]
     fn resolves_enum_variants_and_raw_identifiers() {
         let root = item(
             1,
@@ -2208,6 +2455,74 @@ mod tests {
         )
         .unwrap();
         assert_eq!(raw.imported.name, "type");
+    }
+
+    #[test]
+    fn same_spelling_in_multiple_namespaces_is_an_explicit_ambiguity() {
+        let root = item(
+            1,
+            Some("fixture"),
+            Visibility::Public,
+            ItemEnum::Module(Module {
+                is_crate: true,
+                items: vec![Id(2), Id(3)],
+                is_stripped: false,
+            }),
+        );
+        let trait_use = item(
+            2,
+            Some("Serialize"),
+            Visibility::Public,
+            ItemEnum::Use(Use {
+                source: "serde_core::Serialize".into(),
+                name: "Serialize".into(),
+                id: Some(Id(20)),
+                is_glob: false,
+            }),
+        );
+        let derive_use = item(
+            3,
+            Some("Serialize"),
+            Visibility::Public,
+            ItemEnum::Use(Use {
+                source: "serde_derive::Serialize".into(),
+                name: "Serialize".into(),
+                id: Some(Id(30)),
+                is_glob: false,
+            }),
+        );
+        let mut docs = krate(vec![root, trait_use, derive_use], Id(1));
+        docs.paths.insert(
+            Id(20),
+            ItemSummary {
+                crate_id: 2,
+                path: vec!["serde_core".into(), "Serialize".into()],
+                kind: ItemKind::Trait,
+            },
+        );
+        docs.paths.insert(
+            Id(30),
+            ItemSummary {
+                crate_id: 3,
+                path: vec!["serde_derive".into(), "Serialize".into()],
+                kind: ItemKind::ProcDerive,
+            },
+        );
+
+        let error = find_symbol_report(
+            &docs,
+            &ImportPath {
+                crate_name: "fixture".into(),
+                segments: vec![],
+                item: "Serialize".into(),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "imported name 'Serialize' is ambiguous across Rust namespaces (Trait Serialize, ProcDerive Serialize); query a namespace-specific canonical path"
+        );
     }
 
     #[test]
@@ -2318,6 +2633,215 @@ mod tests {
         assert_eq!(
             format_item(&docs, &unsupported).definition,
             "definition rendering unsupported for extern type"
+        );
+    }
+
+    #[test]
+    fn formatter_preserves_field_visibility_values_and_extern_static_semantics() {
+        let public_field = item(
+            1,
+            Some("value"),
+            Visibility::Public,
+            ItemEnum::StructField(Type::Primitive("u8".into())),
+        );
+        let private_field = item(
+            2,
+            Some("hidden"),
+            Visibility::Default,
+            ItemEnum::StructField(Type::Primitive("u16".into())),
+        );
+        let crate_field = item(
+            3,
+            Some("shared"),
+            Visibility::Crate,
+            ItemEnum::StructField(Type::Primitive("u32".into())),
+        );
+        let named = item(
+            4,
+            Some("Named"),
+            Visibility::Public,
+            ItemEnum::Struct(Struct {
+                kind: StructKind::Plain {
+                    fields: vec![Id(1), Id(2), Id(3)],
+                    has_stripped_fields: false,
+                },
+                generics: generics_empty(),
+                impls: vec![],
+            }),
+        );
+        let tuple = item(
+            5,
+            Some("Tuple"),
+            Visibility::Public,
+            ItemEnum::Struct(Struct {
+                kind: StructKind::Tuple(vec![Some(Id(1)), Some(Id(2)), Some(Id(3))]),
+                generics: generics_empty(),
+                impls: vec![],
+            }),
+        );
+        let union = item(
+            6,
+            Some("Either"),
+            Visibility::Public,
+            ItemEnum::Union(Union {
+                generics: generics_empty(),
+                has_stripped_fields: false,
+                fields: vec![Id(1), Id(3)],
+                impls: vec![],
+            }),
+        );
+        let variant = item(
+            7,
+            Some("Five"),
+            Visibility::Default,
+            ItemEnum::Variant(Variant {
+                kind: VariantKind::Plain,
+                discriminant: Some(rustdoc_types::Discriminant {
+                    expr: "0x05".into(),
+                    value: "5".into(),
+                }),
+            }),
+        );
+        let struct_variant = item(
+            8,
+            Some("Fields"),
+            Visibility::Default,
+            ItemEnum::Variant(Variant {
+                kind: VariantKind::Struct {
+                    fields: vec![Id(1)],
+                    has_stripped_fields: false,
+                },
+                discriminant: None,
+            }),
+        );
+        let number = item(
+            9,
+            Some("Number"),
+            Visibility::Public,
+            ItemEnum::Enum(Enum {
+                generics: generics_empty(),
+                has_stripped_variants: false,
+                variants: vec![Id(7), Id(8)],
+                impls: vec![],
+            }),
+        );
+        let constant = item(
+            10,
+            Some("COUNT"),
+            Visibility::Public,
+            ItemEnum::Constant {
+                type_: Type::Primitive("usize".into()),
+                const_: Constant {
+                    expr: "1 + 2".into(),
+                    value: Some("3".into()),
+                    is_literal: false,
+                },
+            },
+        );
+        let static_item = item(
+            11,
+            Some("READY"),
+            Visibility::Public,
+            ItemEnum::Static(Static {
+                type_: Type::Primitive("bool".into()),
+                is_mutable: false,
+                expr: "true".into(),
+                is_unsafe: false,
+            }),
+        );
+        let foreign = item(
+            12,
+            Some("FOREIGN"),
+            Visibility::Public,
+            ItemEnum::Static(Static {
+                type_: Type::Primitive("u8".into()),
+                is_mutable: false,
+                expr: String::new(),
+                is_unsafe: true,
+            }),
+        );
+        let assoc = item(
+            13,
+            Some("VALUE"),
+            Visibility::Default,
+            ItemEnum::AssocConst {
+                type_: Type::Primitive("u8".into()),
+                value: Some("7".into()),
+            },
+        );
+        let trait_item = item(
+            14,
+            Some("Defaults"),
+            Visibility::Public,
+            ItemEnum::Trait(Trait {
+                is_auto: false,
+                is_unsafe: false,
+                is_dyn_compatible: false,
+                items: vec![Id(13)],
+                generics: generics_empty(),
+                bounds: vec![],
+                implementations: vec![],
+            }),
+        );
+        let docs = krate(
+            vec![
+                public_field,
+                private_field,
+                crate_field,
+                named.clone(),
+                tuple.clone(),
+                union.clone(),
+                variant,
+                struct_variant,
+                number.clone(),
+                constant.clone(),
+                static_item.clone(),
+                foreign.clone(),
+                assoc,
+                trait_item.clone(),
+            ],
+            Id(4),
+        );
+
+        assert_eq!(
+            format_item(&docs, &named).definition,
+            "pub struct Named { pub value: u8, hidden: u16, pub(crate) shared: u32 }"
+        );
+        assert_eq!(
+            format_item(&docs, &tuple).definition,
+            "pub struct Tuple(pub u8, u16, pub(crate) u32);"
+        );
+        assert_eq!(
+            format_item(&docs, &union).definition,
+            "pub union Either { pub value: u8, pub(crate) shared: u32 }"
+        );
+        assert_eq!(
+            format_item(&docs, &number).definition,
+            "pub enum Number { Five = 0x05, Fields { value: u8 } }"
+        );
+        assert_eq!(
+            format_item(&docs, &constant).definition,
+            "pub const COUNT: usize = 1 + 2;"
+        );
+        assert_eq!(
+            constant_initializer(&Constant {
+                expr: "_".into(),
+                value: Some("3".into()),
+                is_literal: false,
+            }),
+            Some("3")
+        );
+        assert_eq!(
+            format_item(&docs, &static_item).definition,
+            "pub static READY: bool = true;"
+        );
+        assert_eq!(
+            format_item(&docs, &foreign).definition,
+            "definition rendering unsupported as standalone Rust for unsafe extern static; declaration inside extern block: static FOREIGN: u8;"
+        );
+        assert_eq!(
+            format_item(&docs, &trait_item).details,
+            vec!["const VALUE: u8 = 7;"]
         );
     }
 
@@ -2756,6 +3280,39 @@ mod tests {
             "fn(u8) -> bool"
         );
         assert_eq!(
+            type_str(&Type::FunctionPointer(Box::new(
+                rustdoc_types::FunctionPointer {
+                    sig: FunctionSignature {
+                        inputs: vec![(
+                            "value".into(),
+                            Type::BorrowedRef {
+                                lifetime: Some("a".into()),
+                                is_mutable: false,
+                                type_: Box::new(Type::Primitive("str".into())),
+                            },
+                        )],
+                        output: Some(Type::BorrowedRef {
+                            lifetime: Some("a".into()),
+                            is_mutable: false,
+                            type_: Box::new(Type::Primitive("str".into())),
+                        }),
+                        is_c_variadic: false,
+                    },
+                    generic_params: vec![GenericParamDef {
+                        name: "a".into(),
+                        kind: GenericParamDefKind::Lifetime { outlives: vec![] },
+                    }],
+                    header: FunctionHeader {
+                        is_const: false,
+                        is_unsafe: false,
+                        is_async: false,
+                        abi: Abi::Rust,
+                    },
+                },
+            ))),
+            "for<'a> fn(&'a str) -> &'a str"
+        );
+        assert_eq!(
             type_str(&Type::ResolvedPath(Path {
                 path: "std::vec::Vec".into(),
                 id: Id(1),
@@ -2841,7 +3398,7 @@ mod tests {
         let docs = krate(vec![field, cache.clone()], Id(2));
         assert_eq!(
             format_item(&docs, &cache).definition,
-            "pub struct Cache<'a: 'b, T: Clone + Send = String, const N: usize = 32> where T: Sync + 'a, 'a: 'b, T::Item = u8, for<'x> T: Borrow<'x> { value: T }"
+            "pub struct Cache<'a: 'b, T: Clone + Send = String, const N: usize = 32> where T: Sync + 'a, 'a: 'b, T::Item = u8, for<'x> T: Borrow<'x> { pub value: T }"
         );
 
         let alias = item(

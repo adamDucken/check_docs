@@ -8,10 +8,10 @@ use cargo_metadata::{Metadata, MetadataCommand, Package, PackageId, Target};
 use cli::{ParsedCommand, parse_command};
 use imports::ImportPath;
 use resolver::{
-    DependencyContext, DependencyFilter, ResolveError, is_rust_library_crate, package_dependencies,
-    resolve_dependency, resolve_dependency_from_package, select_package,
+    DependencyContext, DependencyFilter, is_rust_library_crate, package_dependencies,
+    resolve_dependency, resolve_reachable_dependency, select_package,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
@@ -37,6 +37,16 @@ struct OutputReport {
     source: PathBuf,
     import_line: String,
     symbols: SymbolReport,
+}
+
+#[derive(Debug)]
+struct ResolvedQuery {
+    symbols: SymbolReport,
+    crate_name: String,
+    version: String,
+    contexts: Vec<DependencyContext>,
+    target_triple: String,
+    json_path: PathBuf,
 }
 
 fn main() -> ExitCode {
@@ -103,120 +113,190 @@ fn run() -> Result<(), String> {
         }
         let dep = resolve_dependency(&metadata.packages, &root_dependencies, &import.crate_name)
             .map_err(|err| err.to_string())?;
-        let (krate, json_path) = load_docs_cached(
+        let resolved = resolve_query(
             &mut rustdoc_cache,
             &manifest_path,
             &metadata,
             dep.package,
             dep.target,
+            dep.contexts,
             Some(&selected_target),
+            import,
+            &mut HashSet::new(),
         )?;
-        let (found, report_crate, report_version, report_json_path, contexts, target_triple) =
-            match symbols::find_symbol_report(&krate, import) {
-                Ok(found) => (
-                    found,
-                    dep.package.name.clone(),
-                    dep.package.version.to_string(),
-                    json_path,
-                    dep.contexts,
-                    krate.target.triple.clone(),
-                ),
-                Err(err) => {
-                    let imported_reexport =
-                        symbols::imported_reexport(&krate, import).ok().flatten();
-                    let Some(external) =
-                        symbols::external_reexport(&krate, import).map_err(|external_err| {
-                            format!("{err}; failed to inspect external re-export: {external_err}")
-                        })?
-                    else {
-                        return Err(not_found_message(
-                            import,
-                            &dep.package.name,
-                            Some(&dep.package.version.to_string()),
-                            &json_path,
-                            Some(&err),
-                        ));
-                    };
-                    let external_dep =
-                        match resolve_dependency(&metadata.packages, &root_dependencies, &external.crate_name) {
-                            Ok(dep) => dep,
-                            Err(ResolveError::NotDirectDependency(_)) => {
-                                resolve_dependency_from_package(
-                                    &metadata,
-                                    &metadata.packages,
-                                    dep.package,
-                                    &external.crate_name,
-                                )
-                                .map_err(|graph_err| {
-                                    format!(
-                                        "item '{}' is re-exported from external crate '{}' but exact docs could not resolve that crate through direct dependency '{}': {graph_err}",
-                                        import.item, external.crate_name, dep.package.name
-                                    )
-                                })?
-                            }
-                            Err(dep_err) => {
-                                return Err(format!(
-                                    "item '{}' is re-exported from external crate '{}' but exact docs could not resolve that crate: {dep_err}",
-                                    import.item, external.crate_name
-                                ));
-                            }
-                        };
-                    let (external_krate, external_json_path) = load_docs_cached(
-                        &mut rustdoc_cache,
-                        &manifest_path,
-                        &metadata,
-                        external_dep.package,
-                        external_dep.target,
-                        Some(&selected_target),
-                    )?;
-                    let found = if let Some(external_import) = external.import_path() {
-                        find_external_symbol(
-                            &external_krate,
-                            &external_import,
-                            &external_dep.package.name,
-                            &external_dep.package.version.to_string(),
-                            &external_json_path,
-                        )?
-                    } else {
-                        SymbolReport {
-                            imported: symbols::format_crate_root(&external_krate)
-                                .map_err(|err| err.to_string())?,
-                            resolved: None,
-                        }
-                    };
-                    let found = if let Some(imported) = imported_reexport {
-                        let resolved = found.resolved.unwrap_or(found.imported);
-                        SymbolReport {
-                            imported,
-                            resolved: Some(resolved),
-                        }
-                    } else {
-                        found
-                    };
-                    (
-                        found,
-                        external_dep.package.name.clone(),
-                        external_dep.package.version.to_string(),
-                        external_json_path,
-                        external_dep.contexts,
-                        external_krate.target.triple.clone(),
-                    )
-                }
-            };
 
         let output = OutputReport {
-            crate_name: report_crate,
-            version: Some(report_version),
-            dependency: format_dependency_contexts(&contexts),
-            target_triple,
-            source: report_json_path,
+            crate_name: resolved.crate_name,
+            version: Some(resolved.version),
+            dependency: format_dependency_contexts(&resolved.contexts),
+            target_triple: resolved.target_triple,
+            source: resolved.json_path,
             import_line: format_use(import),
-            symbols: found,
+            symbols: resolved.symbols,
         };
         print_report(&output);
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_query(
+    cache: &mut RustdocCache,
+    manifest_path: &Path,
+    metadata: &Metadata,
+    package: &Package,
+    target: &Target,
+    contexts: Vec<DependencyContext>,
+    target_triple: Option<&str>,
+    import: &ImportPath,
+    visited: &mut HashSet<(PackageId, String)>,
+) -> Result<ResolvedQuery, String> {
+    let visit_key = (package.id.clone(), import.full_path());
+    if !visited.insert(visit_key) {
+        return Err(format!(
+            "cycle while resolving external re-export {} from {}",
+            import.full_path(),
+            package.name
+        ));
+    }
+    let (krate, json_path) = load_docs_cached(
+        cache,
+        manifest_path,
+        metadata,
+        package,
+        target,
+        target_triple,
+    )?;
+    match symbols::find_symbol_report(&krate, import) {
+        Ok(symbols) => Ok(ResolvedQuery {
+            symbols,
+            crate_name: package.name.clone(),
+            version: package.version.to_string(),
+            contexts,
+            target_triple: krate.target.triple.clone(),
+            json_path,
+        }),
+        Err(SymbolError::Ambiguous(message)) => Err(format!(
+            "ambiguous import '{}' in {} {}: {message}",
+            import.full_path(),
+            package.name,
+            package.version
+        )),
+        Err(local_error) => {
+            let imported_reexport = symbols::imported_reexport(&krate, import).ok().flatten();
+            let external_candidates = symbols::external_reexports(&krate, import).map_err(
+                |external_error| {
+                    format!(
+                        "{local_error}; failed to inspect external re-export graph: {external_error}"
+                    )
+                },
+            )?;
+            if external_candidates.is_empty() {
+                return Err(not_found_message(
+                    import,
+                    &package.name,
+                    Some(&package.version.to_string()),
+                    &json_path,
+                    Some(&local_error),
+                ));
+            }
+
+            let mut successes = Vec::new();
+            let mut branch_errors = Vec::new();
+            for external in external_candidates {
+                let external_dep = match resolve_reachable_dependency(
+                    metadata,
+                    &metadata.packages,
+                    package,
+                    &external.crate_name,
+                ) {
+                    Ok(dep) => dep,
+                    Err(error) => {
+                        branch_errors.push(format!("{}: {error}", external.crate_name));
+                        continue;
+                    }
+                };
+                let mut branch_visited = visited.clone();
+                let result = if let Some(external_import) = external.import_path() {
+                    resolve_query(
+                        cache,
+                        manifest_path,
+                        metadata,
+                        external_dep.package,
+                        external_dep.target,
+                        external_dep.contexts,
+                        target_triple,
+                        &external_import,
+                        &mut branch_visited,
+                    )
+                } else {
+                    load_docs_cached(
+                        cache,
+                        manifest_path,
+                        metadata,
+                        external_dep.package,
+                        external_dep.target,
+                        target_triple,
+                    )
+                    .and_then(|(external_krate, external_json_path)| {
+                        Ok(ResolvedQuery {
+                            symbols: SymbolReport {
+                                imported: symbols::format_crate_root(&external_krate)
+                                    .map_err(|error| error.to_string())?,
+                                resolved: None,
+                            },
+                            crate_name: external_dep.package.name.clone(),
+                            version: external_dep.package.version.to_string(),
+                            contexts: external_dep.contexts,
+                            target_triple: external_krate.target.triple.clone(),
+                            json_path: external_json_path,
+                        })
+                    })
+                };
+                match result {
+                    Ok(resolved) => successes.push(resolved),
+                    Err(error) => branch_errors.push(format!("{}: {error}", external.crate_name)),
+                }
+            }
+
+            match successes.len() {
+                1 => {
+                    let mut resolved = successes.pop().expect("one successful branch");
+                    if let Some(imported) = imported_reexport {
+                        let resolved_item = resolved
+                            .symbols
+                            .resolved
+                            .take()
+                            .unwrap_or(resolved.symbols.imported);
+                        resolved.symbols = SymbolReport {
+                            imported,
+                            resolved: Some(resolved_item),
+                        };
+                    }
+                    Ok(resolved)
+                }
+                count if count > 1 => Err(format!(
+                    "ambiguous external re-export for '{}': {count} branches resolved successfully",
+                    import.full_path()
+                )),
+                _ => {
+                    let mut message = not_found_message(
+                        import,
+                        &package.name,
+                        Some(&package.version.to_string()),
+                        &json_path,
+                        Some(&local_error),
+                    );
+                    if !branch_errors.is_empty() {
+                        message.push_str("; external branches failed: ");
+                        message.push_str(&branch_errors.join("; "));
+                    }
+                    Err(message)
+                }
+            }
+        }
+    }
 }
 
 fn host_target_triple() -> Result<String, String> {
@@ -275,6 +355,7 @@ fn rustdoc_cache_key(
     }
 }
 
+#[cfg(test)]
 fn find_external_symbol(
     krate: &rustdoc_types::Crate,
     import: &ImportPath,
@@ -411,16 +492,6 @@ fn not_found_message(
         }
         return message;
     };
-
-    if matches!(context, SymbolError::ExternalReexport(_)) {
-        return format!(
-            "item '{}' is a public re-export with unsupported rustdoc external id in {} ({}): {}; query/add the external crate directly if available",
-            import.item,
-            crate_label,
-            source.display(),
-            context
-        );
-    }
 
     let mut message = format!(
         "item '{}' not found in {} ({}): {}",

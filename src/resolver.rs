@@ -1,5 +1,5 @@
 use cargo_metadata::{DependencyKind, Metadata, Package, PackageId, Target};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::{error::Error, fmt};
 
@@ -173,6 +173,95 @@ pub(crate) fn resolve_dependency_from_package<'a>(
                 .join(", ");
             Err(ResolveError::Other(format!(
                 "crate '{crate_name}' matched multiple dependencies of '{}': {candidates}",
+                source_package.name
+            )))
+        }
+    }
+}
+
+pub(crate) fn resolve_reachable_dependency<'a>(
+    metadata: &Metadata,
+    packages: &'a [Package],
+    source_package: &Package,
+    crate_name: &str,
+) -> Result<ResolvedDependency<'a>, ResolveError> {
+    if let Ok(direct) =
+        resolve_dependency_from_package(metadata, packages, source_package, crate_name)
+    {
+        return Ok(direct);
+    }
+
+    let Some(resolve) = metadata.resolve.as_ref() else {
+        return Err(ResolveError::Other(
+            "cargo metadata did not include a dependency graph".to_string(),
+        ));
+    };
+    let mut queue = VecDeque::from([source_package.id.clone()]);
+    let mut visited = HashSet::new();
+    let mut matches = Vec::<DependencyEntry>::new();
+
+    while let Some(package_id) = queue.pop_front() {
+        if !visited.insert(package_id.clone()) {
+            continue;
+        }
+        let Some(node) = resolve.nodes.iter().find(|node| node.id == package_id) else {
+            continue;
+        };
+        for dep in &node.deps {
+            let normal_kinds = dep
+                .dep_kinds
+                .iter()
+                .filter(|dep_kind| dep_kind.kind == DependencyKind::Normal)
+                .collect::<Vec<_>>();
+            if normal_kinds.is_empty() {
+                continue;
+            }
+            queue.push_back(dep.pkg.clone());
+            if !dependency_matches_crate_name(dep, crate_name) {
+                continue;
+            }
+            for dep_kind in normal_kinds {
+                push_dependency_context(
+                    &mut matches,
+                    dep.pkg.clone(),
+                    transitive_context(
+                        dep_kind.kind,
+                        dep_kind.target.as_ref().map(ToString::to_string),
+                        &source_package.name,
+                    ),
+                );
+            }
+        }
+    }
+
+    matches.sort_by(|left, right| left.package_id.repr.cmp(&right.package_id.repr));
+    match matches.as_slice() {
+        [] => Err(ResolveError::Other(format!(
+            "crate '{crate_name}' is not reachable through normal dependencies of '{}'",
+            source_package.name
+        ))),
+        [entry] => {
+            let package = package_by_id(packages, &entry.package_id).ok_or_else(|| {
+                ResolveError::Other(format!(
+                    "reachable dependency '{crate_name}' of '{}' missing from cargo metadata",
+                    source_package.name
+                ))
+            })?;
+            let target = library_target(package).map_err(ResolveError::Other)?;
+            Ok(ResolvedDependency {
+                package,
+                target,
+                contexts: entry.contexts.clone(),
+            })
+        }
+        entries => {
+            let candidates = entries
+                .iter()
+                .map(|entry| entry.package_id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(ResolveError::Other(format!(
+                "crate '{crate_name}' matched multiple reachable dependencies of '{}': {candidates}",
                 source_package.name
             )))
         }
@@ -391,13 +480,17 @@ pub(crate) fn library_target(package: &Package) -> Result<&Target, String> {
     package
         .targets
         .iter()
-        .find(|target| {
-            target
-                .kind
-                .iter()
-                .any(|kind| kind == "lib" || kind == "proc-macro")
-        })
+        .find(|target| is_library_target(target))
         .ok_or_else(|| format!("package {} has no doc-able library target", package.name))
+}
+
+pub(crate) fn is_library_target(target: &Target) -> bool {
+    target.kind.iter().any(|kind| {
+        matches!(
+            kind.as_str(),
+            "lib" | "rlib" | "dylib" | "cdylib" | "staticlib" | "proc-macro"
+        )
+    })
 }
 
 pub(crate) fn package_spec(package: &Package) -> String {
@@ -489,6 +582,26 @@ edition = "2024"
         let dep = resolve_dependency(&metadata.packages, &deps, "cargo_metadata").unwrap();
         assert_eq!(dep.package.name, "cargo_metadata");
         assert!(library_target(dep.package).is_ok());
+    }
+
+    #[test]
+    fn recognizes_every_cargo_library_crate_type() {
+        let metadata = metadata();
+        let mut target = metadata
+            .packages
+            .iter()
+            .find(|package| package.name == "cargo_metadata")
+            .unwrap()
+            .targets[0]
+            .clone();
+
+        for kind in ["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"] {
+            target.kind = vec![kind.into()];
+            assert!(is_library_target(&target), "{kind}");
+        }
+        target.kind = vec!["example".into()];
+        target.crate_types = vec!["rlib".into()];
+        assert!(!is_library_target(&target));
     }
 
     #[test]

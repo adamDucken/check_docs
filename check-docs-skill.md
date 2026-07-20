@@ -12,12 +12,15 @@ It reports:
 - rustdoc JSON/source location
 - item kind/name, including modules
 - absolute file + line where declared when available
-- definition/signature
+- definition/signature, including higher-ranked function-pointer binders
 - deprecation details (`since` and `note`) when present
 - semantic attributes: `repr`, `non_exhaustive`, and `must_use`
-- struct/union fields, plus `private/stripped` note when fields are hidden
-- enum variants
-- trait associated items
+- struct/union fields with their Rust visibility, plus `private/stripped` note
+  when fields are hidden
+- enum variants, including explicit discriminants
+- trait associated items, including provided associated-constant defaults
+- constant and static initializers when Rustdoc preserves them; extern statics are
+  labeled with their access safety instead of being shown with an invented initializer
 - derives when Rustdoc exposes them via attrs or derived impls
 - inherent public methods for structs/enums/unions
 - direct non-blanket trait impls
@@ -75,6 +78,8 @@ check-docs 'use tokio::sync::{Mutex, RwLock, Semaphore};' --root .
 - Modules are supported and labeled: `use tokio::sync::watch;` -> `item: module watch`
 - Enum variants are supported: `use facade::Number::One;`
 - Raw identifiers are supported in crate aliases and item paths; their source spelling is preserved.
+- Concrete items behind public external globs and multi-package re-export chains
+  are followed through the resolved Cargo dependency graph.
 
 Unsupported:
 
@@ -157,7 +162,11 @@ the `rustdoc-types 0.56.x` schema.
 - `not a direct dependency`: add dependency to `Cargo.toml` or query from project where it is direct.
 - `Rust standard library`: use <https://doc.rust-lang.org/std/>.
 - `glob imports are not supported`: query concrete item path.
-- `public re-export with unsupported rustdoc external id`: item is re-exported from another crate and full item data is absent from current crate JSON. Add/query the external crate directly if possible.
+- `ambiguous across Rust namespaces`: the import spelling denotes more than one
+  public symbol (for example, a trait and derive macro). Query a namespace-specific
+  canonical path; the tool will not silently choose one rustdoc item.
+- `external branches failed`: the item crossed an external re-export or glob, but
+  no unique reachable normal dependency branch contained the requested concrete item.
 - `failed to generate rustdoc JSON`: install/use the pinned nightly, run `cargo check`, inspect Cargo/Rustdoc stderr.
 - `item not found`: likely wrong path, private item, disabled feature, or unsupported Rustdoc shape.
 - `definition rendering unsupported for ...`: Rustdoc identified the item, but its schema does not contain enough source information to print a trustworthy Rust declaration.

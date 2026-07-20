@@ -1,4 +1,4 @@
-use crate::resolver::package_spec;
+use crate::resolver::{is_library_target, package_spec};
 use cargo_metadata::{Metadata, Package, Target};
 use rustdoc_types::{Crate, FORMAT_VERSION};
 use std::env;
@@ -223,11 +223,7 @@ fn generate_json_with_toolchain(
 }
 
 fn target_selector(target: &Target) -> Result<Vec<String>, String> {
-    if target
-        .kind
-        .iter()
-        .any(|kind| kind == "lib" || kind == "proc-macro")
-    {
+    if is_library_target(target) {
         return Ok(vec!["--lib".to_string()]);
     }
     if target.kind.iter().any(|kind| kind == "bin") {
@@ -453,6 +449,11 @@ mod tests {
 
         target.kind = vec!["proc-macro".into()];
         assert_eq!(target_selector(&target).unwrap(), vec!["--lib"]);
+
+        for kind in ["rlib", "dylib", "cdylib", "staticlib"] {
+            target.kind = vec![kind.into()];
+            assert_eq!(target_selector(&target).unwrap(), vec!["--lib"]);
+        }
 
         target.kind = vec!["bin".into()];
         target.name = "tool".into();

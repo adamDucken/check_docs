@@ -1,6 +1,32 @@
 use cargo_metadata::{DependencyKind, Metadata, Package, PackageId, Target};
 use std::collections::HashMap;
 use std::path::Path;
+use std::{error::Error, fmt};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolveError {
+    NotDirectDependency(String),
+    Other(String),
+}
+
+impl fmt::Display for ResolveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotDirectDependency(message) | Self::Other(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+impl Error for ResolveError {}
+
+#[cfg(test)]
+impl ResolveError {
+    fn contains(&self, needle: &str) -> bool {
+        self.to_string().contains(needle)
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct ResolvedDependency<'a> {
@@ -61,21 +87,8 @@ fn package_by_id<'a>(packages: &'a [Package], package_id: &PackageId) -> Option<
     packages.iter().find(|pkg| &pkg.id == package_id)
 }
 
-fn dependency_matches_crate_name(
-    packages: &[Package],
-    dep: &cargo_metadata::NodeDep,
-    crate_name: &str,
-) -> bool {
-    if normalized_crate_name(&dep.name) == crate_name {
-        return true;
-    }
-    let Some(package) = package_by_id(packages, &dep.pkg) else {
-        return false;
-    };
-    normalized_crate_name(&package.name) == crate_name
-        || library_target(package)
-            .map(|target| normalized_crate_name(&target.name) == crate_name)
-            .unwrap_or(false)
+fn dependency_matches_crate_name(dep: &cargo_metadata::NodeDep, crate_name: &str) -> bool {
+    normalized_crate_name(&dep.name) == crate_name
 }
 
 pub(crate) fn resolve_dependency_from_package<'a>(
@@ -83,27 +96,33 @@ pub(crate) fn resolve_dependency_from_package<'a>(
     packages: &'a [Package],
     source_package: &Package,
     crate_name: &str,
-) -> Result<ResolvedDependency<'a>, String> {
+) -> Result<ResolvedDependency<'a>, ResolveError> {
     let Some(resolve) = metadata.resolve.as_ref() else {
-        return Err("cargo metadata did not include a dependency graph".to_string());
+        return Err(ResolveError::Other(
+            "cargo metadata did not include a dependency graph".to_string(),
+        ));
     };
     let Some(node) = resolve
         .nodes
         .iter()
         .find(|node| node.id == source_package.id)
     else {
-        return Err(format!(
+        return Err(ResolveError::Other(format!(
             "package '{}' missing from cargo metadata dependency graph",
             source_package.name
-        ));
+        )));
     };
 
     let mut matches = Vec::<DependencyEntry>::new();
     for dep in &node.deps {
-        if !dependency_matches_crate_name(packages, dep, crate_name) {
+        if !dependency_matches_crate_name(dep, crate_name) {
             continue;
         }
-        for dep_kind in &dep.dep_kinds {
+        for dep_kind in dep
+            .dep_kinds
+            .iter()
+            .filter(|dep_kind| dep_kind.kind == DependencyKind::Normal)
+        {
             push_dependency_context(
                 &mut matches,
                 dep.pkg.clone(),
@@ -124,22 +143,22 @@ pub(crate) fn resolve_dependency_from_package<'a>(
     package_ids.dedup();
 
     match package_ids.as_slice() {
-        [] => Err(format!(
+        [] => Err(ResolveError::Other(format!(
             "crate '{crate_name}' is not a dependency of direct dependency '{}'",
             source_package.name
-        )),
+        ))),
         [_] => {
             let entry = matches
                 .iter()
                 .find(|entry| entry.package_id == package_ids[0])
                 .expect("entry exists for deduplicated package id");
             let package = package_by_id(packages, &entry.package_id).ok_or_else(|| {
-                format!(
+                ResolveError::Other(format!(
                     "dependency '{crate_name}' of '{}' missing from cargo metadata",
                     source_package.name
-                )
+                ))
             })?;
-            let target = library_target(package)?;
+            let target = library_target(package).map_err(ResolveError::Other)?;
             Ok(ResolvedDependency {
                 package,
                 target,
@@ -152,10 +171,10 @@ pub(crate) fn resolve_dependency_from_package<'a>(
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
-            Err(format!(
+            Err(ResolveError::Other(format!(
                 "crate '{crate_name}' matched multiple dependencies of '{}': {candidates}",
                 source_package.name
-            ))
+            )))
         }
     }
 }
@@ -229,7 +248,10 @@ fn dependency_kind_order(kind: DependencyKind) -> u8 {
 }
 
 pub(crate) fn is_rust_library_crate(crate_name: &str) -> bool {
-    matches!(crate_name, "std" | "core" | "alloc")
+    matches!(
+        crate::imports::identifier_key(crate_name),
+        "std" | "core" | "alloc"
+    )
 }
 
 pub(crate) fn select_package<'a>(
@@ -325,11 +347,12 @@ pub(crate) fn resolve_dependency<'a>(
     packages: &'a [Package],
     dependencies: &DependencyIndex,
     crate_name: &str,
-) -> Result<ResolvedDependency<'a>, String> {
+) -> Result<ResolvedDependency<'a>, ResolveError> {
+    let crate_name = crate::imports::identifier_key(crate_name);
     let Some(entries) = dependencies.entries.get(crate_name) else {
-        return Err(format!(
+        return Err(ResolveError::NotDirectDependency(format!(
             "crate '{crate_name}' is not a direct dependency of the selected package"
-        ));
+        )));
     };
     if entries.len() > 1 {
         let candidates = entries
@@ -345,15 +368,18 @@ pub(crate) fn resolve_dependency<'a>(
             })
             .collect::<Vec<_>>()
             .join(", ");
-        return Err(format!(
+        return Err(ResolveError::Other(format!(
             "crate '{crate_name}' matched multiple direct dependencies: {candidates}"
-        ));
+        )));
     }
     let entry = &entries[0];
 
-    let package = package_by_id(packages, &entry.package_id)
-        .ok_or_else(|| format!("direct dependency '{crate_name}' missing from cargo metadata"))?;
-    let target = library_target(package)?;
+    let package = package_by_id(packages, &entry.package_id).ok_or_else(|| {
+        ResolveError::Other(format!(
+            "direct dependency '{crate_name}' missing from cargo metadata"
+        ))
+    })?;
+    let target = library_target(package).map_err(ResolveError::Other)?;
     Ok(ResolvedDependency {
         package,
         target,
@@ -595,6 +621,91 @@ edition = "2024"
         assert_eq!(
             serde_core.contexts[0].label(),
             "transitive via serde (normal)"
+        );
+    }
+
+    #[test]
+    fn transitive_resolution_uses_normal_effective_extern_names_only() {
+        let workspace = TempDir::new().unwrap();
+        for member in ["source", "normal_pkg", "dev_origin"] {
+            fs::create_dir_all(workspace.path().join(member).join("src")).unwrap();
+            fs::write(workspace.path().join(member).join("src/lib.rs"), "").unwrap();
+        }
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            r#"
+[workspace]
+members = ["source", "normal_pkg", "dev_origin"]
+resolver = "3"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("source/Cargo.toml"),
+            r#"
+[package]
+name = "source"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies.origin]
+package = "normal_pkg"
+path = "../normal_pkg"
+
+[dev-dependencies.dev_origin]
+package = "origin"
+path = "../dev_origin"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("normal_pkg/Cargo.toml"),
+            r#"
+[package]
+name = "normal_pkg"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "origin"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("dev_origin/Cargo.toml"),
+            r#"
+[package]
+name = "origin"
+version = "0.2.0"
+edition = "2024"
+"#,
+        )
+        .unwrap();
+
+        let metadata = MetadataCommand::new()
+            .manifest_path(workspace.path().join("Cargo.toml"))
+            .exec()
+            .unwrap();
+        let source = metadata
+            .packages
+            .iter()
+            .find(|package| package.name == "source")
+            .unwrap();
+
+        let resolved =
+            resolve_dependency_from_package(&metadata, &metadata.packages, source, "origin")
+                .unwrap();
+        assert_eq!(resolved.package.name, "normal_pkg");
+        assert_eq!(resolved.contexts.len(), 1);
+        assert_eq!(resolved.contexts[0].kind, DependencyKind::Normal);
+
+        assert!(
+            resolve_dependency_from_package(&metadata, &metadata.packages, source, "normal_pkg")
+                .is_err()
+        );
+        assert!(
+            resolve_dependency_from_package(&metadata, &metadata.packages, source, "dev_origin")
+                .is_err()
         );
     }
 

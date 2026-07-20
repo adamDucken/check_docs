@@ -8,14 +8,15 @@ use cargo_metadata::{Metadata, MetadataCommand, Package, PackageId, Target};
 use cli::{ParsedCommand, parse_command};
 use imports::ImportPath;
 use resolver::{
-    DependencyContext, DependencyFilter, is_rust_library_crate, package_dependencies,
+    DependencyContext, DependencyFilter, ResolveError, is_rust_library_crate, package_dependencies,
     resolve_dependency, resolve_dependency_from_package, select_package,
 };
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
-use symbols::{SymbolDoc, SymbolReport};
+use std::sync::Arc;
+use symbols::{SymbolDoc, SymbolError, SymbolReport};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RustdocCacheKey {
@@ -24,7 +25,8 @@ struct RustdocCacheKey {
     target_triple: Option<String>,
 }
 
-type RustdocCache = HashMap<RustdocCacheKey, (rustdoc_types::Crate, PathBuf)>;
+type LoadedDocs = (Arc<rustdoc_types::Crate>, PathBuf);
+type RustdocCache = HashMap<RustdocCacheKey, LoadedDocs>;
 
 #[derive(Debug)]
 struct OutputReport {
@@ -99,7 +101,8 @@ fn run() -> Result<(), String> {
         if index > 0 {
             println!();
         }
-        let dep = resolve_dependency(&metadata.packages, &root_dependencies, &import.crate_name)?;
+        let dep = resolve_dependency(&metadata.packages, &root_dependencies, &import.crate_name)
+            .map_err(|err| err.to_string())?;
         let (krate, json_path) = load_docs_cached(
             &mut rustdoc_cache,
             &manifest_path,
@@ -137,7 +140,7 @@ fn run() -> Result<(), String> {
                     let external_dep =
                         match resolve_dependency(&metadata.packages, &root_dependencies, &external.crate_name) {
                             Ok(dep) => dep,
-                            Err(dep_err) if dep_err.contains("not a direct dependency") => {
+                            Err(ResolveError::NotDirectDependency(_)) => {
                                 resolve_dependency_from_package(
                                     &metadata,
                                     &metadata.packages,
@@ -176,7 +179,8 @@ fn run() -> Result<(), String> {
                         )?
                     } else {
                         SymbolReport {
-                            imported: symbols::format_crate_root(&external_krate)?,
+                            imported: symbols::format_crate_root(&external_krate)
+                                .map_err(|err| err.to_string())?,
                             resolved: None,
                         }
                     };
@@ -241,19 +245,20 @@ fn load_docs_cached(
     package: &Package,
     target: &Target,
     target_triple: Option<&str>,
-) -> Result<(rustdoc_types::Crate, PathBuf), String> {
+) -> Result<LoadedDocs, String> {
     let key = rustdoc_cache_key(package, target, target_triple);
     if let Some(cached) = cache.get(&key) {
         return Ok(cached.clone());
     }
 
-    let loaded = rustdoc_json::load_or_generate(
+    let (krate, json_path) = rustdoc_json::load_or_generate(
         manifest_path.to_path_buf(),
         metadata,
         package,
         target,
         target_triple,
     )?;
+    let loaded = (Arc::new(krate), json_path);
     cache.insert(key, loaded.clone());
     Ok(loaded)
 }
@@ -384,7 +389,7 @@ fn not_found_message(
     crate_name: &str,
     version: Option<&str>,
     source: &Path,
-    context: Option<&str>,
+    context: Option<&SymbolError>,
 ) -> String {
     let crate_label = if let Some(version) = version {
         format!("{crate_name} {version}")
@@ -407,7 +412,7 @@ fn not_found_message(
         return message;
     };
 
-    if context.contains("external re-export") {
+    if matches!(context, SymbolError::ExternalReexport(_)) {
         return format!(
             "item '{}' is a public re-export with unsupported rustdoc external id in {} ({}): {}; query/add the external crate directly if available",
             import.item,
@@ -596,6 +601,74 @@ mod tests {
         assert!(rendered.starts_with("crate: x\n"));
         assert!(rendered.contains("docs: (none)\n"));
         assert!(rendered.contains("resolved item: struct ResolvedThing\n"));
+    }
+
+    #[test]
+    fn output_preserves_markdown_indentation_and_blank_lines() {
+        let output = OutputReport {
+            crate_name: "x".into(),
+            version: None,
+            dependency: dependency_context().label(),
+            target_triple: "x86_64-unknown-linux-gnu".into(),
+            source: PathBuf::from("/tmp/src"),
+            import_line: "use x::Thing;".into(),
+            symbols: report(doc(
+                "Thing",
+                vec![
+                    "First paragraph.".into(),
+                    "".into(),
+                    "- parent".into(),
+                    "  - child".into(),
+                ],
+            )),
+        };
+
+        assert!(
+            render_report(&output)
+                .contains("docs:\n  First paragraph.\n  \n  - parent\n    - child\n")
+        );
+    }
+
+    #[test]
+    fn typed_not_found_classification_does_not_promote_glob_diagnostics() {
+        let import = ImportPath {
+            crate_name: "facade".into(),
+            segments: vec![],
+            item: "Missing".into(),
+        };
+        let error = SymbolError::NotFound(
+            "glob branches failed: external re-export target unavailable".into(),
+        );
+        let message = not_found_message(
+            &import,
+            "facade",
+            Some("1.0.0"),
+            Path::new("/tmp/facade.json"),
+            Some(&error),
+        );
+        assert!(message.starts_with("item 'Missing' not found"));
+        assert!(!message.contains("is a public re-export"));
+    }
+
+    #[test]
+    fn cache_entries_share_the_rustdoc_graph() {
+        let docs = Arc::new(root_mac_crate());
+        let key = RustdocCacheKey {
+            package_id: PackageId {
+                repr: "path+file:///fixture#1.0.0".into(),
+            },
+            target_name: "fixture".into(),
+            target_triple: None,
+        };
+        let mut cache = RustdocCache::new();
+        cache.insert(
+            key.clone(),
+            (Arc::clone(&docs), PathBuf::from("fixture.json")),
+        );
+        let (cached, _) = cache.get(&key).unwrap().clone();
+
+        assert!(Arc::ptr_eq(&docs, &cached));
+        assert_eq!(Arc::strong_count(&docs), 3);
     }
 
     #[test]

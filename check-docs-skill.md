@@ -11,7 +11,7 @@ It reports:
 - crate name + exact resolved version
 - rustdoc JSON/source location
 - item kind/name, including modules
-- file + line where declared when available
+- absolute file + line where declared when available
 - definition/signature
 - deprecation details (`since` and `note`) when present
 - semantic attributes: `repr`, `non_exhaustive`, and `must_use`
@@ -73,6 +73,8 @@ check-docs 'use tokio::sync::{Mutex, RwLock, Semaphore};' --root .
 - Renamed imports resolve original item: `use syn::File as SynFile;`
 - `self` imports inside non-root braces: `use tokio::sync::{self, mpsc};`
 - Modules are supported and labeled: `use tokio::sync::watch;` -> `item: module watch`
+- Enum variants are supported: `use facade::Number::One;`
+- Raw identifiers are supported in crate aliases and item paths; their source spelling is preserved.
 
 Unsupported:
 
@@ -85,7 +87,7 @@ Unsupported:
 `check-docs` runs Rustdoc through Cargo for the target project:
 
 ```bash
-cargo +nightly rustdoc -p <dependency>@<version> --manifest-path <root>/Cargo.toml -- -Z unstable-options --output-format json
+cargo +nightly-2025-09-10 rustdoc -p <dependency>@<version> --manifest-path <root>/Cargo.toml -- -Z unstable-options --output-format json
 ```
 
 Consequences:
@@ -123,19 +125,21 @@ check-docs 'use tokio::sync::mpsc::Sender;' --root .
 
 ## Nightly requirement
 
-Rustdoc JSON requires nightly. If command fails with missing toolchain:
+Rustdoc JSON requires the nightly pinned in `rust-toolchain.toml`, kept in sync
+with `rustdoc-types 0.56.x`. Install it with:
 
 ```bash
-rustup toolchain install nightly
+rustup toolchain install nightly-2025-09-10 --component rustfmt clippy llvm-tools-preview
 ```
 
 Or set:
 
 ```bash
-CHECK_DOCS_TOOLCHAIN=<toolchain> check-docs 'use crate::Item;' --root .
+CHECK_DOCS_TOOLCHAIN=<toolchain> check-docs 'use dependency::Item;' --root .
 ```
 
-Use a nightly compatible with the pinned `rustdoc-types` schema.
+`CHECK_DOCS_TOOLCHAIN` is an advanced override; the selected toolchain must emit
+the `rustdoc-types 0.56.x` schema.
 
 ## Agent workflow
 
@@ -154,8 +158,9 @@ Use a nightly compatible with the pinned `rustdoc-types` schema.
 - `Rust standard library`: use <https://doc.rust-lang.org/std/>.
 - `glob imports are not supported`: query concrete item path.
 - `public re-export with unsupported rustdoc external id`: item is re-exported from another crate and full item data is absent from current crate JSON. Add/query the external crate directly if possible.
-- `failed to generate rustdoc JSON`: install/use nightly, run `cargo check`, inspect Cargo/Rustdoc stderr.
+- `failed to generate rustdoc JSON`: install/use the pinned nightly, run `cargo check`, inspect Cargo/Rustdoc stderr.
 - `item not found`: likely wrong path, private item, disabled feature, or unsupported Rustdoc shape.
+- `definition rendering unsupported for ...`: Rustdoc identified the item, but its schema does not contain enough source information to print a trustworthy Rust declaration.
 
 ## Best practices
 

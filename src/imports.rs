@@ -7,6 +7,10 @@ pub(crate) struct ImportPath {
     pub(crate) item: String,
 }
 
+pub(crate) fn identifier_key(name: &str) -> &str {
+    name.strip_prefix("r#").unwrap_or(name)
+}
+
 #[cfg(test)]
 impl ImportPath {
     pub(crate) fn full_path(&self) -> String {
@@ -133,6 +137,15 @@ mod tests {
 
         let import = parse_use_line("use syn::ItemUse").unwrap();
         assert_eq!(import.full_path(), "syn::ItemUse");
+    }
+
+    #[test]
+    fn preserves_raw_spelling_and_exposes_unraw_lookup_key() {
+        let import = parse_use_line("use r#type::r#match::r#loop;").unwrap();
+        assert_eq!(import.full_path(), "r#type::r#match::r#loop");
+        assert_eq!(identifier_key(&import.crate_name), "type");
+        assert_eq!(identifier_key(&import.segments[0]), "match");
+        assert_eq!(identifier_key(&import.item), "loop");
     }
 
     #[test]

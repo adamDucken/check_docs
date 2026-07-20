@@ -2,15 +2,15 @@ use crate::resolver::package_spec;
 use cargo_metadata::{Metadata, Package, Target};
 use rustdoc_types::{Crate, FORMAT_VERSION};
 use std::env;
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
-const LOCK_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
+const PINNED_TOOLCHAIN: &str = "nightly-2025-09-10";
 
 pub(crate) fn load_or_generate(
     manifest_path: PathBuf,
@@ -19,6 +19,16 @@ pub(crate) fn load_or_generate(
     target: &Target,
     target_triple: Option<&str>,
 ) -> Result<(Crate, PathBuf), String> {
+    let manifest_path = manifest_path.canonicalize().map_err(|err| {
+        format!(
+            "failed to resolve manifest path {}: {err}",
+            manifest_path.display()
+        )
+    })?;
+    let invocation_dir = manifest_path
+        .parent()
+        .ok_or_else(|| format!("manifest path {} has no parent", manifest_path.display()))?
+        .to_path_buf();
     let mut doc_dir = metadata.target_directory.as_std_path().to_path_buf();
     if let Some(target_triple) = target_triple {
         doc_dir.push(target_triple);
@@ -31,25 +41,22 @@ pub(crate) fn load_or_generate(
     // Always regenerate. Existing JSON does not encode enough of Cargo's resolved state
     // to prove it matches the selected package's current features/source graph.
     generate_json(manifest_path, package, target, target_triple)?;
-    let krate = load_valid_json(&json_path, package)?;
+    let mut krate = load_valid_json(&json_path, package)?;
+    normalize_span_paths(&mut krate, &invocation_dir);
     Ok((krate, json_path))
 }
 
 #[derive(Debug)]
 struct JsonGenerationLock {
-    path: PathBuf,
+    _file: File,
 }
 
 impl JsonGenerationLock {
     fn acquire(path: PathBuf) -> Result<Self, String> {
-        Self::acquire_with_options(path, LOCK_WAIT_TIMEOUT, LOCK_STALE_AFTER)
+        Self::acquire_with_timeout(path, LOCK_WAIT_TIMEOUT)
     }
 
-    fn acquire_with_options(
-        path: PathBuf,
-        wait_timeout: Duration,
-        stale_after: Duration,
-    ) -> Result<Self, String> {
+    fn acquire_with_timeout(path: PathBuf, wait_timeout: Duration) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
                 format!(
@@ -60,26 +67,27 @@ impl JsonGenerationLock {
         }
         let deadline = Instant::now() + wait_timeout;
         loop {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut file) => {
-                    file.write_all(lock_metadata().as_bytes()).map_err(|err| {
-                        format!(
-                            "failed to write rustdoc JSON lock metadata {}: {err}",
-                            path.display()
-                        )
-                    })?;
-                    return Ok(Self { path });
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .map_err(|err| {
+                    format!("failed to open rustdoc JSON lock {}: {err}", path.display())
+                })?;
+            match file.try_lock() {
+                Ok(()) => {
+                    write_lock_metadata(&mut file, &path)?;
+                    return Ok(Self { _file: file });
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if recover_stale_lock(&path, stale_after)? {
-                        continue;
-                    }
+                Err(TryLockError::WouldBlock) => {
                     if Instant::now() >= deadline {
                         return Err(lock_timeout_message(&path));
                     }
                     thread::sleep(Duration::from_millis(50));
                 }
-                Err(err) => {
+                Err(TryLockError::Error(err)) => {
                     return Err(format!(
                         "failed to acquire rustdoc JSON lock {}: {err}",
                         path.display()
@@ -88,6 +96,27 @@ impl JsonGenerationLock {
             }
         }
     }
+}
+
+fn write_lock_metadata(file: &mut File, path: &Path) -> Result<(), String> {
+    file.set_len(0).map_err(|err| {
+        format!(
+            "failed to truncate rustdoc JSON lock metadata {}: {err}",
+            path.display()
+        )
+    })?;
+    file.rewind().map_err(|err| {
+        format!(
+            "failed to seek rustdoc JSON lock metadata {}: {err}",
+            path.display()
+        )
+    })?;
+    file.write_all(lock_metadata().as_bytes()).map_err(|err| {
+        format!(
+            "failed to write rustdoc JSON lock metadata {}: {err}",
+            path.display()
+        )
+    })
 }
 
 fn lock_metadata() -> String {
@@ -105,41 +134,21 @@ fn current_unix_secs() -> u64 {
         .as_secs()
 }
 
-fn recover_stale_lock(path: &PathBuf, stale_after: Duration) -> Result<bool, String> {
-    let text = fs::read_to_string(path).unwrap_or_default();
-    let Some(created) = parse_lock_created_secs(&text) else {
-        return Ok(false);
-    };
-    let age_secs = current_unix_secs().saturating_sub(created);
-    if age_secs < stale_after.as_secs() {
-        return Ok(false);
-    }
-    match fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(err) => Err(format!(
-            "failed to remove stale rustdoc JSON lock {}: {err}",
-            path.display()
-        )),
-    }
-}
-
-fn parse_lock_created_secs(text: &str) -> Option<u64> {
-    text.lines()
-        .find_map(|line| line.strip_prefix("created_unix_secs="))
-        .and_then(|value| value.trim().parse().ok())
-}
-
 fn lock_timeout_message(path: &Path) -> String {
     format!(
-        "timed out waiting for rustdoc JSON lock {}; if no cargo rustdoc process is running, remove this stale lock file and retry",
+        "timed out waiting for the active rustdoc JSON lock {}",
         path.display()
     )
 }
 
-impl Drop for JsonGenerationLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+fn normalize_span_paths(krate: &mut Crate, invocation_dir: &Path) {
+    for item in krate.index.values_mut() {
+        let Some(span) = item.span.as_mut() else {
+            continue;
+        };
+        if span.filename.is_relative() {
+            span.filename = invocation_dir.join(&span.filename);
+        }
     }
 }
 
@@ -171,7 +180,8 @@ fn generate_json(
     target: &Target,
     target_triple: Option<&str>,
 ) -> Result<(), String> {
-    let toolchain = env::var("CHECK_DOCS_TOOLCHAIN").unwrap_or_else(|_| "nightly".to_string());
+    let toolchain =
+        env::var("CHECK_DOCS_TOOLCHAIN").unwrap_or_else(|_| PINNED_TOOLCHAIN.to_string());
     generate_json_with_toolchain(manifest_path, package, target, target_triple, &toolchain)
 }
 
@@ -185,6 +195,12 @@ fn generate_json_with_toolchain(
     let spec = package_spec(package);
     let selector = target_selector(target)?;
     let mut command = Command::new("cargo");
+    if let Some(invocation_dir) = manifest_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        command.current_dir(invocation_dir);
+    }
     command
         .arg(format!("+{toolchain}"))
         .args(["rustdoc", "--manifest-path"])
@@ -199,7 +215,7 @@ fn generate_json_with_toolchain(
         .output()
         .map_err(|err| {
             format!(
-                "failed to run cargo +{toolchain} rustdoc for {} {}: {err}; install nightly with `rustup toolchain install nightly` or set CHECK_DOCS_TOOLCHAIN",
+                "failed to run cargo +{toolchain} rustdoc for {} {}: {err}; install the pinned toolchain with `rustup toolchain install {PINNED_TOOLCHAIN}` or set CHECK_DOCS_TOOLCHAIN",
                 package.name, package.version
             )
         })?;
@@ -246,7 +262,7 @@ fn handle_generate_output(
 
 fn format_generate_error(package: &Package, _toolchain: &str, stderr: &str) -> String {
     let hint = if stderr.contains("toolchain") || stderr.contains("not installed") {
-        "; nightly toolchain not found; install with `rustup toolchain install nightly` or set CHECK_DOCS_TOOLCHAIN"
+        "; compatible nightly toolchain not found; install with `rustup toolchain install nightly-2025-09-10` or set CHECK_DOCS_TOOLCHAIN"
     } else if stderr.contains("unstable-options") || stderr.contains("output-format") {
         "; rustdoc JSON requires nightly and `-Z unstable-options`"
     } else {
@@ -422,6 +438,12 @@ mod tests {
     }
 
     #[test]
+    fn default_toolchain_matches_the_repository_pin() {
+        let toolchain_file = include_str!("../rust-toolchain.toml");
+        assert!(toolchain_file.contains(&format!("channel = \"{PINNED_TOOLCHAIN}\"")));
+    }
+
+    #[test]
     fn target_selector_filters_cargo_rustdoc_to_one_target() {
         let pkg = package();
         let mut target = pkg.targets[0].clone();
@@ -460,68 +482,65 @@ mod tests {
     }
 
     #[test]
-    fn lock_writes_metadata_and_removes_file_on_drop() {
+    fn lock_writes_metadata_and_releases_exclusive_lock_on_drop() {
         let dir = tempfile::TempDir::new().unwrap();
         let lock_path = dir.path().join("crate.json.lock");
-        {
-            let _lock = JsonGenerationLock::acquire_with_options(
-                lock_path.clone(),
-                Duration::ZERO,
-                Duration::from_secs(600),
+        let first =
+            JsonGenerationLock::acquire_with_timeout(lock_path.clone(), Duration::ZERO).unwrap();
+        let text = fs::read_to_string(&lock_path).unwrap();
+        assert!(text.contains("pid="));
+        assert!(text.contains("created_unix_secs="));
+
+        let err = JsonGenerationLock::acquire_with_timeout(lock_path.clone(), Duration::ZERO)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "timed out waiting for the active rustdoc JSON lock {}",
+                lock_path.display()
             )
-            .unwrap();
-            let text = fs::read_to_string(&lock_path).unwrap();
-            assert!(text.contains("pid="));
-            assert!(text.contains("created_unix_secs="));
-        }
-        assert!(!lock_path.exists());
+        );
+
+        drop(first);
+        assert!(JsonGenerationLock::acquire_with_timeout(lock_path, Duration::ZERO).is_ok());
     }
 
     #[test]
-    fn lock_timeout_reports_remediation_for_fresh_or_malformed_lock() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let fresh = dir.path().join("fresh.json.lock");
-        fs::write(
-            &fresh,
-            format!("pid=1\ncreated_unix_secs={}\n", super::current_unix_secs()),
-        )
-        .unwrap();
-        let err = JsonGenerationLock::acquire_with_options(
-            fresh.clone(),
-            Duration::ZERO,
-            Duration::from_secs(600),
-        )
-        .unwrap_err();
-        assert!(err.contains(&fresh.display().to_string()));
-        assert!(err.contains("remove this stale lock file"));
-        assert!(fresh.exists());
-
-        let malformed = dir.path().join("malformed.json.lock");
-        fs::write(&malformed, "not metadata").unwrap();
-        let err = JsonGenerationLock::acquire_with_options(
-            malformed.clone(),
-            Duration::ZERO,
-            Duration::from_secs(600),
-        )
-        .unwrap_err();
-        assert!(err.contains("remove this stale lock file"));
-        assert!(malformed.exists());
-    }
-
-    #[test]
-    fn lock_recovers_stale_metadata() {
+    fn lock_ignores_stale_or_malformed_metadata_when_no_owner_is_active() {
         let dir = tempfile::TempDir::new().unwrap();
         let lock_path = dir.path().join("stale.json.lock");
-        fs::write(&lock_path, "pid=1\ncreated_unix_secs=1\n").unwrap();
-        let lock = JsonGenerationLock::acquire_with_options(
-            lock_path.clone(),
-            Duration::ZERO,
-            Duration::from_secs(1),
-        )
-        .unwrap();
+        fs::write(&lock_path, "not metadata").unwrap();
+        let _lock =
+            JsonGenerationLock::acquire_with_timeout(lock_path.clone(), Duration::ZERO).unwrap();
         let text = fs::read_to_string(&lock_path).unwrap();
         assert!(text.contains(&format!("pid={}", std::process::id())));
-        drop(lock);
-        assert!(!lock_path.exists());
+        assert!(!text.contains("not metadata"));
+    }
+
+    #[test]
+    fn metadata_write_failure_does_not_leave_an_owned_lock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let lock_path = dir.path().join("metadata-error.json.lock");
+        fs::write(&lock_path, "old").unwrap();
+        let mut read_only = File::open(&lock_path).unwrap();
+        assert!(write_lock_metadata(&mut read_only, &lock_path).is_err());
+        drop(read_only);
+
+        assert!(JsonGenerationLock::acquire_with_timeout(lock_path, Duration::ZERO).is_ok());
+    }
+
+    #[test]
+    fn relative_rustdoc_spans_are_normalized_against_invocation_directory() {
+        let mut krate = minimal_crate(None, FORMAT_VERSION);
+        krate.index.get_mut(&krate.root).unwrap().span = Some(rustdoc_types::Span {
+            filename: PathBuf::from("dep/src/lib.rs"),
+            begin: (7, 1),
+            end: (7, 2),
+        });
+        normalize_span_paths(&mut krate, Path::new("/workspace"));
+        assert_eq!(
+            krate.index[&krate.root].span.as_ref().unwrap().filename,
+            PathBuf::from("/workspace/dep/src/lib.rs")
+        );
     }
 }

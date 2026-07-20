@@ -257,6 +257,242 @@ pub struct Annotated {
 }
 
 #[test]
+fn binary_resolves_enum_variants_raw_identifiers_markdown_and_absolute_locations() {
+    let workspace = TempDir::new().unwrap();
+    fs::create_dir_all(workspace.path().join("app/src")).unwrap();
+    fs::create_dir_all(workspace.path().join("raw_dep/src")).unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        r#"
+[workspace]
+members = ["app", "raw_dep"]
+resolver = "3"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("app/Cargo.toml"),
+        r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies.type]
+package = "raw_dep"
+path = "../raw_dep"
+"#,
+    )
+    .unwrap();
+    fs::write(workspace.path().join("app/src/lib.rs"), "").unwrap();
+    fs::write(
+        workspace.path().join("raw_dep/Cargo.toml"),
+        r#"
+[package]
+name = "raw_dep"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("raw_dep/src/lib.rs"),
+        r#"
+pub enum Number {
+    One,
+}
+
+pub mod r#match {
+    pub struct r#type;
+}
+
+#[doc = "First paragraph.\n\n- parent\n  - child\n\n    code"]
+pub struct Documented;
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use r#type::{Number::One, r#match::r#type, Documented};",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("import: use r#type::Number::One;\nitem: variant One\n"));
+    assert!(stdout.contains("definition: One\n"));
+    assert!(stdout.contains("import: use r#type::r#match::r#type;\nitem: struct type\n"));
+    assert!(
+        stdout.contains("docs:\n  First paragraph.\n  \n  - parent\n    - child\n  \n      code\n")
+    );
+    assert!(stdout.contains(&format!(
+        "location: {}/raw_dep/src/lib.rs:",
+        workspace.path().display()
+    )));
+}
+
+#[test]
+fn binary_does_not_misclassify_a_missing_item_beside_an_external_glob() {
+    let workspace = TempDir::new().unwrap();
+    for member in ["app", "facade", "middle"] {
+        fs::create_dir_all(workspace.path().join(member).join("src")).unwrap();
+    }
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        r#"
+[workspace]
+members = ["app", "facade", "middle"]
+resolver = "3"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("app/Cargo.toml"),
+        r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+facade = { path = "../facade" }
+"#,
+    )
+    .unwrap();
+    fs::write(workspace.path().join("app/src/lib.rs"), "").unwrap();
+    fs::write(
+        workspace.path().join("facade/Cargo.toml"),
+        r#"
+[package]
+name = "facade"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+middle = { path = "../middle" }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("facade/src/lib.rs"),
+        "pub use middle::*;\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("middle/Cargo.toml"),
+        r#"
+[package]
+name = "middle"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("middle/src/lib.rs"),
+        "pub struct Present;\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use facade::Missing;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("item 'Missing' not found"), "{stderr}");
+    assert!(!stderr.contains("is a public re-export"), "{stderr}");
+}
+
+#[test]
+fn binary_renders_advanced_item_kinds_without_inventing_definitions() {
+    let workspace = TempDir::new().unwrap();
+    for member in ["app", "advanced"] {
+        fs::create_dir_all(workspace.path().join(member).join("src")).unwrap();
+    }
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        r#"
+[workspace]
+members = ["app", "advanced"]
+resolver = "3"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("app/Cargo.toml"),
+        r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+advanced = { path = "../advanced" }
+"#,
+    )
+    .unwrap();
+    fs::write(workspace.path().join("app/src/lib.rs"), "").unwrap();
+    fs::write(
+        workspace.path().join("advanced/Cargo.toml"),
+        r#"
+[package]
+name = "advanced"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("advanced/src/lib.rs"),
+        r#"
+#![feature(auto_traits, trait_alias)]
+
+pub trait Alias = Send + Sync;
+pub auto trait Marker {}
+pub mod api {}
+"#,
+    )
+    .unwrap();
+    let advanced = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use advanced::{Alias, Marker, api};",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        advanced.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&advanced.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&advanced.stdout);
+    assert!(stdout.contains("definition: pub trait Alias = Send + Sync;\n"));
+    assert!(stdout.contains("definition: pub auto trait Marker { ... }\n"));
+    assert!(stdout.contains("definition: pub mod api;\n"));
+}
+
+#[test]
 fn binary_rejects_bad_import() {
     let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
         .arg("use crate::local::Thing;")

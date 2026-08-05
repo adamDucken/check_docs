@@ -3,3 +3,5 @@ Cargo.lock
 review.md
 AGENTS.md
 agent_loop.py
+serious.md
+serious-state.json

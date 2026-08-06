@@ -89,6 +89,7 @@ pub(crate) struct SymbolReport {
 pub(crate) struct ExternalReexport {
     pub(crate) crate_name: String,
     pub(crate) path: Vec<String>,
+    pub(crate) via_glob: bool,
 }
 
 impl ExternalReexport {
@@ -235,25 +236,22 @@ fn external_candidates(
 
     let direct = direct_matching_children(krate, children, part)?;
     let mut candidates = Vec::new();
-    if !direct.is_empty() {
-        for child_id in direct {
-            match follow_use_or_external(krate, child_id, &mut HashSet::new())? {
-                Followed::External(mut external) => {
-                    external.path.extend(tail.iter().cloned());
-                    push_external_candidate(&mut candidates, external);
-                }
-                Followed::Local(id) if !tail.is_empty() => {
-                    if item(krate, id).is_ok_and(is_path_container) {
-                        let mut branch_visited = visited.clone();
-                        for external in external_candidates(krate, id, tail, &mut branch_visited)? {
-                            push_external_candidate(&mut candidates, external);
-                        }
+    for child_id in direct {
+        match follow_use_or_external(krate, child_id, &mut HashSet::new())? {
+            Followed::External(mut external) => {
+                external.path.extend(tail.iter().cloned());
+                push_external_candidate(&mut candidates, external);
+            }
+            Followed::Local(id) if !tail.is_empty() => {
+                if item(krate, id).is_ok_and(is_path_container) {
+                    let mut branch_visited = visited.clone();
+                    for external in external_candidates(krate, id, tail, &mut branch_visited)? {
+                        push_external_candidate(&mut candidates, external);
                     }
                 }
-                Followed::Local(_) => {}
             }
+            Followed::Local(_) => {}
         }
-        return Ok(candidates);
     }
 
     for child_id in children {
@@ -270,12 +268,15 @@ fn external_candidates(
         match follow_use_or_external(krate, glob_id, &mut HashSet::new())? {
             Followed::External(mut external) => {
                 external.path.extend(parts.iter().cloned());
+                external.via_glob = true;
                 push_external_candidate(&mut candidates, external);
             }
             Followed::Local(id) => {
                 if item(krate, id).is_ok_and(is_path_container) {
                     let mut branch_visited = visited.clone();
-                    for external in external_candidates(krate, id, parts, &mut branch_visited)? {
+                    for mut external in external_candidates(krate, id, parts, &mut branch_visited)?
+                    {
+                        external.via_glob = true;
                         push_external_candidate(&mut candidates, external);
                     }
                 }
@@ -337,6 +338,7 @@ fn external_from_id(krate: &Crate, id: Id) -> Option<ExternalReexport> {
     Some(ExternalReexport {
         crate_name: external.name.clone(),
         path,
+        via_glob: false,
     })
 }
 
@@ -366,7 +368,7 @@ fn find_child(
 
     let direct_matches = direct_matching_children(krate, children, name)?;
     match direct_matches.as_slice() {
-        [child_id] => return Ok(*child_id),
+        [_] => {}
         [] => {}
         _ => return Err(ambiguous_symbol(krate, name, &direct_matches)),
     }
@@ -423,6 +425,23 @@ fn find_child(
         }
     }
 
+    if let [direct] = direct_matches.as_slice() {
+        let direct_namespaces = item_namespaces(krate, *direct)?;
+        let distinct_globs = glob_matches
+            .into_iter()
+            .filter(|glob| {
+                item_namespaces(krate, *glob)
+                    .is_ok_and(|namespaces| namespaces & direct_namespaces == 0)
+            })
+            .collect::<Vec<_>>();
+        if distinct_globs.is_empty() {
+            return Ok(*direct);
+        }
+        let mut candidates = vec![*direct];
+        candidates.extend(distinct_globs);
+        return Err(ambiguous_symbol(krate, name, &candidates));
+    }
+
     match glob_matches.as_slice() {
         [child_id] => return Ok(*child_id),
         [] => {}
@@ -435,6 +454,106 @@ fn find_child(
         message.push_str(&glob_errors.join("; "));
     }
     Err(SymbolError::NotFound(message))
+}
+
+const TYPE_NAMESPACE: u8 = 1;
+const VALUE_NAMESPACE: u8 = 2;
+const MACRO_NAMESPACE: u8 = 4;
+
+fn item_namespaces(krate: &Crate, id: Id) -> Result<u8, SymbolError> {
+    item_namespaces_inner(krate, id, &mut HashSet::new())
+}
+
+fn item_namespaces_inner(
+    krate: &Crate,
+    id: Id,
+    visited: &mut HashSet<Id>,
+) -> Result<u8, SymbolError> {
+    if !visited.insert(id) {
+        return Err(SymbolError::InvalidRustdoc(
+            "cycle while determining Rust namespace".to_string(),
+        ));
+    }
+    if let Some(summary) = krate.paths.get(&id) {
+        return Ok(item_kind_namespaces(summary.kind));
+    }
+    let item = item(krate, id)?;
+    Ok(match &item.inner {
+        ItemEnum::Module(_)
+        | ItemEnum::Union(_)
+        | ItemEnum::Enum(_)
+        | ItemEnum::Trait(_)
+        | ItemEnum::TraitAlias(_)
+        | ItemEnum::TypeAlias(_)
+        | ItemEnum::ExternType
+        | ItemEnum::Primitive(_)
+        | ItemEnum::AssocType { .. } => TYPE_NAMESPACE,
+        ItemEnum::Struct(_) => TYPE_NAMESPACE | VALUE_NAMESPACE,
+        ItemEnum::Function(_)
+        | ItemEnum::StructField(_)
+        | ItemEnum::Variant(_)
+        | ItemEnum::Constant { .. }
+        | ItemEnum::Static(_)
+        | ItemEnum::AssocConst { .. } => VALUE_NAMESPACE,
+        ItemEnum::Macro(_) | ItemEnum::ProcMacro(_) => MACRO_NAMESPACE,
+        ItemEnum::Use(use_item) => use_item
+            .id
+            .map(|id| item_namespaces_inner(krate, id, visited))
+            .transpose()?
+            .unwrap_or(TYPE_NAMESPACE | VALUE_NAMESPACE | MACRO_NAMESPACE),
+        ItemEnum::ExternCrate { .. } => TYPE_NAMESPACE,
+        ItemEnum::Impl(_) => 0,
+    })
+}
+
+fn item_kind_namespaces(kind: rustdoc_types::ItemKind) -> u8 {
+    use rustdoc_types::ItemKind;
+    match kind {
+        ItemKind::Module
+        | ItemKind::ExternCrate
+        | ItemKind::Union
+        | ItemKind::Enum
+        | ItemKind::Trait
+        | ItemKind::TraitAlias
+        | ItemKind::TypeAlias
+        | ItemKind::ExternType
+        | ItemKind::Primitive
+        | ItemKind::AssocType => TYPE_NAMESPACE,
+        ItemKind::Struct => TYPE_NAMESPACE | VALUE_NAMESPACE,
+        ItemKind::StructField
+        | ItemKind::Variant
+        | ItemKind::Function
+        | ItemKind::Constant
+        | ItemKind::Static
+        | ItemKind::AssocConst => VALUE_NAMESPACE,
+        ItemKind::Macro | ItemKind::ProcAttribute | ItemKind::ProcDerive | ItemKind::Attribute => {
+            MACRO_NAMESPACE
+        }
+        ItemKind::Use | ItemKind::Impl | ItemKind::Keyword => 0,
+    }
+}
+
+fn symbol_namespaces(symbol: &SymbolDoc) -> u8 {
+    match symbol.kind {
+        "struct" => TYPE_NAMESPACE | VALUE_NAMESPACE,
+        "module" | "union" | "enum" | "trait" | "trait alias" | "type" | "extern type"
+        | "primitive" | "assoc type" | "extern crate" => TYPE_NAMESPACE,
+        "fn" | "field" | "variant" | "const" | "static" | "assoc const" => VALUE_NAMESPACE,
+        "macro" | "proc-attribute" | "proc-derive" | "proc macro" | "attribute macro"
+        | "derive macro" => MACRO_NAMESPACE,
+        _ => 0,
+    }
+}
+
+pub(crate) fn reports_overlap_namespace(left: &SymbolReport, right: &SymbolReport) -> bool {
+    let left = left.resolved.as_ref().unwrap_or(&left.imported);
+    let right = right.resolved.as_ref().unwrap_or(&right.imported);
+    symbol_namespaces(left) & symbol_namespaces(right) != 0
+}
+
+pub(crate) fn report_item_label(report: &SymbolReport) -> String {
+    let item = report.resolved.as_ref().unwrap_or(&report.imported);
+    format!("{} {}", item.kind, item.name)
 }
 
 fn direct_matching_children(
@@ -564,46 +683,77 @@ fn format_item(krate: &Crate, item: &Item) -> SymbolDoc {
         .name
         .clone()
         .unwrap_or_else(|| exported_name(item).unwrap_or_default());
+    let rendered_name = rust_identifier(&name);
     let (kind, definition, details) = match &item.inner {
         ItemEnum::Struct(s) => (
             "struct",
-            struct_def(krate, &name, s),
+            struct_def(krate, &rendered_name, s),
             struct_details(krate, s),
         ),
-        ItemEnum::Enum(e) => ("enum", enum_def(krate, &name, e), enum_details(krate, e)),
-        ItemEnum::Trait(t) => ("trait", trait_def(krate, &name, t), trait_details(krate, t)),
-        ItemEnum::TraitAlias(alias) => ("trait alias", trait_alias_def(&name, alias), Vec::new()),
-        ItemEnum::Function(f) => ("fn", fn_def(&name, f), Vec::new()),
+        ItemEnum::Enum(e) => (
+            "enum",
+            enum_def(krate, &rendered_name, e),
+            enum_details(krate, e),
+        ),
+        ItemEnum::Trait(t) => (
+            "trait",
+            trait_def(krate, &rendered_name, t),
+            trait_details(krate, t),
+        ),
+        ItemEnum::TraitAlias(alias) => (
+            "trait alias",
+            trait_alias_def(&rendered_name, alias),
+            Vec::new(),
+        ),
+        ItemEnum::Function(f) => ("fn", fn_def(&rendered_name, f), Vec::new()),
         ItemEnum::TypeAlias(t) => (
             "type",
             format!(
                 "pub type {}{}{} = {};",
-                name,
+                rendered_name,
                 generics(&t.generics),
                 where_clause(&t.generics),
                 type_str(&t.type_)
             ),
             Vec::new(),
         ),
-        ItemEnum::Constant { type_, const_ } => {
-            ("const", constant_def(&name, type_, const_), Vec::new())
-        }
-        ItemEnum::Static(s) => ("static", static_def(&name, s), Vec::new()),
-        ItemEnum::Union(u) => ("union", union_def(krate, &name, u), union_details(krate, u)),
-        ItemEnum::Variant(variant) => ("variant", variant_def(krate, &name, variant), Vec::new()),
-        ItemEnum::Macro(source) => ("macro", format!("macro_rules! {name} {source}"), Vec::new()),
+        ItemEnum::Constant { type_, const_ } => (
+            "const",
+            constant_def(&rendered_name, type_, const_),
+            Vec::new(),
+        ),
+        ItemEnum::Static(s) => ("static", static_def(&rendered_name, s), Vec::new()),
+        ItemEnum::Union(u) => (
+            "union",
+            union_def(krate, &rendered_name, u),
+            union_details(krate, u),
+        ),
+        ItemEnum::Variant(variant) => (
+            "variant",
+            variant_def(krate, &rendered_name, variant),
+            Vec::new(),
+        ),
+        ItemEnum::Macro(source) => (
+            "macro",
+            if source.trim().is_empty() {
+                "definition rendering unsupported for empty declarative macro source".to_string()
+            } else {
+                source.clone()
+            },
+            Vec::new(),
+        ),
         ItemEnum::ProcMacro(pm) => match pm.kind {
             MacroKind::Bang => (
                 "macro",
                 format!(
-                    "definition rendering unsupported for function-like procedural macro; usage: {name}!(...)"
+                    "definition rendering unsupported for function-like procedural macro; usage: {rendered_name}!(...)"
                 ),
                 Vec::new(),
             ),
             MacroKind::Attr => (
                 "proc-attribute",
                 format!(
-                    "definition rendering unsupported for attribute procedural macro; usage: #[{name}]"
+                    "definition rendering unsupported for attribute procedural macro; usage: #[{rendered_name}]"
                 ),
                 Vec::new(),
             ),
@@ -616,7 +766,7 @@ fn format_item(krate: &Crate, item: &Item) -> SymbolDoc {
                 (
                     "proc-derive",
                     format!(
-                        "definition rendering unsupported for derive procedural macro; usage: #[derive({name})]{helpers}"
+                        "definition rendering unsupported for derive procedural macro; usage: #[derive({rendered_name})]{helpers}"
                     ),
                     Vec::new(),
                 )
@@ -624,20 +774,25 @@ fn format_item(krate: &Crate, item: &Item) -> SymbolDoc {
         },
         ItemEnum::Use(u) => (
             "use",
-            format!("pub use {} as {};", u.source, u.name),
+            format!(
+                "pub use {} as {};",
+                rust_path(&u.source),
+                rust_identifier(&u.name)
+            ),
             Vec::new(),
         ),
-        ItemEnum::Module(_) => ("module", format!("pub mod {name};"), Vec::new()),
+        ItemEnum::Module(_) => ("module", format!("pub mod {rendered_name};"), Vec::new()),
         ItemEnum::ExternCrate {
             name: external_name,
             rename,
         } => (
             "extern crate",
             format!(
-                "pub extern crate {external_name}{};",
+                "pub extern crate {}{};",
+                rust_identifier(external_name),
                 rename
                     .as_ref()
-                    .map(|rename| format!(" as {rename}"))
+                    .map(|rename| format!(" as {}", rust_identifier(rename)))
                     .unwrap_or_default()
             ),
             Vec::new(),
@@ -645,7 +800,7 @@ fn format_item(krate: &Crate, item: &Item) -> SymbolDoc {
         ItemEnum::AssocConst { type_, value } => (
             "assoc const",
             format!(
-                "const {name}: {}{};",
+                "const {rendered_name}: {}{};",
                 type_str(type_),
                 value
                     .as_ref()
@@ -660,7 +815,7 @@ fn format_item(krate: &Crate, item: &Item) -> SymbolDoc {
             type_,
         } => (
             "assoc type",
-            assoc_type_def(&name, generics, bounds, type_.as_ref()),
+            assoc_type_def(&rendered_name, generics, bounds, type_.as_ref()),
             Vec::new(),
         ),
         ItemEnum::StructField(_)
@@ -699,6 +854,86 @@ fn format_item(krate: &Crate, item: &Item) -> SymbolDoc {
         derives: derives(krate, item),
         methods: methods(krate, item),
         impls: impls(krate, item),
+    }
+}
+
+fn rust_identifier(name: &str) -> String {
+    if name.starts_with("r#")
+        || matches!(name, "crate" | "self" | "Self" | "super" | "_")
+        || !matches!(
+            name,
+            "as" | "async"
+                | "await"
+                | "break"
+                | "const"
+                | "continue"
+                | "dyn"
+                | "else"
+                | "enum"
+                | "extern"
+                | "false"
+                | "fn"
+                | "for"
+                | "gen"
+                | "if"
+                | "impl"
+                | "in"
+                | "let"
+                | "loop"
+                | "match"
+                | "mod"
+                | "move"
+                | "mut"
+                | "pub"
+                | "ref"
+                | "return"
+                | "static"
+                | "struct"
+                | "trait"
+                | "true"
+                | "type"
+                | "unsafe"
+                | "use"
+                | "where"
+                | "while"
+                | "abstract"
+                | "become"
+                | "box"
+                | "do"
+                | "final"
+                | "macro"
+                | "override"
+                | "priv"
+                | "try"
+                | "typeof"
+                | "unsized"
+                | "virtual"
+                | "yield"
+        )
+    {
+        name.to_string()
+    } else {
+        format!("r#{name}")
+    }
+}
+
+fn rust_path(path: &str) -> String {
+    path.split("::")
+        .map(rust_identifier)
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+fn rust_binding(binding: &str) -> String {
+    let key = binding.strip_prefix("r#").unwrap_or(binding);
+    if !key.is_empty()
+        && key
+            .chars()
+            .all(|character| character == '_' || character.is_alphanumeric())
+    {
+        rust_identifier(binding)
+    } else {
+        binding.to_string()
     }
 }
 
@@ -811,7 +1046,7 @@ fn methods(krate: &Crate, item: &Item) -> Vec<String> {
                 continue;
             }
             if let (Some(name), ItemEnum::Function(f)) = (&method.name, &method.inner) {
-                methods.push(fn_def(name, f));
+                methods.push(fn_def(&rust_identifier(name), f));
             }
         }
     }
@@ -907,23 +1142,32 @@ fn struct_def(krate: &Crate, name: &str, s: &rustdoc_types::Struct) -> String {
             generics(&s.generics),
             fields
                 .iter()
-                .map(|id| id
-                    .and_then(|id| field_type(krate, id, FieldContext::TypeDefinition))
-                    .unwrap_or_else(|| "_".into()))
+                .map(|id| {
+                    id.and_then(|id| field_type(krate, id, FieldContext::TypeDefinition))
+                        .unwrap_or_else(|| "/* private/stripped field */".into())
+                })
                 .collect::<Vec<_>>()
                 .join(", "),
             where_clause(&s.generics)
         ),
-        StructKind::Plain { fields, .. } => format!(
-            "pub struct {name}{}{} {{ {} }}",
-            generics(&s.generics),
-            where_clause(&s.generics),
-            fields
+        StructKind::Plain {
+            fields,
+            has_stripped_fields,
+        } => {
+            let mut fields = fields
                 .iter()
                 .filter_map(|id| field_line(krate, *id, FieldContext::TypeDefinition))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+                .collect::<Vec<_>>();
+            if *has_stripped_fields {
+                fields.push("/* private/stripped fields */".to_string());
+            }
+            format!(
+                "pub struct {name}{}{} {{ {} }}",
+                generics(&s.generics),
+                where_clause(&s.generics),
+                fields.join(", ")
+            )
+        }
     }
 }
 
@@ -961,27 +1205,34 @@ fn struct_details(krate: &Crate, s: &rustdoc_types::Struct) -> Vec<String> {
 }
 
 fn enum_def(krate: &Crate, name: &str, e: &rustdoc_types::Enum) -> String {
+    let mut variants = enum_variant_defs(krate, e);
+    if e.has_stripped_variants {
+        variants.push("/* private/stripped variants */".to_string());
+    }
     format!(
         "pub enum {name}{}{} {{ {} }}",
         generics(&e.generics),
         where_clause(&e.generics),
-        enum_details(krate, e).join(", ")
+        variants.join(", ")
     )
 }
 
-fn enum_details(krate: &Crate, e: &rustdoc_types::Enum) -> Vec<String> {
-    let mut details = e
-        .variants
+fn enum_variant_defs(krate: &Crate, e: &rustdoc_types::Enum) -> Vec<String> {
+    e.variants
         .iter()
         .filter_map(|id| {
             let item = krate.index.get(id)?;
             let name = item.name.clone()?;
             let ItemEnum::Variant(v) = &item.inner else {
-                return Some(name);
+                return Some(rust_identifier(&name));
             };
-            Some(variant_def(krate, &name, v))
+            Some(variant_def(krate, &rust_identifier(&name), v))
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn enum_details(krate: &Crate, e: &rustdoc_types::Enum) -> Vec<String> {
+    let mut details = enum_variant_defs(krate, e);
     if e.has_stripped_variants {
         details.push("variants: private/stripped".to_string());
     }
@@ -1023,20 +1274,27 @@ fn variant_def(krate: &Crate, name: &str, variant: &rustdoc_types::Variant) -> S
             "{name}({})",
             fields
                 .iter()
-                .map(|field| field
-                    .and_then(|id| field_type(krate, id, FieldContext::EnumVariant))
-                    .unwrap_or_else(|| "_".to_string()))
+                .map(|field| {
+                    field
+                        .and_then(|id| field_type(krate, id, FieldContext::EnumVariant))
+                        .unwrap_or_else(|| "/* private/stripped field */".to_string())
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        VariantKind::Struct { fields, .. } => format!(
-            "{name} {{ {} }}",
-            fields
+        VariantKind::Struct {
+            fields,
+            has_stripped_fields,
+        } => {
+            let mut fields = fields
                 .iter()
                 .filter_map(|id| field_line(krate, *id, FieldContext::EnumVariant))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+                .collect::<Vec<_>>();
+            if *has_stripped_fields {
+                fields.push("/* private/stripped fields */".to_string());
+            }
+            format!("{name} {{ {} }}", fields.join(", "))
+        }
     };
     match &variant.discriminant {
         Some(discriminant) => format!("{definition} = {}", discriminant.expr),
@@ -1049,7 +1307,7 @@ fn trait_details(krate: &Crate, t: &rustdoc_types::Trait) -> Vec<String> {
         .iter()
         .filter_map(|id| krate.index.get(id))
         .filter_map(|item| {
-            let name = item.name.clone().unwrap_or_default();
+            let name = rust_identifier(item.name.as_deref().unwrap_or_default());
             match &item.inner {
                 ItemEnum::Function(f) => Some(trait_fn_def(&name, f)),
                 ItemEnum::AssocType {
@@ -1099,7 +1357,7 @@ fn function_def(name: &str, f: &rustdoc_types::Function, context: FunctionContex
         .sig
         .inputs
         .iter()
-        .map(|(name, ty)| format!("{name}: {}", type_str(ty)))
+        .map(|(name, ty)| format!("{}: {}", rust_binding(name), type_str(ty)))
         .collect::<Vec<_>>();
     let inputs = signature_inputs(inputs, f.sig.is_c_variadic);
     let output = f
@@ -1124,11 +1382,19 @@ fn function_def(name: &str, f: &rustdoc_types::Function, context: FunctionContex
 }
 
 fn union_def(krate: &Crate, name: &str, u: &rustdoc_types::Union) -> String {
+    let mut fields = u
+        .fields
+        .iter()
+        .filter_map(|id| field_line(krate, *id, FieldContext::TypeDefinition))
+        .collect::<Vec<_>>();
+    if u.has_stripped_fields {
+        fields.push("/* private/stripped fields */".to_string());
+    }
     format!(
         "pub union {name}{}{} {{ {} }}",
         generics(&u.generics),
         where_clause(&u.generics),
-        union_details(krate, u).join(", ")
+        fields.join(", ")
     )
 }
 
@@ -1180,7 +1446,11 @@ fn field_line(krate: &Crate, id: Id, context: FieldContext) -> Option<String> {
     Some(format!(
         "{}{}: {}",
         field_visibility(&field.visibility, context),
-        field.name.clone().unwrap_or_else(|| "_".into()),
+        field
+            .name
+            .as_deref()
+            .map(rust_identifier)
+            .unwrap_or_else(|| "_".into()),
         type_str(ty)
     ))
 }
@@ -1205,7 +1475,7 @@ fn field_visibility(visibility: &Visibility, context: FieldContext) -> String {
         Visibility::Public => "pub ".to_string(),
         Visibility::Default => String::new(),
         Visibility::Crate => "pub(crate) ".to_string(),
-        Visibility::Restricted { path, .. } => format!("pub(in {path}) "),
+        Visibility::Restricted { path, .. } => format!("pub(in {}) ", rust_path(path)),
     }
 }
 
@@ -1303,7 +1573,7 @@ fn generic_param_decl(p: &rustdoc_types::GenericParamDef) -> String {
         GenericParamDefKind::Type {
             bounds, default, ..
         } => {
-            let mut param = p.name.clone();
+            let mut param = rust_identifier(&p.name);
             if !bounds.is_empty() {
                 param.push_str(&format!(": {}", bounds_str(bounds)));
             }
@@ -1313,7 +1583,7 @@ fn generic_param_decl(p: &rustdoc_types::GenericParamDef) -> String {
             param
         }
         GenericParamDefKind::Const { type_, default } => {
-            let mut param = format!("const {}: {}", p.name, type_str(type_));
+            let mut param = format!("const {}: {}", rust_identifier(&p.name), type_str(type_));
             if let Some(default) = default {
                 param.push_str(&format!(" = {default}"));
             }
@@ -1396,7 +1666,7 @@ fn type_str(ty: &Type) -> String {
                 .join(" + ");
             format!("dyn {traits}")
         }
-        Type::Generic(name) => name.clone(),
+        Type::Generic(name) => rust_identifier(name),
         Type::Primitive(name) => name.clone(),
         Type::FunctionPointer(fp) => fn_pointer_str(fp),
         Type::Tuple(items) => {
@@ -1440,7 +1710,8 @@ fn type_str(ty: &Type) -> String {
             trait_,
         } => {
             let name = format!(
-                "{name}{}",
+                "{}{}",
+                rust_identifier(name),
                 args.as_deref().map(args_str).unwrap_or_default()
             );
             if let Some(trait_) = trait_ {
@@ -1460,7 +1731,7 @@ fn type_str(ty: &Type) -> String {
 fn format_path(path: &rustdoc_types::Path) -> String {
     format!(
         "{}{}",
-        path.path,
+        rust_path(&path.path),
         path.args.as_deref().map(args_str).unwrap_or_default()
     )
 }
@@ -1473,10 +1744,20 @@ fn args_str(args: &GenericArgs) -> String {
                 let args = constraint.args.as_deref().map(args_str).unwrap_or_default();
                 match &constraint.binding {
                     AssocItemConstraintKind::Equality(term) => {
-                        format!("{}{} = {}", constraint.name, args, term_str(term))
+                        format!(
+                            "{}{} = {}",
+                            rust_identifier(&constraint.name),
+                            args,
+                            term_str(term)
+                        )
                     }
                     AssocItemConstraintKind::Constraint(bounds) => {
-                        format!("{}{}: {}", constraint.name, args, bounds_str(bounds))
+                        format!(
+                            "{}{}: {}",
+                            rust_identifier(&constraint.name),
+                            args,
+                            bounds_str(bounds)
+                        )
                     }
                 }
             }));
@@ -1546,7 +1827,7 @@ fn bound_str(bound: &GenericBound) -> String {
             args.iter()
                 .map(|arg| match arg {
                     rustdoc_types::PreciseCapturingArg::Lifetime(l) => lifetime_str(l),
-                    rustdoc_types::PreciseCapturingArg::Param(p) => p.clone(),
+                    rustdoc_types::PreciseCapturingArg::Param(p) => rust_identifier(p),
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -1559,7 +1840,9 @@ fn generic_param_names(params: &[rustdoc_types::GenericParamDef]) -> String {
         .iter()
         .map(|p| match &p.kind {
             GenericParamDefKind::Lifetime { .. } => lifetime_str(&p.name),
-            GenericParamDefKind::Type { .. } | GenericParamDefKind::Const { .. } => p.name.clone(),
+            GenericParamDefKind::Type { .. } | GenericParamDefKind::Const { .. } => {
+                rust_identifier(&p.name)
+            }
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -2232,6 +2515,7 @@ mod tests {
             ExternalReexport {
                 crate_name: "dep_crate".into(),
                 path: vec!["module".into(), "Thing".into()],
+                via_glob: false,
             }
         );
         assert_eq!(
@@ -2295,6 +2579,7 @@ mod tests {
             ExternalReexport {
                 crate_name: "dep_crate".into(),
                 path: Vec::new(),
+                via_glob: false,
             }
         );
         assert!(root_external.import_path().is_none());
@@ -2314,6 +2599,7 @@ mod tests {
             ExternalReexport {
                 crate_name: "dep_crate".into(),
                 path: vec!["Thing".into()],
+                via_glob: false,
             }
         );
         assert_eq!(
@@ -2375,6 +2661,7 @@ mod tests {
             vec![ExternalReexport {
                 crate_name: "middle".into(),
                 path: vec!["api".into(), "Thing".into()],
+                via_glob: true,
             }]
         );
     }
@@ -2455,6 +2742,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(raw.imported.name, "type");
+        assert_eq!(raw.imported.definition, "pub struct r#type;");
     }
 
     #[test]
@@ -2523,6 +2811,113 @@ mod tests {
             error.to_string(),
             "imported name 'Serialize' is ambiguous across Rust namespaces (Trait Serialize, ProcDerive Serialize); query a namespace-specific canonical path"
         );
+    }
+
+    #[test]
+    fn explicit_items_shadow_same_namespace_globs_but_not_macro_namespaces() {
+        let root = item(
+            1,
+            Some("fixture"),
+            Visibility::Public,
+            ItemEnum::Module(Module {
+                is_crate: true,
+                items: vec![Id(2), Id(3), Id(4), Id(7)],
+                is_stripped: false,
+            }),
+        );
+        let direct = item(
+            2,
+            Some("Thing"),
+            Visibility::Public,
+            ItemEnum::Struct(Struct {
+                kind: StructKind::Unit,
+                generics: generics_empty(),
+                impls: vec![],
+            }),
+        );
+        let glob_module = item(
+            3,
+            Some("globbed"),
+            Visibility::Public,
+            ItemEnum::Module(Module {
+                is_crate: false,
+                items: vec![Id(5), Id(6)],
+                is_stripped: false,
+            }),
+        );
+        let glob = item(
+            4,
+            Some("glob"),
+            Visibility::Public,
+            ItemEnum::Use(Use {
+                source: "globbed::*".into(),
+                name: "glob".into(),
+                id: Some(Id(3)),
+                is_glob: true,
+            }),
+        );
+        let macro_item = item(
+            5,
+            Some("Thing"),
+            Visibility::Public,
+            ItemEnum::Macro("macro_rules! Thing { () => { ... }; }".into()),
+        );
+        let glob_same = item(
+            6,
+            Some("Same"),
+            Visibility::Public,
+            ItemEnum::Struct(Struct {
+                kind: StructKind::Unit,
+                generics: generics_empty(),
+                impls: vec![],
+            }),
+        );
+        let direct_same = item(
+            7,
+            Some("Same"),
+            Visibility::Public,
+            ItemEnum::Struct(Struct {
+                kind: StructKind::Unit,
+                generics: generics_empty(),
+                impls: vec![],
+            }),
+        );
+        let docs = krate(
+            vec![
+                root,
+                direct,
+                glob_module,
+                glob,
+                macro_item,
+                glob_same,
+                direct_same,
+            ],
+            Id(1),
+        );
+
+        let ambiguous = find_symbol_report(
+            &docs,
+            &ImportPath {
+                crate_name: "fixture".into(),
+                segments: vec![],
+                item: "Thing".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(ambiguous.contains("ambiguous across Rust namespaces"));
+        assert!(ambiguous.contains("struct Thing"));
+        assert!(ambiguous.contains("macro Thing"));
+
+        let shadowed = find_symbol_report(
+            &docs,
+            &ImportPath {
+                crate_name: "fixture".into(),
+                segments: vec![],
+                item: "Same".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(shadowed.imported.definition, "pub struct Same;");
     }
 
     #[test]
@@ -2983,7 +3378,7 @@ mod tests {
                 18,
                 Some("m"),
                 Visibility::Public,
-                ItemEnum::Macro("() => {}".into()),
+                ItemEnum::Macro("macro_rules! m { () => { ... }; }".into()),
             ),
             item(
                 19,
@@ -3040,6 +3435,10 @@ mod tests {
             let doc = format_item(&docs, it);
             assert!(!doc.definition.is_empty());
         }
+        assert_eq!(
+            format_item(&docs, docs.index.get(&Id(18)).unwrap()).definition,
+            "macro_rules! m { () => { ... }; }"
+        );
 
         let trait_item = item(
             30,

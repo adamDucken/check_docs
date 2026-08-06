@@ -9,7 +9,7 @@ use cli::{ParsedCommand, parse_command};
 use imports::ImportPath;
 use resolver::{
     DependencyContext, DependencyFilter, is_rust_library_crate, package_dependencies,
-    resolve_dependency, resolve_reachable_dependency, select_package,
+    resolve_dependency, resolve_reachable_dependencies, select_package,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -22,11 +22,21 @@ use symbols::{SymbolDoc, SymbolError, SymbolReport};
 struct RustdocCacheKey {
     package_id: PackageId,
     target_name: String,
-    target_triple: Option<String>,
+    unit: rustdoc_json::CargoUnitIdentity,
 }
 
 type LoadedDocs = (Arc<rustdoc_types::Crate>, PathBuf);
 type RustdocCache = HashMap<RustdocCacheKey, LoadedDocs>;
+
+struct DependencyDocsRequest<'a> {
+    manifest_path: &'a Path,
+    metadata: &'a Metadata,
+    root_package: &'a Package,
+    package: &'a Package,
+    target: &'a Target,
+    contexts: &'a [DependencyContext],
+    target_selection: &'a rustdoc_json::CargoTargetSelection,
+}
 
 #[derive(Debug)]
 struct OutputReport {
@@ -50,6 +60,9 @@ struct ResolvedQuery {
 }
 
 fn main() -> ExitCode {
+    if std::env::var_os("CHECK_DOCS_RUSTC_WRAPPER_MODE").is_some() {
+        rustdoc_json::run_rustc_wrapper();
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
@@ -85,20 +98,28 @@ fn run() -> Result<(), String> {
             manifest_path.display()
         ));
     }
-    let selected_target = match args.target {
-        Some(target) => target,
-        None => host_target_triple()?,
-    };
+    let host_target = host_target_triple()?;
+    let target_selection =
+        rustdoc_json::target_selection(&manifest_path, args.target.as_deref(), &host_target)?;
+    let selected_target = &target_selection.effective_triple;
 
     let mut metadata_command = MetadataCommand::new();
     metadata_command.manifest_path(&manifest_path);
+    if let Some(invocation_dir) = manifest_path.parent() {
+        metadata_command.current_dir(invocation_dir);
+    }
     metadata_command.other_options(vec![
+        "--locked".to_string(),
         "--filter-platform".to_string(),
         selected_target.clone(),
     ]);
     let metadata = metadata_command
         .exec()
-        .map_err(|err| format!("failed to read cargo metadata: {err}"))?;
+        .map_err(|err| {
+            format!(
+                "failed to read cargo metadata without changing Cargo.lock: {err}; run `cargo check` or `cargo build` to create or refresh the lockfile, then retry"
+            )
+        })?;
 
     let root_package = select_package(&metadata, &manifest_path, args.package.as_deref())?;
     let dependency_filter = DependencyFilter {
@@ -107,34 +128,54 @@ fn run() -> Result<(), String> {
     };
     let root_dependencies = package_dependencies(&metadata, &root_package.id, dependency_filter);
     let mut rustdoc_cache = RustdocCache::new();
-    for (index, import) in imports.iter().enumerate() {
-        if index > 0 {
-            println!();
-        }
+    let mut printed_report = false;
+    for import in &imports {
         let dep = resolve_dependency(&metadata.packages, &root_dependencies, &import.crate_name)
             .map_err(|err| err.to_string())?;
-        let resolved = resolve_query(
-            &mut rustdoc_cache,
-            &manifest_path,
-            &metadata,
-            dep.package,
-            dep.target,
-            dep.contexts,
-            Some(&selected_target),
-            import,
-            &mut HashSet::new(),
-        )?;
+        let mut resolved_contexts = Vec::new();
+        let mut context_errors = Vec::new();
+        for context in dep.contexts {
+            let context_label = context.label();
+            match resolve_query(
+                &mut rustdoc_cache,
+                &manifest_path,
+                &metadata,
+                root_package,
+                dep.package,
+                dep.target,
+                vec![context],
+                &target_selection,
+                import,
+                &mut HashSet::new(),
+            ) {
+                Ok(resolved) => resolved_contexts.push(resolved),
+                Err(error) => context_errors.push(format!("{context_label}: {error}")),
+            }
+        }
+        if resolved_contexts.is_empty() {
+            return Err(format!(
+                "failed to resolve '{}' in any selected dependency context: {}",
+                import.full_path(),
+                context_errors.join("; ")
+            ));
+        }
 
-        let output = OutputReport {
-            crate_name: resolved.crate_name,
-            version: Some(resolved.version),
-            dependency: format_dependency_contexts(&resolved.contexts),
-            target_triple: resolved.target_triple,
-            source: resolved.json_path,
-            import_line: format_use(import),
-            symbols: resolved.symbols,
-        };
-        print_report(&output);
+        for resolved in resolved_contexts {
+            if printed_report {
+                println!();
+            }
+            let output = OutputReport {
+                crate_name: resolved.crate_name,
+                version: Some(resolved.version),
+                dependency: format_dependency_contexts(&resolved.contexts),
+                target_triple: resolved.target_triple,
+                source: resolved.json_path,
+                import_line: format_use(import),
+                symbols: resolved.symbols,
+            };
+            print_report(&output);
+            printed_report = true;
+        }
     }
 
     Ok(())
@@ -145,10 +186,11 @@ fn resolve_query(
     cache: &mut RustdocCache,
     manifest_path: &Path,
     metadata: &Metadata,
+    root_package: &Package,
     package: &Package,
     target: &Target,
     contexts: Vec<DependencyContext>,
-    target_triple: Option<&str>,
+    target_selection: &rustdoc_json::CargoTargetSelection,
     import: &ImportPath,
     visited: &mut HashSet<(PackageId, String)>,
 ) -> Result<ResolvedQuery, String> {
@@ -162,139 +204,186 @@ fn resolve_query(
     }
     let (krate, json_path) = load_docs_cached(
         cache,
-        manifest_path,
-        metadata,
-        package,
-        target,
-        target_triple,
+        DependencyDocsRequest {
+            manifest_path,
+            metadata,
+            root_package,
+            package,
+            target,
+            contexts: &contexts,
+            target_selection,
+        },
     )?;
-    match symbols::find_symbol_report(&krate, import) {
-        Ok(symbols) => Ok(ResolvedQuery {
-            symbols,
+    let local_result = symbols::find_symbol_report(&krate, import);
+    if let Err(SymbolError::Ambiguous(message)) = &local_result {
+        return Err(format!(
+            "ambiguous import '{}' in {} {}: {message}",
+            import.full_path(),
+            package.name,
+            package.version
+        ));
+    }
+    let external_candidates = symbols::external_reexports(&krate, import).map_err(
+        |external_error| match &local_result {
+            Ok(_) => format!("failed to inspect external re-export graph: {external_error}"),
+            Err(local_error) => format!(
+                "{local_error}; failed to inspect external re-export graph: {external_error}"
+            ),
+        },
+    )?;
+    if external_candidates.is_empty() {
+        return match local_result {
+            Ok(symbols) => Ok(ResolvedQuery {
+                symbols,
+                crate_name: package.name.clone(),
+                version: package.version.to_string(),
+                contexts,
+                target_triple: krate.target.triple.clone(),
+                json_path,
+            }),
+            Err(local_error) => Err(not_found_message(
+                import,
+                &package.name,
+                Some(&package.version.to_string()),
+                &json_path,
+                Some(&local_error),
+            )),
+        };
+    }
+
+    let mut successes = Vec::new();
+    let mut branch_errors = Vec::new();
+    for external in external_candidates {
+        let external_deps = match resolve_reachable_dependencies(
+            metadata,
+            &metadata.packages,
+            package,
+            &contexts,
+            &external.crate_name,
+        ) {
+            Ok(dep) => dep,
+            Err(error) => {
+                branch_errors.push(format!("{}: {error}", external.crate_name));
+                continue;
+            }
+        };
+        for external_dep in external_deps {
+            let mut branch_visited = visited.clone();
+            let result = if let Some(external_import) = external.import_path() {
+                resolve_query(
+                    cache,
+                    manifest_path,
+                    metadata,
+                    root_package,
+                    external_dep.package,
+                    external_dep.target,
+                    external_dep.contexts,
+                    target_selection,
+                    &external_import,
+                    &mut branch_visited,
+                )
+            } else {
+                load_docs_cached(
+                    cache,
+                    DependencyDocsRequest {
+                        manifest_path,
+                        metadata,
+                        root_package,
+                        package: external_dep.package,
+                        target: external_dep.target,
+                        contexts: &external_dep.contexts,
+                        target_selection,
+                    },
+                )
+                .and_then(|(external_krate, external_json_path)| {
+                    Ok(ResolvedQuery {
+                        symbols: SymbolReport {
+                            imported: symbols::format_crate_root(&external_krate)
+                                .map_err(|error| error.to_string())?,
+                            resolved: None,
+                        },
+                        crate_name: external_dep.package.name.clone(),
+                        version: external_dep.package.version.to_string(),
+                        contexts: external_dep.contexts,
+                        target_triple: external_krate.target.triple.clone(),
+                        json_path: external_json_path,
+                    })
+                })
+            };
+            match result {
+                Ok(resolved) => successes.push((external.via_glob, resolved)),
+                Err(error) => branch_errors.push(format!(
+                    "{} ({}): {error}",
+                    external.crate_name, external_dep.package.id
+                )),
+            }
+        }
+    }
+
+    if let Ok(local_symbols) = local_result {
+        let conflicts = successes
+            .iter()
+            .filter(|(via_glob, resolved)| {
+                !*via_glob || !symbols::reports_overlap_namespace(&local_symbols, &resolved.symbols)
+            })
+            .map(|(_, resolved)| symbols::report_item_label(&resolved.symbols))
+            .collect::<Vec<_>>();
+        if !conflicts.is_empty() {
+            return Err(format!(
+                "ambiguous import '{}' in {} {}: imported name '{}' is ambiguous across Rust namespaces ({}, {}); query a namespace-specific canonical path",
+                import.full_path(),
+                package.name,
+                package.version,
+                import.item,
+                symbols::report_item_label(&local_symbols),
+                conflicts.join(", ")
+            ));
+        }
+        return Ok(ResolvedQuery {
+            symbols: local_symbols,
             crate_name: package.name.clone(),
             version: package.version.to_string(),
             contexts,
             target_triple: krate.target.triple.clone(),
             json_path,
-        }),
-        Err(SymbolError::Ambiguous(message)) => Err(format!(
-            "ambiguous import '{}' in {} {}: {message}",
-            import.full_path(),
-            package.name,
-            package.version
+        });
+    }
+
+    let local_error = local_result.expect_err("local result was checked above");
+    let imported_reexport = symbols::imported_reexport(&krate, import).ok().flatten();
+    match successes.len() {
+        1 => {
+            let (_, mut resolved) = successes.pop().expect("one successful branch");
+            if let Some(imported) = imported_reexport {
+                let resolved_item = resolved
+                    .symbols
+                    .resolved
+                    .take()
+                    .unwrap_or(resolved.symbols.imported);
+                resolved.symbols = SymbolReport {
+                    imported,
+                    resolved: Some(resolved_item),
+                };
+            }
+            Ok(resolved)
+        }
+        count if count > 1 => Err(format!(
+            "ambiguous external re-export for '{}': {count} branches resolved successfully",
+            import.full_path()
         )),
-        Err(local_error) => {
-            let imported_reexport = symbols::imported_reexport(&krate, import).ok().flatten();
-            let external_candidates = symbols::external_reexports(&krate, import).map_err(
-                |external_error| {
-                    format!(
-                        "{local_error}; failed to inspect external re-export graph: {external_error}"
-                    )
-                },
-            )?;
-            if external_candidates.is_empty() {
-                return Err(not_found_message(
-                    import,
-                    &package.name,
-                    Some(&package.version.to_string()),
-                    &json_path,
-                    Some(&local_error),
-                ));
+        _ => {
+            let mut message = not_found_message(
+                import,
+                &package.name,
+                Some(&package.version.to_string()),
+                &json_path,
+                Some(&local_error),
+            );
+            if !branch_errors.is_empty() {
+                message.push_str("; external branches failed: ");
+                message.push_str(&branch_errors.join("; "));
             }
-
-            let mut successes = Vec::new();
-            let mut branch_errors = Vec::new();
-            for external in external_candidates {
-                let external_dep = match resolve_reachable_dependency(
-                    metadata,
-                    &metadata.packages,
-                    package,
-                    &external.crate_name,
-                ) {
-                    Ok(dep) => dep,
-                    Err(error) => {
-                        branch_errors.push(format!("{}: {error}", external.crate_name));
-                        continue;
-                    }
-                };
-                let mut branch_visited = visited.clone();
-                let result = if let Some(external_import) = external.import_path() {
-                    resolve_query(
-                        cache,
-                        manifest_path,
-                        metadata,
-                        external_dep.package,
-                        external_dep.target,
-                        external_dep.contexts,
-                        target_triple,
-                        &external_import,
-                        &mut branch_visited,
-                    )
-                } else {
-                    load_docs_cached(
-                        cache,
-                        manifest_path,
-                        metadata,
-                        external_dep.package,
-                        external_dep.target,
-                        target_triple,
-                    )
-                    .and_then(|(external_krate, external_json_path)| {
-                        Ok(ResolvedQuery {
-                            symbols: SymbolReport {
-                                imported: symbols::format_crate_root(&external_krate)
-                                    .map_err(|error| error.to_string())?,
-                                resolved: None,
-                            },
-                            crate_name: external_dep.package.name.clone(),
-                            version: external_dep.package.version.to_string(),
-                            contexts: external_dep.contexts,
-                            target_triple: external_krate.target.triple.clone(),
-                            json_path: external_json_path,
-                        })
-                    })
-                };
-                match result {
-                    Ok(resolved) => successes.push(resolved),
-                    Err(error) => branch_errors.push(format!("{}: {error}", external.crate_name)),
-                }
-            }
-
-            match successes.len() {
-                1 => {
-                    let mut resolved = successes.pop().expect("one successful branch");
-                    if let Some(imported) = imported_reexport {
-                        let resolved_item = resolved
-                            .symbols
-                            .resolved
-                            .take()
-                            .unwrap_or(resolved.symbols.imported);
-                        resolved.symbols = SymbolReport {
-                            imported,
-                            resolved: Some(resolved_item),
-                        };
-                    }
-                    Ok(resolved)
-                }
-                count if count > 1 => Err(format!(
-                    "ambiguous external re-export for '{}': {count} branches resolved successfully",
-                    import.full_path()
-                )),
-                _ => {
-                    let mut message = not_found_message(
-                        import,
-                        &package.name,
-                        Some(&package.version.to_string()),
-                        &json_path,
-                        Some(&local_error),
-                    );
-                    if !branch_errors.is_empty() {
-                        message.push_str("; external branches failed: ");
-                        message.push_str(&branch_errors.join("; "));
-                    }
-                    Err(message)
-                }
-            }
+            Err(message)
         }
     }
 }
@@ -320,24 +409,31 @@ fn host_target_triple() -> Result<String, String> {
 
 fn load_docs_cached(
     cache: &mut RustdocCache,
-    manifest_path: &Path,
-    metadata: &Metadata,
-    package: &Package,
-    target: &Target,
-    target_triple: Option<&str>,
+    request: DependencyDocsRequest<'_>,
 ) -> Result<LoadedDocs, String> {
-    let key = rustdoc_cache_key(package, target, target_triple);
+    let unit = rustdoc_json::resolved_unit(
+        request.manifest_path,
+        request.root_package,
+        request.package,
+        request.target,
+        request.contexts,
+        request.target_selection,
+    )?;
+    let key = rustdoc_cache_key(request.package, request.target, &unit);
     if let Some(cached) = cache.get(&key) {
         return Ok(cached.clone());
     }
 
-    let (krate, json_path) = rustdoc_json::load_or_generate(
-        manifest_path.to_path_buf(),
-        metadata,
-        package,
-        target,
-        target_triple,
-    )?;
+    let (krate, json_path) = rustdoc_json::load_or_generate(rustdoc_json::RustdocRequest {
+        manifest_path: request.manifest_path.to_path_buf(),
+        metadata: request.metadata,
+        root_package: request.root_package,
+        package: request.package,
+        target: request.target,
+        contexts: request.contexts,
+        target_selection: request.target_selection,
+        unit: &unit,
+    })?;
     let loaded = (Arc::new(krate), json_path);
     cache.insert(key, loaded.clone());
     Ok(loaded)
@@ -346,12 +442,12 @@ fn load_docs_cached(
 fn rustdoc_cache_key(
     package: &Package,
     target: &Target,
-    target_triple: Option<&str>,
+    unit: &rustdoc_json::CargoUnitIdentity,
 ) -> RustdocCacheKey {
     RustdocCacheKey {
         package_id: package.id.clone(),
         target_name: target.name.clone(),
-        target_triple: target_triple.map(str::to_string),
+        unit: unit.clone(),
     }
 }
 
@@ -478,40 +574,21 @@ fn not_found_message(
         crate_name.to_string()
     };
     let Some(context) = context else {
-        let mut message = format!(
-            "item '{}' not found in {} ({}): no matching public rustdoc item",
+        return format!(
+            "item '{}' not found in {} ({}): no matching public rustdoc item; check the path, visibility, and selected feature set",
             import.item,
             crate_label,
             source.display(),
         );
-        if looks_like_module_name(&import.item) {
-            message.push_str(&format!(
-                "; '{}' appears to be a module — query a concrete item inside that module",
-                import.item
-            ));
-        }
-        return message;
     };
 
-    let mut message = format!(
-        "item '{}' not found in {} ({}): {}",
+    format!(
+        "item '{}' not found in {} ({}): {}; check the path, visibility, and selected feature set",
         import.item,
         crate_label,
         source.display(),
         context
-    );
-    if looks_like_module_name(&import.item) {
-        message.push_str(&format!(
-            "; '{}' appears to be a module — query a concrete item inside that module",
-            import.item
-        ));
-    }
-    message
-}
-
-fn looks_like_module_name(name: &str) -> bool {
-    name.chars()
-        .all(|ch| ch.is_ascii_lowercase() || ch == '_' || ch.is_ascii_digit())
+    )
 }
 
 #[cfg(test)]
@@ -585,23 +662,29 @@ mod tests {
             },
         );
         let dep = resolve_dependency(&metadata.packages, &deps, "cargo_metadata").unwrap();
-        let key = rustdoc_cache_key(dep.package, dep.target, None);
+        let unit = rustdoc_json::CargoUnitIdentity {
+            features: vec!["serde".into()],
+            mode: "check".into(),
+            platform: None,
+            profile: "{}".into(),
+        };
+        let key = rustdoc_cache_key(dep.package, dep.target, &unit);
 
         assert_eq!(&key.package_id, &dep.package.id);
         assert_eq!(&key.target_name, &dep.target.name);
+        assert_eq!(key.unit.features, ["serde"]);
     }
 
     #[test]
-    fn not_found_message_handles_modules_and_plain_items() {
+    fn not_found_message_does_not_guess_item_kind_from_spelling() {
         let module = ImportPath {
             crate_name: "tokio".into(),
             segments: vec!["sync".into()],
             item: "mpsc".into(),
         };
         let message = not_found_message(&module, "tokio", Some("1.0.0"), Path::new("/src"), None);
-        assert!(message.contains("appears to be a module"));
-        assert!(message.contains("query a concrete item inside that module"));
-        assert!(!message.contains("Sender"));
+        assert!(message.contains("check the path, visibility, and selected feature set"));
+        assert!(!message.contains("appears to be a module"));
 
         let item = ImportPath {
             crate_name: "x".into(),
@@ -610,8 +693,6 @@ mod tests {
         };
         let message = not_found_message(&item, "x", None, Path::new("/src"), None);
         assert!(!message.contains("appears to be a module"));
-        assert!(looks_like_module_name("module_2"));
-        assert!(!looks_like_module_name("TypeName"));
     }
 
     #[test]
@@ -729,7 +810,12 @@ mod tests {
                 repr: "path+file:///fixture#1.0.0".into(),
             },
             target_name: "fixture".into(),
-            target_triple: None,
+            unit: rustdoc_json::CargoUnitIdentity {
+                features: vec!["selected".into()],
+                mode: "check".into(),
+                platform: None,
+                profile: "{}".into(),
+            },
         };
         let mut cache = RustdocCache::new();
         cache.insert(

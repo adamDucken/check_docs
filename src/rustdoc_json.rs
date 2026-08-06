@@ -1,8 +1,11 @@
-use crate::resolver::{is_library_target, package_spec};
-use cargo_metadata::{Metadata, Package, Target};
+use crate::resolver::{DependencyContext, is_library_target, package_spec};
+use cargo_metadata::{DependencyKind, Metadata, Package, Target};
 use rustdoc_types::{Crate, FORMAT_VERSION};
+use serde::Deserialize;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions, TryLockError};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,38 +15,90 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const PINNED_TOOLCHAIN: &str = "nightly-2025-09-10";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CargoTargetSelection {
+    pub(crate) effective_triple: String,
+    pub(crate) cargo_platform: Option<String>,
+    pub(crate) command_line_override: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CargoUnitIdentity {
+    pub(crate) features: Vec<String>,
+    pub(crate) mode: String,
+    pub(crate) platform: Option<String>,
+    pub(crate) profile: String,
+}
+
+pub(crate) struct RustdocRequest<'a> {
+    pub(crate) manifest_path: PathBuf,
+    pub(crate) metadata: &'a Metadata,
+    pub(crate) root_package: &'a Package,
+    pub(crate) package: &'a Package,
+    pub(crate) target: &'a Target,
+    pub(crate) contexts: &'a [DependencyContext],
+    pub(crate) target_selection: &'a CargoTargetSelection,
+    pub(crate) unit: &'a CargoUnitIdentity,
+}
+
 pub(crate) fn load_or_generate(
-    manifest_path: PathBuf,
-    metadata: &Metadata,
-    package: &Package,
-    target: &Target,
-    target_triple: Option<&str>,
+    mut request: RustdocRequest<'_>,
 ) -> Result<(Crate, PathBuf), String> {
-    let manifest_path = manifest_path.canonicalize().map_err(|err| {
+    request.manifest_path = request.manifest_path.canonicalize().map_err(|err| {
         format!(
             "failed to resolve manifest path {}: {err}",
-            manifest_path.display()
+            request.manifest_path.display()
         )
     })?;
-    let invocation_dir = manifest_path
+    let invocation_dir = request
+        .manifest_path
         .parent()
-        .ok_or_else(|| format!("manifest path {} has no parent", manifest_path.display()))?
+        .ok_or_else(|| {
+            format!(
+                "manifest path {} has no parent",
+                request.manifest_path.display()
+            )
+        })?
         .to_path_buf();
-    let mut doc_dir = metadata.target_directory.as_std_path().to_path_buf();
-    if let Some(target_triple) = target_triple {
-        doc_dir.push(target_triple);
+    let target_dir = generation_target_dir(&request);
+    let mut doc_dir = target_dir.clone();
+    if let Some(platform) = &request.unit.platform {
+        doc_dir.push(platform);
     }
     let json_path = doc_dir
         .join("doc")
-        .join(format!("{}.json", target.name.replace('-', "_")));
+        .join(format!("{}.json", request.target.name.replace('-', "_")));
     let _lock = JsonGenerationLock::acquire(json_path.with_extension("json.lock"))?;
 
     // Always regenerate. Existing JSON does not encode enough of Cargo's resolved state
     // to prove it matches the selected package's current features/source graph.
-    generate_json(manifest_path, package, target, target_triple)?;
-    let mut krate = load_valid_json(&json_path, package)?;
+    generate_json(
+        &request,
+        &target_dir,
+        json_path.parent().expect("JSON path has doc directory"),
+    )?;
+    let mut krate = load_valid_json(&json_path, request.package)?;
     normalize_span_paths(&mut krate, &invocation_dir);
     Ok((krate, json_path))
+}
+
+fn generation_target_dir(request: &RustdocRequest<'_>) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    request.root_package.id.hash(&mut hasher);
+    request.package.id.hash(&mut hasher);
+    request.target.name.hash(&mut hasher);
+    request.unit.hash(&mut hasher);
+    for context in request.contexts {
+        context.kind.hash(&mut hasher);
+        context.target.hash(&mut hasher);
+        context.via.hash(&mut hasher);
+    }
+    request
+        .metadata
+        .target_directory
+        .as_std_path()
+        .join("check-docs")
+        .join(format!("{:016x}", hasher.finish()))
 }
 
 #[derive(Debug)]
@@ -175,25 +230,379 @@ fn load_valid_json(path: &PathBuf, package: &Package) -> Result<Crate, String> {
 }
 
 fn generate_json(
-    manifest_path: PathBuf,
-    package: &Package,
-    target: &Target,
-    target_triple: Option<&str>,
+    request: &RustdocRequest<'_>,
+    target_dir: &Path,
+    doc_dir: &Path,
 ) -> Result<(), String> {
     let toolchain =
         env::var("CHECK_DOCS_TOOLCHAIN").unwrap_or_else(|_| PINNED_TOOLCHAIN.to_string());
-    generate_json_with_toolchain(manifest_path, package, target, target_triple, &toolchain)
+    generate_json_with_toolchain(request, target_dir, doc_dir, &toolchain)
 }
 
 fn generate_json_with_toolchain(
-    manifest_path: PathBuf,
-    package: &Package,
-    target: &Target,
-    target_triple: Option<&str>,
+    request: &RustdocRequest<'_>,
+    target_dir: &Path,
+    doc_dir: &Path,
     toolchain: &str,
 ) -> Result<(), String> {
-    let spec = package_spec(package);
-    let selector = target_selector(target)?;
+    target_selector(request.target)?;
+    let context_kind = exact_context_kind(request.contexts)?;
+    let mut command = Command::new("cargo");
+    if let Some(invocation_dir) = request
+        .manifest_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        command.current_dir(invocation_dir);
+    }
+    command.arg(format!("+{toolchain}"));
+    if context_kind == DependencyKind::Development {
+        command.args(["test", "--no-run"]);
+    } else {
+        command.arg("rustdoc");
+    }
+    command
+        .args(["--manifest-path"])
+        .arg(&request.manifest_path)
+        .args([
+            "--locked",
+            "-p",
+            &package_spec(request.root_package),
+            "--target-dir",
+        ])
+        .arg(target_dir);
+    if let Some(target_triple) = &request.target_selection.command_line_override {
+        command.args(["--target", target_triple]);
+    }
+    let current_exe = env::current_exe()
+        .map_err(|err| format!("failed to locate check-docs executable for Rustdoc: {err}"))?;
+    command
+        .env("RUSTC_WRAPPER", current_exe)
+        .env("CHECK_DOCS_RUSTC_WRAPPER_MODE", "1")
+        .env("CHECK_DOCS_WRAPPER_PACKAGE_NAME", &request.package.name)
+        .env(
+            "CHECK_DOCS_WRAPPER_PACKAGE_VERSION",
+            request.package.version.to_string(),
+        )
+        .env(
+            "CHECK_DOCS_WRAPPER_MANIFEST_DIR",
+            request
+                .package
+                .manifest_path
+                .parent()
+                .expect("package manifest has parent")
+                .as_std_path(),
+        )
+        .env("CHECK_DOCS_WRAPPER_TARGET_NAME", &request.target.name)
+        .env(
+            "CHECK_DOCS_WRAPPER_FEATURES",
+            serde_json::to_string(&request.unit.features).expect("feature names serialize"),
+        )
+        .env("CHECK_DOCS_WRAPPER_UNIT_MODE", &request.unit.mode)
+        .env(
+            "CHECK_DOCS_WRAPPER_UNIT_PLATFORM",
+            serde_json::to_string(&request.unit.platform).expect("unit platform serializes"),
+        )
+        .env("CHECK_DOCS_WRAPPER_DOC_DIR", doc_dir);
+    let output = command
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to run cargo +{toolchain} rustdoc for {} {}: {err}; install the pinned toolchain with `rustup toolchain install {PINNED_TOOLCHAIN}` or set CHECK_DOCS_TOOLCHAIN",
+                request.package.name, request.package.version
+            )
+        })?;
+    handle_generate_output(request.package, toolchain, output)
+}
+
+pub(crate) fn run_rustc_wrapper() -> ! {
+    let command_arguments = env::args_os().skip(1).collect::<Vec<_>>();
+    let Some(compiler) = command_arguments.first() else {
+        eprintln!("check-docs Rust compiler wrapper was not given a compiler executable");
+        std::process::exit(1);
+    };
+    let status = Command::new(compiler)
+        .args(&command_arguments[1..])
+        .status()
+        .unwrap_or_else(|err| {
+            eprintln!("check-docs Rust compiler wrapper failed to run rustc: {err}");
+            std::process::exit(1);
+        });
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    let invocation = rustc_invocation(&command_arguments);
+    if !wrapper_matches_selected_unit(invocation.arguments) {
+        std::process::exit(0);
+    }
+
+    let Some(doc_dir) = env::var_os("CHECK_DOCS_WRAPPER_DOC_DIR").map(PathBuf::from) else {
+        eprintln!("check-docs Rust compiler wrapper is missing its Rustdoc output directory");
+        std::process::exit(1);
+    };
+    if let Err(err) = fs::create_dir_all(&doc_dir) {
+        eprintln!(
+            "check-docs Rust compiler wrapper failed to create {}: {err}",
+            doc_dir.display()
+        );
+        std::process::exit(1);
+    }
+    let mut rustdoc = PathBuf::from(invocation.rustc);
+    rustdoc.set_file_name(if cfg!(windows) {
+        "rustdoc.exe"
+    } else {
+        "rustdoc"
+    });
+    let rustdoc_arguments = rustdoc_arguments(invocation.arguments);
+    let mut command = if let Some(workspace_wrapper) = invocation.workspace_wrapper {
+        let mut command = Command::new(workspace_wrapper);
+        command.arg(&rustdoc);
+        command
+    } else {
+        Command::new(&rustdoc)
+    };
+    let status = command
+        .args(rustdoc_arguments)
+        .args(["-Z", "unstable-options", "--output-format", "json", "-o"])
+        .arg(&doc_dir)
+        .status()
+        .unwrap_or_else(|err| {
+            eprintln!(
+                "check-docs Rust compiler wrapper failed to run {}: {err}",
+                rustdoc.display()
+            );
+            std::process::exit(1);
+        });
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+struct RustcInvocation<'a> {
+    workspace_wrapper: Option<&'a OsStr>,
+    rustc: &'a OsStr,
+    arguments: &'a [OsString],
+}
+
+fn rustc_invocation(arguments: &[OsString]) -> RustcInvocation<'_> {
+    let compiler = arguments
+        .first()
+        .expect("compiler wrapper invocation has a compiler");
+    // Cargo puts an option immediately after rustc for its direct invocations. When
+    // RUSTC_WORKSPACE_WRAPPER is also active, Cargo's documented nesting instead puts
+    // the actual rustc executable in this position:
+    // `$RUSTC_WRAPPER $RUSTC_WORKSPACE_WRAPPER $RUSTC ...`.
+    let nested = arguments
+        .get(1)
+        .is_some_and(|argument| !argument.to_string_lossy().starts_with('-'));
+    if nested {
+        RustcInvocation {
+            workspace_wrapper: Some(compiler.as_os_str()),
+            rustc: arguments[1].as_os_str(),
+            arguments: &arguments[2..],
+        }
+    } else {
+        RustcInvocation {
+            workspace_wrapper: None,
+            rustc: compiler.as_os_str(),
+            arguments: &arguments[1..],
+        }
+    }
+}
+
+fn wrapper_matches_selected_unit(arguments: &[OsString]) -> bool {
+    let expected_name = env::var("CHECK_DOCS_WRAPPER_PACKAGE_NAME").ok();
+    let expected_version = env::var("CHECK_DOCS_WRAPPER_PACKAGE_VERSION").ok();
+    let expected_manifest_dir = env::var_os("CHECK_DOCS_WRAPPER_MANIFEST_DIR");
+    if expected_name.as_deref() != env::var("CARGO_PKG_NAME").ok().as_deref()
+        || expected_version.as_deref() != env::var("CARGO_PKG_VERSION").ok().as_deref()
+        || expected_manifest_dir.as_deref() != env::var_os("CARGO_MANIFEST_DIR").as_deref()
+    {
+        return false;
+    }
+    let arguments = arguments
+        .iter()
+        .map(|argument| argument.to_string_lossy())
+        .collect::<Vec<_>>();
+    let expected_target = env::var("CHECK_DOCS_WRAPPER_TARGET_NAME")
+        .unwrap_or_default()
+        .replace('-', "_");
+    if argument_value(&arguments, "--crate-name") != Some(expected_target.as_str()) {
+        return false;
+    }
+
+    let expected_mode = env::var("CHECK_DOCS_WRAPPER_UNIT_MODE").unwrap_or_default();
+    if rustc_compile_mode(&arguments) != Some(expected_mode.as_str()) {
+        return false;
+    }
+    let expected_platform = env::var("CHECK_DOCS_WRAPPER_UNIT_PLATFORM")
+        .ok()
+        .and_then(|platform| serde_json::from_str::<Option<String>>(&platform).ok())
+        .flatten();
+    if argument_value(&arguments, "--target") != expected_platform.as_deref() {
+        return false;
+    }
+
+    let mut actual_features = Vec::new();
+    for (index, argument) in arguments.iter().enumerate() {
+        let cfg = if argument == "--cfg" {
+            arguments.get(index + 1).map(|value| value.as_ref())
+        } else {
+            argument.strip_prefix("--cfg=")
+        };
+        if let Some(feature) = cfg
+            .and_then(|cfg| cfg.strip_prefix("feature=\""))
+            .and_then(|feature| feature.strip_suffix('"'))
+        {
+            actual_features.push(feature.to_string());
+        }
+    }
+    actual_features.sort();
+    actual_features.dedup();
+    let mut expected_features = env::var("CHECK_DOCS_WRAPPER_FEATURES")
+        .ok()
+        .and_then(|features| serde_json::from_str::<Vec<String>>(&features).ok())
+        .unwrap_or_default();
+    expected_features.sort();
+    expected_features.dedup();
+    actual_features == expected_features
+}
+
+fn argument_value<'a>(arguments: &'a [std::borrow::Cow<'a, str>], flag: &str) -> Option<&'a str> {
+    arguments.iter().enumerate().find_map(|(index, argument)| {
+        if argument == flag {
+            return arguments.get(index + 1).map(AsRef::as_ref);
+        }
+        argument
+            .strip_prefix(flag)
+            .and_then(|value| value.strip_prefix('='))
+    })
+}
+
+fn rustc_compile_mode(arguments: &[std::borrow::Cow<'_, str>]) -> Option<&'static str> {
+    let emit = argument_value(arguments, "--emit")?;
+    if emit.split(',').any(|kind| kind == "link") {
+        Some("build")
+    } else if emit.split(',').any(|kind| kind == "metadata") {
+        Some("check")
+    } else {
+        None
+    }
+}
+
+fn rustdoc_arguments(arguments: &[OsString]) -> Vec<OsString> {
+    let mut filtered = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = arguments[index].to_string_lossy();
+        if matches!(argument.as_ref(), "--emit" | "--out-dir" | "-o") {
+            index += 2;
+            continue;
+        }
+        if argument.starts_with("--emit=") || argument.starts_with("--out-dir=") {
+            index += 1;
+            continue;
+        }
+        if argument == "-C"
+            && arguments.get(index + 1).is_some_and(|value| {
+                matches!(
+                    value.to_string_lossy().split('=').next(),
+                    Some("incremental" | "metadata" | "extra-filename")
+                )
+            })
+        {
+            index += 2;
+            continue;
+        }
+        filtered.push(arguments[index].clone());
+        index += 1;
+    }
+    filtered
+}
+
+#[derive(Debug, Deserialize)]
+struct UnitGraph {
+    version: u32,
+    units: Vec<Unit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Unit {
+    pkg_id: String,
+    target: UnitTarget,
+    mode: String,
+    platform: Option<String>,
+    features: Vec<String>,
+    profile: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct UnitTarget {
+    name: String,
+}
+
+fn exact_context_kind(contexts: &[DependencyContext]) -> Result<DependencyKind, String> {
+    let Some(first) = contexts.first() else {
+        return Err("cannot select a Cargo unit without a dependency context".to_string());
+    };
+    if contexts.iter().any(|context| context.kind != first.kind) {
+        return Err(format!(
+            "dependency contexts resolve to different Cargo units ({}); query each exact context separately",
+            contexts
+                .iter()
+                .map(DependencyContext::label)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Ok(first.kind)
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoConfig {
+    build: CargoBuildConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoBuildConfig {
+    target: ConfiguredCargoTargets,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ConfiguredCargoTargets {
+    One(String),
+    Many(Vec<String>),
+}
+
+pub(crate) fn target_selection(
+    manifest_path: &Path,
+    command_line_target: Option<&str>,
+    host_triple: &str,
+) -> Result<CargoTargetSelection, String> {
+    if let Some(target) = command_line_target {
+        return Ok(CargoTargetSelection {
+            effective_triple: target.to_string(),
+            cargo_platform: Some(target.to_string()),
+            command_line_override: Some(target.to_string()),
+        });
+    }
+
+    let Some(configured_target) = configured_build_target(manifest_path)? else {
+        return Ok(CargoTargetSelection {
+            effective_triple: host_triple.to_string(),
+            cargo_platform: None,
+            command_line_override: None,
+        });
+    };
+    Ok(CargoTargetSelection {
+        effective_triple: configured_target.clone(),
+        cargo_platform: Some(configured_target),
+        command_line_override: None,
+    })
+}
+
+fn configured_build_target(manifest_path: &Path) -> Result<Option<String>, String> {
+    let toolchain =
+        env::var("CHECK_DOCS_TOOLCHAIN").unwrap_or_else(|_| PINNED_TOOLCHAIN.to_string());
     let mut command = Command::new("cargo");
     if let Some(invocation_dir) = manifest_path
         .parent()
@@ -201,25 +610,161 @@ fn generate_json_with_toolchain(
     {
         command.current_dir(invocation_dir);
     }
-    command
-        .arg(format!("+{toolchain}"))
-        .args(["rustdoc", "--manifest-path"])
-        .arg(&manifest_path)
-        .args(["-p", &spec]);
-    if let Some(target_triple) = target_triple {
-        command.args(["--target", target_triple]);
-    }
     let output = command
-        .args(selector)
-        .args(["--", "-Z", "unstable-options", "--output-format", "json"])
+        .arg(format!("+{toolchain}"))
+        .args([
+            "-Z",
+            "unstable-options",
+            "config",
+            "get",
+            "build.target",
+            "--format",
+            "json",
+        ])
         .output()
         .map_err(|err| {
-            format!(
-                "failed to run cargo +{toolchain} rustdoc for {} {}: {err}; install the pinned toolchain with `rustup toolchain install {PINNED_TOOLCHAIN}` or set CHECK_DOCS_TOOLCHAIN",
-                package.name, package.version
-            )
+            format!("failed to ask Cargo for the configured build target with +{toolchain}: {err}")
         })?;
-    handle_generate_output(package, toolchain, output)
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("config value `build.target` is not set") {
+            return Ok(None);
+        }
+        return Err(format!(
+            "failed to read Cargo's configured build target: {}",
+            stderr.trim()
+        ));
+    }
+    let config: CargoConfig = serde_json::from_slice(&output.stdout).map_err(|err| {
+        format!(
+            "failed to parse Cargo's configured build target: {err}: {}",
+            String::from_utf8_lossy(&output.stdout).trim()
+        )
+    })?;
+    match config.build.target {
+        ConfiguredCargoTargets::One(target) => Ok(Some(target)),
+        ConfiguredCargoTargets::Many(targets) => Err(format!(
+            "Cargo build.target selects multiple targets ({}); pass --target TRIPLE to select one documentation target",
+            targets.join(", ")
+        )),
+    }
+}
+
+pub(crate) fn resolved_unit(
+    manifest_path: &Path,
+    root_package: &Package,
+    package: &Package,
+    target: &Target,
+    contexts: &[DependencyContext],
+    target_selection: &CargoTargetSelection,
+) -> Result<CargoUnitIdentity, String> {
+    let toolchain =
+        env::var("CHECK_DOCS_TOOLCHAIN").unwrap_or_else(|_| PINNED_TOOLCHAIN.to_string());
+    let context_kind = exact_context_kind(contexts)?;
+    let only_dev = context_kind == DependencyKind::Development;
+    let host_unit = context_kind == DependencyKind::Build
+        || target.kind.iter().any(|kind| kind == "proc-macro");
+    let mut command = Command::new("cargo");
+    if let Some(invocation_dir) = manifest_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        command.current_dir(invocation_dir);
+    }
+    command.arg(format!("+{toolchain}"));
+    if only_dev {
+        command.args(["test", "--no-run"]);
+    } else {
+        command.arg("rustdoc");
+    }
+    command.args(["--manifest-path"]).arg(manifest_path).args([
+        "--locked",
+        "-p",
+        &package_spec(root_package),
+        "--unit-graph",
+        "-Z",
+        "unstable-options",
+    ]);
+    if let Some(target_triple) = &target_selection.command_line_override {
+        command.args(["--target", target_triple]);
+    }
+    let output = command.output().map_err(|err| {
+        format!(
+            "failed to run cargo +{toolchain} to resolve the exact feature unit for {} {}: {err}",
+            package.name, package.version
+        )
+    })?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to resolve the exact Cargo feature unit for {} {} without changing Cargo.lock: {}; run `cargo check` or `cargo build` to create or refresh the lockfile, then retry",
+            package.name,
+            package.version,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let graph: UnitGraph = serde_json::from_slice(&output.stdout).map_err(|err| {
+        format!(
+            "failed to parse Cargo unit graph while resolving features for {} {}: {err}",
+            package.name, package.version
+        )
+    })?;
+    if graph.version != 1 {
+        return Err(format!(
+            "Cargo unit graph version {} is unsupported; supported: 1",
+            graph.version
+        ));
+    }
+
+    let expected_mode = if only_dev || host_unit {
+        "build"
+    } else {
+        "check"
+    };
+    let expected_platform = if host_unit {
+        None
+    } else {
+        target_selection.cargo_platform.as_deref()
+    };
+    let mut candidates = graph
+        .units
+        .into_iter()
+        .filter(|unit| unit.pkg_id == package.id.to_string() && unit.target.name == target.name)
+        .filter(|unit| unit.mode == expected_mode && unit.platform.as_deref() == expected_platform)
+        .map(|mut unit| {
+            unit.features.sort();
+            CargoUnitIdentity {
+                features: unit.features,
+                mode: unit.mode,
+                platform: unit.platform,
+                profile: serde_json::to_string(&unit.profile).expect("Cargo profile serializes"),
+            }
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.features
+            .cmp(&right.features)
+            .then_with(|| left.profile.cmp(&right.profile))
+    });
+    candidates.dedup();
+    match candidates.as_slice() {
+        [unit] => Ok(unit.clone()),
+        [] => Err(format!(
+            "Cargo unit graph did not contain the selected {} unit for {} {} target {} on {}",
+            expected_mode,
+            package.name,
+            package.version,
+            target.name,
+            expected_platform.unwrap_or("the host platform")
+        )),
+        _ => Err(format!(
+            "Cargo unit graph contained multiple {} units for {} {} target {} on {}; query a dependency context with one exact Cargo unit",
+            expected_mode,
+            package.name,
+            package.version,
+            target.name,
+            expected_platform.unwrap_or("the host platform")
+        )),
+    }
 }
 
 fn target_selector(target: &Target) -> Result<Vec<String>, String> {
@@ -259,6 +804,8 @@ fn handle_generate_output(
 fn format_generate_error(package: &Package, _toolchain: &str, stderr: &str) -> String {
     let hint = if stderr.contains("toolchain") || stderr.contains("not installed") {
         "; compatible nightly toolchain not found; install with `rustup toolchain install nightly-2025-09-10` or set CHECK_DOCS_TOOLCHAIN"
+    } else if stderr.contains("lock file") && stderr.contains("needs to be updated") {
+        "; Cargo.lock is missing or stale; run `cargo check` or `cargo build` to refresh it, then retry"
     } else if stderr.contains("unstable-options") || stderr.contains("output-format") {
         "; rustdoc JSON requires nightly and `-Z unstable-options`"
     } else {
@@ -471,15 +1018,121 @@ mod tests {
     fn generate_json_reports_missing_toolchain() {
         let pkg = package();
         let target = pkg.targets[0].clone();
+        let output = tempfile::TempDir::new().unwrap();
+        let contexts = [DependencyContext {
+            kind: DependencyKind::Normal,
+            target: None,
+            via: None,
+        }];
+        let target_selection = CargoTargetSelection {
+            effective_triple: "x86_64-unknown-linux-gnu".into(),
+            cargo_platform: None,
+            command_line_override: None,
+        };
+        let unit = CargoUnitIdentity {
+            features: Vec::new(),
+            mode: "check".into(),
+            platform: None,
+            profile: "{}".into(),
+        };
+        let request = RustdocRequest {
+            manifest_path: PathBuf::from("Cargo.toml"),
+            metadata: &metadata(),
+            root_package: &pkg,
+            package: &pkg,
+            target: &target,
+            contexts: &contexts,
+            target_selection: &target_selection,
+            unit: &unit,
+        };
         let err = generate_json_with_toolchain(
-            PathBuf::from("Cargo.toml"),
-            &pkg,
-            &target,
-            None,
+            &request,
+            output.path(),
+            output.path(),
             "definitely_missing_check_docs_toolchain",
         )
         .unwrap_err();
         assert!(err.contains("failed to generate rustdoc JSON"));
+    }
+
+    #[test]
+    fn compiler_wrapper_parses_direct_and_nested_cargo_invocations() {
+        let direct = vec![
+            OsString::from("/toolchain/bin/rustc"),
+            OsString::from("--crate-name"),
+            OsString::from("fixture"),
+        ];
+        let invocation = rustc_invocation(&direct);
+        assert!(invocation.workspace_wrapper.is_none());
+        assert_eq!(invocation.rustc, OsStr::new("/toolchain/bin/rustc"));
+        assert_eq!(invocation.arguments, &direct[1..]);
+
+        let nested = vec![
+            OsString::from("/workspace/recording-wrapper"),
+            OsString::from("/toolchain/bin/rustc"),
+            OsString::from("--crate-name"),
+            OsString::from("fixture"),
+        ];
+        let invocation = rustc_invocation(&nested);
+        assert_eq!(
+            invocation.workspace_wrapper,
+            Some(OsStr::new("/workspace/recording-wrapper"))
+        );
+        assert_eq!(invocation.rustc, OsStr::new("/toolchain/bin/rustc"));
+        assert_eq!(invocation.arguments, &nested[2..]);
+    }
+
+    #[test]
+    fn compiler_wrapper_distinguishes_compile_mode_and_platform() {
+        let target_check = [
+            OsString::from("--crate-name"),
+            OsString::from("shared"),
+            OsString::from("--emit=dep-info,metadata"),
+            OsString::from("--target"),
+            OsString::from("wasm32-unknown-unknown"),
+        ];
+        let target_check = target_check
+            .iter()
+            .map(|argument| argument.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert_eq!(rustc_compile_mode(&target_check), Some("check"));
+        assert_eq!(
+            argument_value(&target_check, "--target"),
+            Some("wasm32-unknown-unknown")
+        );
+
+        let host_build = [
+            OsString::from("--crate-name=shared"),
+            OsString::from("--emit"),
+            OsString::from("dep-info,metadata,link"),
+        ];
+        let host_build = host_build
+            .iter()
+            .map(|argument| argument.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert_eq!(rustc_compile_mode(&host_build), Some("build"));
+        assert_eq!(argument_value(&host_build, "--target"), None);
+        assert_eq!(argument_value(&host_build, "--crate-name"), Some("shared"));
+    }
+
+    #[test]
+    fn cargo_unit_selection_rejects_mixed_contexts() {
+        let contexts = [
+            DependencyContext {
+                kind: DependencyKind::Normal,
+                target: None,
+                via: None,
+            },
+            DependencyContext {
+                kind: DependencyKind::Development,
+                target: None,
+                via: None,
+            },
+        ];
+
+        let error = exact_context_kind(&contexts).unwrap_err();
+        assert!(error.contains("different Cargo units"));
+        assert!(error.contains("normal, dev"));
     }
 
     #[test]

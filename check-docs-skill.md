@@ -15,8 +15,8 @@ It reports:
 - definition/signature, including higher-ranked function-pointer binders
 - deprecation details (`since` and `note`) when present
 - semantic attributes: `repr`, `non_exhaustive`, and `must_use`
-- struct/union fields with their Rust visibility, plus `private/stripped` note
-  when fields are hidden
+- struct/union fields with their Rust visibility; definitions contain an explicit
+  `private/stripped` comment and details contain a matching note when fields are hidden
 - enum variants, including explicit discriminants
 - trait associated items, including provided associated-constant defaults
 - constant and static initializers when Rustdoc preserves them; extern statics are
@@ -77,7 +77,8 @@ check-docs 'use tokio::sync::{Mutex, RwLock, Semaphore};' --root .
 - `self` imports inside non-root braces: `use tokio::sync::{self, mpsc};`
 - Modules are supported and labeled: `use tokio::sync::watch;` -> `item: module watch`
 - Enum variants are supported: `use facade::Number::One;`
-- Raw identifiers are supported in crate aliases and item paths; their source spelling is preserved.
+- Raw identifiers are supported in crate aliases and item paths; declarations restore
+  the `r#` prefix wherever Rustdoc reports an unescaped keyword name.
 - Concrete items behind public external globs and multi-package re-export chains
   are followed through the resolved Cargo dependency graph.
 
@@ -89,14 +90,32 @@ Unsupported:
 
 ## Dependency and feature workflow
 
-`check-docs` runs Rustdoc through Cargo for the target project:
+`check-docs` asks Cargo for the selected root package's exact unit graph, then
+runs the root Cargo operation with an internal compiler wrapper that emits
+Rustdoc JSON for the matching dependency unit. Conceptually, the Cargo side is:
 
 ```bash
-cargo +nightly-2025-09-10 rustdoc -p <dependency>@<version> --manifest-path <root>/Cargo.toml -- -Z unstable-options --output-format json
+cargo +nightly-2025-09-10 rustdoc --locked -p <selected-root-package> --manifest-path <root>/Cargo.toml
 ```
 
 Consequences:
 
+- It refuses to create or update `Cargo.lock`; a missing or stale lockfile must be
+  refreshed explicitly with `cargo check` or `cargo build`.
+- It obtains the dependency's context-specific feature unit from Cargo's unit graph
+  and emits JSON from that exact compiler invocation, including non-workspace dependencies.
+- With no `--target`, it honors Cargo's effective `build.target` configuration (including
+  `CARGO_BUILD_TARGET`); an explicit `--target` remains the highest-precedence override.
+- Compiler-wrapper matching and cache paths include Cargo's compile mode, host/target
+  platform, feature set, and profile identity, so equal-feature host and target units
+  cannot overwrite one another's Rustdoc JSON.
+- Dev-only queries use Cargo's test graph, build-only queries use the host build unit,
+  and external re-export traversal preserves that originating context at every hop.
+- If one package is selected in multiple contexts (for example, normal and dev with
+  different features), each context in which the item exists is reported separately;
+  output never labels one generated unit as though it represented all contexts.
+- Cargo's configured workspace compiler wrapper remains in the compiler chain and is
+  replayed around the matching Rustdoc invocation.
 - It uses exact versions from the project lockfile/resolution.
 - It respects dependency renames from `Cargo.toml`.
 - It uses exactly the features enabled by the target project.
@@ -168,6 +187,8 @@ the `rustdoc-types 0.56.x` schema.
 - `external branches failed`: the item crossed an external re-export or glob, but
   no unique reachable normal dependency branch contained the requested concrete item.
 - `failed to generate rustdoc JSON`: install/use the pinned nightly, run `cargo check`, inspect Cargo/Rustdoc stderr.
+- `failed to read cargo metadata without changing Cargo.lock`: run `cargo check` or
+  `cargo build` to create or refresh the lockfile, then retry.
 - `item not found`: likely wrong path, private item, disabled feature, or unsupported Rustdoc shape.
 - `definition rendering unsupported for ...`: Rustdoc identified the item, but its schema does not contain enough source information to print a trustworthy Rust declaration.
 

@@ -67,14 +67,10 @@ impl DependencyContext {
     }
 }
 
-fn transitive_context(
-    kind: DependencyKind,
-    target: Option<String>,
-    source_crate: &str,
-) -> DependencyContext {
+fn transitive_context(source_context: &DependencyContext, source_crate: &str) -> DependencyContext {
     DependencyContext {
-        kind,
-        target,
+        kind: source_context.kind,
+        target: source_context.target.clone(),
         via: Some(source_crate.to_string()),
     }
 }
@@ -95,6 +91,7 @@ pub(crate) fn resolve_dependency_from_package<'a>(
     metadata: &Metadata,
     packages: &'a [Package],
     source_package: &Package,
+    source_contexts: &[DependencyContext],
     crate_name: &str,
 ) -> Result<ResolvedDependency<'a>, ResolveError> {
     let Some(resolve) = metadata.resolve.as_ref() else {
@@ -118,19 +115,18 @@ pub(crate) fn resolve_dependency_from_package<'a>(
         if !dependency_matches_crate_name(dep, crate_name) {
             continue;
         }
-        for dep_kind in dep
+        if dep
             .dep_kinds
             .iter()
-            .filter(|dep_kind| dep_kind.kind == DependencyKind::Normal)
+            .all(|dep_kind| dep_kind.kind != DependencyKind::Normal)
         {
+            continue;
+        }
+        for source_context in source_contexts {
             push_dependency_context(
                 &mut matches,
                 dep.pkg.clone(),
-                transitive_context(
-                    dep_kind.kind,
-                    dep_kind.target.as_ref().map(ToString::to_string),
-                    &source_package.name,
-                ),
+                transitive_context(source_context, &source_package.name),
             );
         }
     }
@@ -179,16 +175,21 @@ pub(crate) fn resolve_dependency_from_package<'a>(
     }
 }
 
-pub(crate) fn resolve_reachable_dependency<'a>(
+pub(crate) fn resolve_reachable_dependencies<'a>(
     metadata: &Metadata,
     packages: &'a [Package],
     source_package: &Package,
+    source_contexts: &[DependencyContext],
     crate_name: &str,
-) -> Result<ResolvedDependency<'a>, ResolveError> {
-    if let Ok(direct) =
-        resolve_dependency_from_package(metadata, packages, source_package, crate_name)
-    {
-        return Ok(direct);
+) -> Result<Vec<ResolvedDependency<'a>>, ResolveError> {
+    if let Ok(direct) = resolve_dependency_from_package(
+        metadata,
+        packages,
+        source_package,
+        source_contexts,
+        crate_name,
+    ) {
+        return Ok(vec![direct]);
     }
 
     let Some(resolve) = metadata.resolve.as_ref() else {
@@ -220,27 +221,27 @@ pub(crate) fn resolve_reachable_dependency<'a>(
             if !dependency_matches_crate_name(dep, crate_name) {
                 continue;
             }
-            for dep_kind in normal_kinds {
+            for source_context in source_contexts {
                 push_dependency_context(
                     &mut matches,
                     dep.pkg.clone(),
-                    transitive_context(
-                        dep_kind.kind,
-                        dep_kind.target.as_ref().map(ToString::to_string),
-                        &source_package.name,
-                    ),
+                    transitive_context(source_context, &source_package.name),
                 );
             }
         }
     }
 
     matches.sort_by(|left, right| left.package_id.repr.cmp(&right.package_id.repr));
-    match matches.as_slice() {
-        [] => Err(ResolveError::Other(format!(
+    if matches.is_empty() {
+        return Err(ResolveError::Other(format!(
             "crate '{crate_name}' is not reachable through normal dependencies of '{}'",
             source_package.name
-        ))),
-        [entry] => {
+        )));
+    }
+
+    matches
+        .iter()
+        .map(|entry| {
             let package = package_by_id(packages, &entry.package_id).ok_or_else(|| {
                 ResolveError::Other(format!(
                     "reachable dependency '{crate_name}' of '{}' missing from cargo metadata",
@@ -253,19 +254,8 @@ pub(crate) fn resolve_reachable_dependency<'a>(
                 target,
                 contexts: entry.contexts.clone(),
             })
-        }
-        entries => {
-            let candidates = entries
-                .iter()
-                .map(|entry| entry.package_id.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(ResolveError::Other(format!(
-                "crate '{crate_name}' matched multiple reachable dependencies of '{}': {candidates}",
-                source_package.name
-            )))
-        }
-    }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -726,6 +716,7 @@ edition = "2024"
             &metadata,
             &metadata.packages,
             serde.package,
+            &serde.contexts,
             "serde_core",
         )
         .unwrap();
@@ -804,21 +795,43 @@ edition = "2024"
             .iter()
             .find(|package| package.name == "source")
             .unwrap();
+        let source_contexts = [DependencyContext {
+            kind: DependencyKind::Normal,
+            target: None,
+            via: None,
+        }];
 
-        let resolved =
-            resolve_dependency_from_package(&metadata, &metadata.packages, source, "origin")
-                .unwrap();
+        let resolved = resolve_dependency_from_package(
+            &metadata,
+            &metadata.packages,
+            source,
+            &source_contexts,
+            "origin",
+        )
+        .unwrap();
         assert_eq!(resolved.package.name, "normal_pkg");
         assert_eq!(resolved.contexts.len(), 1);
         assert_eq!(resolved.contexts[0].kind, DependencyKind::Normal);
 
         assert!(
-            resolve_dependency_from_package(&metadata, &metadata.packages, source, "normal_pkg")
-                .is_err()
+            resolve_dependency_from_package(
+                &metadata,
+                &metadata.packages,
+                source,
+                &source_contexts,
+                "normal_pkg"
+            )
+            .is_err()
         );
         assert!(
-            resolve_dependency_from_package(&metadata, &metadata.packages, source, "dev_origin")
-                .is_err()
+            resolve_dependency_from_package(
+                &metadata,
+                &metadata.packages,
+                source,
+                &source_contexts,
+                "dev_origin"
+            )
+            .is_err()
         );
     }
 

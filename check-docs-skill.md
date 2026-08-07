@@ -9,6 +9,7 @@ Use `check-docs` for local Rust dependency docs from the exact crate version and
 It reports:
 
 - crate name + exact resolved version
+- normalized root feature selection
 - rustdoc JSON/source location
 - item kind/name, including modules
 - absolute file + line where declared when available
@@ -17,7 +18,8 @@ It reports:
 - semantic attributes: `repr`, `non_exhaustive`, and `must_use`
 - struct/union fields with their Rust visibility; definitions contain an explicit
   `private/stripped` comment and details contain a matching note when fields are hidden
-- enum variants, including explicit discriminants
+- enum variants, including explicit discriminants; Rustdoc placeholder expressions
+  use their evaluated value when one is available
 - trait associated items, including provided associated-constant defaults
 - constant and static initializers when Rustdoc preserves them; extern statics are
   labeled with their access safety instead of being shown with an invented initializer
@@ -67,6 +69,18 @@ check-docs 'use serde::Serialize;' --root .
 check-docs 'use tokio::sync::{Mutex, RwLock, Semaphore};' --root .
 ```
 
+Root-package feature selection uses Cargo-compatible flags:
+
+```bash
+check-docs 'use dependency::Extra;' --root . --features extra
+check-docs 'use dependency::Extra;' --root . --all-features
+check-docs 'use dependency::DefaultApi;' --root . --no-default-features
+```
+
+`--features` accepts comma- or space-separated feature names and may be repeated.
+In a virtual workspace, combine feature flags with `--package`; unqualified feature
+names apply to that selected package just as they do for `cargo check -p`.
+
 ## Supported input
 
 - External crate paths: `use serde::Serialize;`
@@ -74,13 +88,16 @@ check-docs 'use tokio::sync::{Mutex, RwLock, Semaphore};' --root .
 - Single-item brace imports: `use syn::{File};`
 - Nested brace imports: `use tower::{service_fn, util::{MapResponseLayer}};`
 - Renamed imports resolve original item: `use syn::File as SynFile;`
-- `self` imports inside non-root braces: `use tokio::sync::{self, mpsc};`
+- `self` imports inside non-root braces: `use tokio::sync::{self, mpsc};`.
+  These bind only the parent's type namespace, matching Rust import semantics.
 - Modules are supported and labeled: `use tokio::sync::watch;` -> `item: module watch`
 - Enum variants are supported: `use facade::Number::One;`
 - Raw identifiers are supported in crate aliases and item paths; declarations restore
   the `r#` prefix wherever Rustdoc reports an unescaped keyword name.
 - Concrete items behind public external globs and multi-package re-export chains
   are followed through the resolved Cargo dependency graph.
+- Public primitive re-exports such as `pub use i32 as MyI32` are reported with
+  both the public use declaration and the built-in primitive identity.
 
 Unsupported:
 
@@ -104,6 +121,8 @@ Consequences:
   refreshed explicitly with `cargo check` or `cargo build`.
 - It obtains the dependency's context-specific feature unit from Cargo's unit graph
   and emits JSON from that exact compiler invocation, including non-workspace dependencies.
+- `--features`, `--all-features`, and `--no-default-features` are forwarded to
+  metadata, unit selection, Rustdoc generation, and cache identity as one normalized selection.
 - With no `--target`, it honors Cargo's effective `build.target` configuration (including
   `CARGO_BUILD_TARGET`); an explicit `--target` remains the highest-precedence override.
 - Compiler-wrapper matching and cache paths include Cargo's compile mode, host/target
@@ -111,11 +130,15 @@ Consequences:
   cannot overwrite one another's Rustdoc JSON.
 - Dev-only queries use Cargo's test graph, build-only queries use the host build unit,
   and external re-export traversal preserves that originating context at every hop.
+- Target-specific normal/dev edges are evaluated for the selected target, while
+  target-specific build-dependency edges are evaluated separately for the host.
 - If one package is selected in multiple contexts (for example, normal and dev with
   different features), each context in which the item exists is reported separately;
   output never labels one generated unit as though it represented all contexts.
 - Cargo's configured workspace compiler wrapper remains in the compiler chain and is
   replayed around the matching Rustdoc invocation.
+- Cargo's configured general compiler wrapper also remains in the chain for both
+  ordinary compiler work and the matching generated Rustdoc invocation.
 - It uses exact versions from the project lockfile/resolution.
 - It respects dependency renames from `Cargo.toml`.
 - It uses exactly the features enabled by the target project.
@@ -187,8 +210,13 @@ the `rustdoc-types 0.56.x` schema.
 - `external branches failed`: the item crossed an external re-export or glob, but
   no unique reachable normal dependency branch contained the requested concrete item.
 - `failed to generate rustdoc JSON`: install/use the pinned nightly, run `cargo check`, inspect Cargo/Rustdoc stderr.
-- `failed to read cargo metadata without changing Cargo.lock`: run `cargo check` or
-  `cargo build` to create or refresh the lockfile, then retry.
+- `query ... is incomplete`: at least one requested dependency context had a Cargo,
+  unit-selection, Rustdoc, parse, or ambiguity failure; fix that context before
+  treating output from another context as complete. A conclusively absent item may
+  still be omitted when it exists in another selected context.
+- `failed to read cargo metadata without changing Cargo.lock`: follow lockfile-refresh
+  guidance only when Cargo specifically reports a missing or stale lockfile; otherwise
+  fix the manifest, target, feature, or other Cargo error shown.
 - `item not found`: likely wrong path, private item, disabled feature, or unsupported Rustdoc shape.
 - `definition rendering unsupported for ...`: Rustdoc identified the item, but its schema does not contain enough source information to print a trustworthy Rust declaration.
 

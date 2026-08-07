@@ -1,4 +1,7 @@
+use std::ffi::OsString;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
@@ -1008,7 +1011,7 @@ locked_dep = { path = "../locked_dep" }
 }
 
 #[test]
-fn binary_probes_all_reachable_versions_for_external_reexports() {
+fn binary_follows_the_immediate_reexport_edge_when_versions_share_an_item() {
     let workspace = TempDir::new().unwrap();
     for member in ["app", "facade", "middle", "other", "origin_v1", "origin_v2"] {
         fs::create_dir_all(workspace.path().join(member).join("src")).unwrap();
@@ -1036,7 +1039,7 @@ resolver = "3"
     .unwrap();
     fs::write(
         workspace.path().join("facade/src/lib.rs"),
-        "pub use middle::*;\n",
+        "pub use middle::*;\npub mod nested { pub use middle::Thing as NestedThing; }\npub use crate::nested::NestedThing;\n",
     )
     .unwrap();
     fs::write(
@@ -1057,7 +1060,7 @@ resolver = "3"
     fs::write(workspace.path().join("other/src/lib.rs"), "").unwrap();
     for (directory, version, source) in [
         ("origin_v1", "1.0.0", "pub struct Thing;\n"),
-        ("origin_v2", "2.0.0", "pub struct OtherThing;\n"),
+        ("origin_v2", "2.0.0", "pub struct Thing;\n"),
     ] {
         fs::write(
             workspace.path().join(directory).join("Cargo.toml"),
@@ -1070,7 +1073,7 @@ resolver = "3"
 
     let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
         .args([
-            "use facade::Thing;",
+            "use facade::{Thing, NestedThing};",
             "--root",
             workspace.path().to_str().unwrap(),
             "--package",
@@ -1086,6 +1089,10 @@ resolver = "3"
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("crate: origin 1.0.0"), "{stdout}");
     assert!(stdout.contains("item: struct Thing"), "{stdout}");
+    assert!(
+        stdout.contains("import: use facade::NestedThing;"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -1241,7 +1248,13 @@ fn binary_preserves_dev_context_across_external_reexports() {
 
 #[test]
 fn binary_preserves_build_context_across_external_reexports() {
-    let workspace = context_reexport_workspace("[build-dependencies]", true);
+    let workspace = context_reexport_workspace("[target.'cfg(unix)'.build-dependencies]", true);
+    fs::create_dir_all(workspace.path().join(".cargo")).unwrap();
+    fs::write(
+        workspace.path().join(".cargo/config.toml"),
+        "[build]\ntarget = \"wasm32-unknown-unknown\"\n",
+    )
+    .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
         .args([
             "use facade::ContextThing;",
@@ -1262,7 +1275,7 @@ fn binary_preserves_build_context_across_external_reexports() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("crate: origin 0.1.0"), "{stdout}");
     assert!(
-        stdout.contains("dependency: transitive via facade (build)"),
+        stdout.contains("dependency: transitive via facade (build (cfg(unix)))"),
         "{stdout}"
     );
     assert!(stdout.contains("definition: pub struct ContextThing;"));
@@ -1480,7 +1493,7 @@ edition = "2024"
 shared = { path = "../shared" }
 macro_dep = { path = "../macro_dep" }
 
-[build-dependencies]
+[target.'cfg(unix)'.build-dependencies]
 shared = { path = "../shared" }
 "#,
     )
@@ -1598,6 +1611,456 @@ pub struct HostOnly;
 }
 
 #[test]
+fn binary_supports_relative_child_and_sibling_roots() {
+    let parent = TempDir::new().unwrap();
+    let sibling = parent.path().join("sibling");
+    for member in ["app", "dep"] {
+        fs::create_dir_all(sibling.join(member).join("src")).unwrap();
+    }
+    fs::write(
+        sibling.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"dep\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    fs::write(
+        sibling.join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\ndep = { path = \"../dep\" }\n",
+    )
+    .unwrap();
+    fs::write(sibling.join("app/src/lib.rs"), "").unwrap();
+    fs::write(
+        sibling.join("dep/Cargo.toml"),
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(sibling.join("dep/src/lib.rs"), "pub struct Thing;\n").unwrap();
+    let lock = Command::new("cargo")
+        .args(["generate-lockfile", "--offline", "--manifest-path"])
+        .arg(sibling.join("Cargo.toml"))
+        .output()
+        .unwrap();
+    assert!(
+        lock.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
+
+    let child = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .current_dir(parent.path())
+        .args(["use dep::Thing;", "--root", "sibling", "--package", "app"])
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "{}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+
+    fs::create_dir_all(parent.path().join("runner")).unwrap();
+    let relative_sibling = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .current_dir(parent.path().join("runner"))
+        .args([
+            "use dep::Thing;",
+            "--root",
+            "../sibling",
+            "--package",
+            "app",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        relative_sibling.status.success(),
+        "{}",
+        String::from_utf8_lossy(&relative_sibling.stderr)
+    );
+}
+
+#[test]
+fn binary_forwards_root_feature_selection_in_a_workspace() {
+    let workspace = TempDir::new().unwrap();
+    for member in ["app", "feature_dep"] {
+        fs::create_dir_all(workspace.path().join(member).join("src")).unwrap();
+    }
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"feature_dep\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("app/Cargo.toml"),
+        r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["feature_dep/default-api"]
+extra = ["feature_dep/extra"]
+
+[dependencies]
+feature_dep = { path = "../feature_dep", default-features = false }
+"#,
+    )
+    .unwrap();
+    fs::write(workspace.path().join("app/src/lib.rs"), "").unwrap();
+    fs::write(
+        workspace.path().join("feature_dep/Cargo.toml"),
+        r#"
+[package]
+name = "feature_dep"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default-api = []
+extra = []
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("feature_dep/src/lib.rs"),
+        "#[cfg(feature = \"default-api\")]\npub struct DefaultOnly;\n#[cfg(feature = \"extra\")]\npub struct Extra;\n",
+    )
+    .unwrap();
+    lock_workspace(&workspace);
+
+    for feature_args in [vec!["--features", "extra"], vec!["--all-features"]] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_check-docs"));
+        command.args([
+            "use feature_dep::Extra;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ]);
+        command.args(feature_args);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("pub struct Extra;"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("root features: --"));
+    }
+
+    let no_defaults = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use feature_dep::DefaultOnly;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+            "--no-default-features",
+        ])
+        .output()
+        .unwrap();
+    assert!(!no_defaults.status.success());
+    assert!(String::from_utf8_lossy(&no_defaults.stderr).contains("DefaultOnly' not found"));
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_composes_with_a_general_cfg_injecting_rustc_wrapper() {
+    let workspace = TempDir::new().unwrap();
+    for member in ["app", "wrapped_dep"] {
+        fs::create_dir_all(workspace.path().join(member).join("src")).unwrap();
+    }
+    fs::create_dir_all(workspace.path().join(".cargo")).unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"wrapped_dep\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nwrapped_dep = { path = \"../wrapped_dep\" }\n",
+    )
+    .unwrap();
+    fs::write(workspace.path().join("app/src/lib.rs"), "").unwrap();
+    fs::write(
+        workspace.path().join("wrapped_dep/Cargo.toml"),
+        "[package]\nname = \"wrapped_dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("wrapped_dep/src/lib.rs"),
+        "#[cfg(wrapped)]\npub struct WrappedThing;\n",
+    )
+    .unwrap();
+    let wrapper = workspace.path().join("cfg-wrapper.sh");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\ncompiler=\"$1\"\nshift\nexec \"$compiler\" --cfg wrapped \"$@\"\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&wrapper).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&wrapper, permissions).unwrap();
+    fs::write(
+        workspace.path().join(".cargo/config.toml"),
+        format!("[build]\nrustc-wrapper = {:?}\n", wrapper.to_str().unwrap()),
+    )
+    .unwrap();
+    lock_workspace(&workspace);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use wrapped_dep::WrappedThing;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("pub struct WrappedThing;"));
+}
+
+#[test]
+fn binary_fails_when_one_selected_context_cannot_be_verified() {
+    let workspace = TempDir::new().unwrap();
+    for member in ["app", "dep"] {
+        fs::create_dir_all(workspace.path().join(member).join("src")).unwrap();
+    }
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"dep\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\ndep = { path = \"../dep\" }\n[dev-dependencies]\ndep = { path = \"../dep\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("app/src/lib.rs"),
+        "#[cfg(test)]\ncompile_error!(\"dev graph intentionally fails\");\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("dep/Cargo.toml"),
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("dep/src/lib.rs"),
+        "pub struct Thing;\n",
+    )
+    .unwrap();
+    lock_workspace(&workspace);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use dep::Thing;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+            "--include-dev",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("query 'dep::Thing' is incomplete"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("dev graph intentionally fails"), "{stderr}");
+}
+
+#[test]
+fn binary_applies_named_shadowing_per_exact_namespace() {
+    let workspace = TempDir::new().unwrap();
+    for member in ["app", "facade", "direct_origin", "glob_origin"] {
+        fs::create_dir_all(workspace.path().join(member).join("src")).unwrap();
+    }
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"facade\", \"direct_origin\", \"glob_origin\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nfacade = { path = \"../facade\" }\n",
+    )
+    .unwrap();
+    fs::write(workspace.path().join("app/src/lib.rs"), "").unwrap();
+    fs::write(
+        workspace.path().join("facade/Cargo.toml"),
+        "[package]\nname = \"facade\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\ndirect_origin = { path = \"../direct_origin\" }\nglob_origin = { path = \"../glob_origin\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("facade/src/lib.rs"),
+        "pub use direct_origin::{Same, Partial, Variant, VariantUnit};\npub use glob_origin::*;\n",
+    )
+    .unwrap();
+    for member in ["direct_origin", "glob_origin"] {
+        fs::write(
+            workspace.path().join(member).join("Cargo.toml"),
+            format!("[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        workspace.path().join("direct_origin/src/lib.rs"),
+        "pub struct Same;\npub struct Partial { pub value: u8 }\npub enum Direct { Variant { value: u8 }, VariantUnit }\npub use Direct::{Variant, VariantUnit};\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("glob_origin/src/lib.rs"),
+        "pub struct Same;\npub struct Partial(pub u8);\npub enum Other { Variant(u8), VariantUnit }\npub use Other::*;\n",
+    )
+    .unwrap();
+    lock_workspace(&workspace);
+
+    for import in ["use facade::Same;", "use facade::VariantUnit;"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+            .args([
+                import,
+                "--root",
+                workspace.path().to_str().unwrap(),
+                "--package",
+                "app",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{import}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("crate: direct_origin"));
+    }
+    for import in ["use facade::Partial;", "use facade::Variant;"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+            .args([
+                import,
+                "--root",
+                workspace.path().to_str().unwrap(),
+                "--package",
+                "app",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{import}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("ambiguous external re-export"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn binary_honors_self_import_namespaces_and_primitive_reexports() {
+    let workspace = TempDir::new().unwrap();
+    for member in ["app", "shape_dep"] {
+        fs::create_dir_all(workspace.path().join(member).join("src")).unwrap();
+    }
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"shape_dep\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nshape_dep = { path = \"../shape_dep\" }\n",
+    )
+    .unwrap();
+    fs::write(workspace.path().join("app/src/lib.rs"), "").unwrap();
+    fs::write(
+        workspace.path().join("shape_dep/Cargo.toml"),
+        "[package]\nname = \"shape_dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("shape_dep/src/lib.rs"),
+        "pub mod foo {}\npub fn foo() {}\npub struct Bar;\n#[macro_export]\nmacro_rules! Bar { () => {}; }\npub use i32 as MyI32;\n",
+    )
+    .unwrap();
+    lock_workspace(&workspace);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use shape_dep::{foo::{self}, Bar::{self}, MyI32};",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("import: use shape_dep::foo;\nitem: module foo"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("import: use shape_dep::Bar;\nitem: struct Bar"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("item: use MyI32"), "{stdout}");
+    assert!(stdout.contains("resolved item: primitive i32"), "{stdout}");
+}
+
+#[test]
+fn binary_does_not_prescribe_lockfile_refresh_for_manifest_errors() {
+    let workspace = TempDir::new().unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package\nname = \"broken\"\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use dep::Thing;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to read cargo metadata"), "{stderr}");
+    assert!(
+        !stderr.contains("run `cargo check` or `cargo build`"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_reports_non_unicode_roots_without_panicking() {
+    let root = OsString::from_vec(vec![b'/', b't', b'm', b'p', b'/', 0xff]);
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .arg("use dep::Thing;")
+        .arg("--root")
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no Cargo.toml found"), "{stderr}");
+    assert!(!stderr.contains("panicked at"), "{stderr}");
+}
+
+#[test]
 fn binary_rejects_bad_import() {
     let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
         .arg("use crate::local::Thing;")
@@ -1635,7 +2098,7 @@ fn binary_reports_unknown_argument() {
         assert!(!output.status.success());
         assert_eq!(
             String::from_utf8_lossy(&output.stderr),
-            "check-docs: unknown argument: --bad\nusage: check-docs '<use crate_name::module::item;>' [--root PATH] [--package NAME_OR_ID] [--target TRIPLE] [--include-dev] [--include-build]\n"
+            "check-docs: unknown argument: --bad\nusage: check-docs '<use crate_name::module::item;>' [--root PATH] [--package NAME_OR_ID] [--target TRIPLE] [--features FEATURES] [--all-features] [--no-default-features] [--include-dev] [--include-build]\n"
         );
     }
 }

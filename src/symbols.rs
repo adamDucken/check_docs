@@ -1,4 +1,4 @@
-use crate::imports::{ImportPath, identifier_key};
+use crate::imports::{ImportPath, NamespaceConstraint, identifier_key};
 use rustdoc_types::{
     AssocItemConstraintKind, Attribute, AttributeRepr, Crate, GenericArg, GenericArgs,
     GenericBound, GenericParamDefKind, Id, Item, ItemEnum, MacroKind, ReprKind, StructKind, Term,
@@ -51,6 +51,7 @@ pub(crate) struct SymbolDoc {
     pub(crate) derives: Vec<String>,
     pub(crate) methods: Vec<String>,
     pub(crate) impls: Vec<String>,
+    pub(crate) namespaces: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +91,7 @@ pub(crate) struct ExternalReexport {
     pub(crate) crate_name: String,
     pub(crate) path: Vec<String>,
     pub(crate) via_glob: bool,
+    pub(crate) namespace: Option<NamespaceConstraint>,
 }
 
 impl ExternalReexport {
@@ -99,6 +101,7 @@ impl ExternalReexport {
             crate_name: self.crate_name.clone(),
             segments: segments.to_vec(),
             item: item.clone(),
+            namespace: self.namespace,
         }
         .into()
     }
@@ -112,7 +115,13 @@ pub(crate) fn find_symbol(krate: &Crate, import: &ImportPath) -> Result<SymbolDo
 
     for (index, part) in parts.iter().enumerate() {
         let is_last = index + 1 == parts.len();
-        current = find_child(krate, current, part, &mut HashSet::new())?;
+        current = find_child(
+            krate,
+            current,
+            part,
+            is_last.then_some(import.namespace).flatten(),
+            &mut HashSet::new(),
+        )?;
         current = follow_use(krate, current, &mut HashSet::new())?;
         if !is_last && !is_path_container(item(krate, current)?) {
             return Err(SymbolError::NotFound(format!(
@@ -135,11 +144,23 @@ pub(crate) fn find_symbol_report(
 
     for (index, part) in parts.iter().enumerate() {
         let is_last = index + 1 == parts.len();
-        let child_id = find_child(krate, current, part, &mut HashSet::new())?;
+        let child_id = find_child(
+            krate,
+            current,
+            part,
+            is_last.then_some(import.namespace).flatten(),
+            &mut HashSet::new(),
+        )?;
         let child = item(krate, child_id)?;
         if is_last {
             if matches!(child.inner, ItemEnum::Use(_)) {
                 let imported = format_item(krate, child);
+                if let Some(resolved) = primitive_reexport_doc(child) {
+                    return Ok(SymbolReport {
+                        imported,
+                        resolved: Some(resolved),
+                    });
+                }
                 let resolved_id = follow_use(krate, child_id, &mut HashSet::new())?;
                 let resolved = format_item(krate, item(krate, resolved_id)?);
                 return Ok(SymbolReport {
@@ -175,7 +196,13 @@ pub(crate) fn imported_reexport(
 
     for (index, part) in parts.iter().enumerate() {
         let is_last = index + 1 == parts.len();
-        let child_id = find_child(krate, current, part, &mut HashSet::new())?;
+        let child_id = find_child(
+            krate,
+            current,
+            part,
+            is_last.then_some(import.namespace).flatten(),
+            &mut HashSet::new(),
+        )?;
         let child = item(krate, child_id)?;
         if is_last {
             return Ok(matches!(child.inner, ItemEnum::Use(_)).then(|| format_item(krate, child)));
@@ -195,7 +222,13 @@ pub(crate) fn external_reexports(
 ) -> Result<Vec<ExternalReexport>, SymbolError> {
     let mut parts = import.segments.clone();
     parts.push(import.item.clone());
-    external_candidates(krate, krate.root, &parts, &mut HashSet::new())
+    external_candidates(
+        krate,
+        krate.root,
+        &parts,
+        import.namespace,
+        &mut HashSet::new(),
+    )
 }
 
 #[cfg(test)]
@@ -218,6 +251,7 @@ fn external_candidates(
     krate: &Crate,
     container_id: Id,
     parts: &[String],
+    namespace: Option<NamespaceConstraint>,
     visited: &mut HashSet<Id>,
 ) -> Result<Vec<ExternalReexport>, SymbolError> {
     let Some((part, tail)) = parts.split_first() else {
@@ -234,18 +268,26 @@ fn external_candidates(
         ))
     })?;
 
-    let direct = direct_matching_children(krate, children, part)?;
+    let direct = direct_matching_children(
+        krate,
+        children,
+        part,
+        tail.is_empty().then_some(namespace).flatten(),
+    )?;
     let mut candidates = Vec::new();
     for child_id in direct {
         match follow_use_or_external(krate, child_id, &mut HashSet::new())? {
             Followed::External(mut external) => {
                 external.path.extend(tail.iter().cloned());
+                external.namespace = namespace;
                 push_external_candidate(&mut candidates, external);
             }
             Followed::Local(id) if !tail.is_empty() => {
                 if item(krate, id).is_ok_and(is_path_container) {
                     let mut branch_visited = visited.clone();
-                    for external in external_candidates(krate, id, tail, &mut branch_visited)? {
+                    for external in
+                        external_candidates(krate, id, tail, namespace, &mut branch_visited)?
+                    {
                         push_external_candidate(&mut candidates, external);
                     }
                 }
@@ -262,19 +304,21 @@ fn external_candidates(
         if !is_public(child) || !use_item.is_glob {
             continue;
         }
-        let Some(glob_id) = use_item.id else {
+        let Some(_) = use_item.id else {
             continue;
         };
-        match follow_use_or_external(krate, glob_id, &mut HashSet::new())? {
+        match follow_use_or_external(krate, *child_id, &mut HashSet::new())? {
             Followed::External(mut external) => {
                 external.path.extend(parts.iter().cloned());
                 external.via_glob = true;
+                external.namespace = namespace;
                 push_external_candidate(&mut candidates, external);
             }
             Followed::Local(id) => {
                 if item(krate, id).is_ok_and(is_path_container) {
                     let mut branch_visited = visited.clone();
-                    for mut external in external_candidates(krate, id, parts, &mut branch_visited)?
+                    for mut external in
+                        external_candidates(krate, id, parts, namespace, &mut branch_visited)?
                     {
                         external.via_glob = true;
                         push_external_candidate(&mut candidates, external);
@@ -315,7 +359,22 @@ fn follow_use_or_external(
         let ItemEnum::Use(use_item) = &current.inner else {
             return Ok(Followed::Local(id));
         };
+        if use_item
+            .id
+            .and_then(|target| external_from_id(krate, target))
+            .is_some()
+            && let Some(local_target) = local_use_source_target(krate, id, use_item)?
+        {
+            id = local_target;
+            continue;
+        }
+        if let Some(external) = external_from_use(krate, use_item) {
+            return Ok(Followed::External(external));
+        }
         let Some(next) = use_item.id else {
+            if primitive_reexport_name(use_item).is_some() {
+                return Ok(Followed::Local(id));
+            }
             return Err(SymbolError::InvalidRustdoc(format!(
                 "use '{}' has no resolved id",
                 use_item.source
@@ -323,6 +382,99 @@ fn follow_use_or_external(
         };
         id = next;
     }
+}
+
+fn local_use_source_target(
+    krate: &Crate,
+    use_id: Id,
+    use_item: &rustdoc_types::Use,
+) -> Result<Option<Id>, SymbolError> {
+    let mut parts = use_item.source.split("::").collect::<Vec<_>>();
+    if use_item.is_glob && parts.last() == Some(&"*") {
+        parts.pop();
+    }
+    let Some(first) = parts.first().copied() else {
+        return Ok(None);
+    };
+
+    let mut container = match first {
+        "crate" => krate.root,
+        "self" | "super" => containing_module(krate, use_id).ok_or_else(|| {
+            SymbolError::InvalidRustdoc(format!(
+                "use '{}' is missing its containing module",
+                use_item.source
+            ))
+        })?,
+        _ => return Ok(None),
+    };
+    let mut offset = 1;
+    if first == "super" {
+        while parts.get(offset) == Some(&"super") {
+            container = containing_module(krate, container).ok_or_else(|| {
+                SymbolError::InvalidRustdoc(format!(
+                    "use '{}' traverses beyond the crate root",
+                    use_item.source
+                ))
+            })?;
+            offset += 1;
+        }
+        container = containing_module(krate, container).ok_or_else(|| {
+            SymbolError::InvalidRustdoc(format!(
+                "use '{}' traverses beyond the crate root",
+                use_item.source
+            ))
+        })?;
+    }
+
+    let path = &parts[offset..];
+    if path.is_empty() {
+        return Ok(Some(container));
+    }
+    for (index, name) in path.iter().enumerate() {
+        let current = item(krate, container)?;
+        let ItemEnum::Module(module) = &current.inner else {
+            return Err(SymbolError::InvalidRustdoc(format!(
+                "local use path '{}' traverses non-module item '{}'",
+                use_item.source,
+                current.name.as_deref().unwrap_or("<unnamed>")
+            )));
+        };
+        let mut matches = module
+            .items
+            .iter()
+            .copied()
+            .filter(|child_id| {
+                krate.index.get(child_id).is_some_and(|child| {
+                    exported_name(child)
+                        .as_deref()
+                        .is_some_and(|exported| identifier_key(exported) == identifier_key(name))
+                })
+            })
+            .collect::<Vec<_>>();
+        if index + 1 != path.len() {
+            matches.retain(|child_id| krate.index.get(child_id).is_some_and(is_path_container));
+        }
+        match matches.as_slice() {
+            [matched] => container = *matched,
+            [] => {
+                return Err(SymbolError::InvalidRustdoc(format!(
+                    "local use source '{}' is missing path segment '{}'",
+                    use_item.source, name
+                )));
+            }
+            _ => return Err(ambiguous_symbol(krate, name, &matches)),
+        }
+    }
+    Ok(Some(container))
+}
+
+fn containing_module(krate: &Crate, child_id: Id) -> Option<Id> {
+    krate.index.iter().find_map(|(id, item)| {
+        let ItemEnum::Module(module) = &item.inner else {
+            return None;
+        };
+        module.items.contains(&child_id).then_some(*id)
+    })
 }
 
 fn external_from_id(krate: &Crate, id: Id) -> Option<ExternalReexport> {
@@ -339,6 +491,26 @@ fn external_from_id(krate: &Crate, id: Id) -> Option<ExternalReexport> {
         crate_name: external.name.clone(),
         path,
         via_glob: false,
+        namespace: None,
+    })
+}
+
+fn external_from_use(krate: &Crate, use_item: &rustdoc_types::Use) -> Option<ExternalReexport> {
+    use_item.id.and_then(|id| external_from_id(krate, id))?;
+    let mut source = use_item
+        .source
+        .split("::")
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if use_item.is_glob && source.last().is_some_and(|part| part == "*") {
+        source.pop();
+    }
+    let crate_name = identifier_key(source.first()?).to_string();
+    Some(ExternalReexport {
+        crate_name,
+        path: source.into_iter().skip(1).collect(),
+        via_glob: use_item.is_glob,
+        namespace: None,
     })
 }
 
@@ -351,6 +523,7 @@ fn find_child(
     krate: &Crate,
     module_id: Id,
     name: &str,
+    namespace: Option<NamespaceConstraint>,
     visited: &mut HashSet<Id>,
 ) -> Result<Id, SymbolError> {
     if !visited.insert(module_id) {
@@ -366,7 +539,7 @@ fn find_child(
         ))
     })?;
 
-    let direct_matches = direct_matching_children(krate, children, name)?;
+    let direct_matches = direct_matching_children(krate, children, name, namespace)?;
     match direct_matches.as_slice() {
         [_] => {}
         [] => {}
@@ -395,7 +568,7 @@ fn find_child(
                 Ok(target) => match item(krate, target) {
                     Ok(target_item) if is_path_container(target_item) => {
                         let mut branch_visited = visited.clone();
-                        match find_child(krate, target, name, &mut branch_visited) {
+                        match find_child(krate, target, name, namespace, &mut branch_visited) {
                             Ok(found) => {
                                 if !glob_matches.contains(&found) {
                                     glob_matches.push(found);
@@ -431,7 +604,7 @@ fn find_child(
             .into_iter()
             .filter(|glob| {
                 item_namespaces(krate, *glob)
-                    .is_ok_and(|namespaces| namespaces & direct_namespaces == 0)
+                    .is_ok_and(|namespaces| namespaces & !direct_namespaces != 0)
             })
             .collect::<Vec<_>>();
         if distinct_globs.is_empty() {
@@ -474,36 +647,80 @@ fn item_namespaces_inner(
             "cycle while determining Rust namespace".to_string(),
         ));
     }
-    if let Some(summary) = krate.paths.get(&id) {
-        return Ok(item_kind_namespaces(summary.kind));
+    if let Some(item) = krate.index.get(&id) {
+        return Ok(match &item.inner {
+            ItemEnum::Module(_)
+            | ItemEnum::Union(_)
+            | ItemEnum::Enum(_)
+            | ItemEnum::Trait(_)
+            | ItemEnum::TraitAlias(_)
+            | ItemEnum::TypeAlias(_)
+            | ItemEnum::ExternType
+            | ItemEnum::Primitive(_)
+            | ItemEnum::AssocType { .. } => TYPE_NAMESPACE,
+            ItemEnum::Struct(struct_) => struct_namespaces(krate, struct_),
+            ItemEnum::Function(_)
+            | ItemEnum::StructField(_)
+            | ItemEnum::Constant { .. }
+            | ItemEnum::Static(_)
+            | ItemEnum::AssocConst { .. } => VALUE_NAMESPACE,
+            ItemEnum::Variant(variant) => variant_namespaces(variant),
+            ItemEnum::Macro(_) | ItemEnum::ProcMacro(_) => MACRO_NAMESPACE,
+            ItemEnum::Use(use_item) => use_item
+                .id
+                .map(|id| item_namespaces_inner(krate, id, visited))
+                .transpose()?
+                .unwrap_or_else(|| {
+                    if primitive_reexport_name(use_item).is_some() {
+                        TYPE_NAMESPACE
+                    } else {
+                        TYPE_NAMESPACE | VALUE_NAMESPACE | MACRO_NAMESPACE
+                    }
+                }),
+            ItemEnum::ExternCrate { .. } => TYPE_NAMESPACE,
+            ItemEnum::Impl(_) => 0,
+        });
     }
-    let item = item(krate, id)?;
-    Ok(match &item.inner {
-        ItemEnum::Module(_)
-        | ItemEnum::Union(_)
-        | ItemEnum::Enum(_)
-        | ItemEnum::Trait(_)
-        | ItemEnum::TraitAlias(_)
-        | ItemEnum::TypeAlias(_)
-        | ItemEnum::ExternType
-        | ItemEnum::Primitive(_)
-        | ItemEnum::AssocType { .. } => TYPE_NAMESPACE,
-        ItemEnum::Struct(_) => TYPE_NAMESPACE | VALUE_NAMESPACE,
-        ItemEnum::Function(_)
-        | ItemEnum::StructField(_)
-        | ItemEnum::Variant(_)
-        | ItemEnum::Constant { .. }
-        | ItemEnum::Static(_)
-        | ItemEnum::AssocConst { .. } => VALUE_NAMESPACE,
-        ItemEnum::Macro(_) | ItemEnum::ProcMacro(_) => MACRO_NAMESPACE,
-        ItemEnum::Use(use_item) => use_item
-            .id
-            .map(|id| item_namespaces_inner(krate, id, visited))
-            .transpose()?
-            .unwrap_or(TYPE_NAMESPACE | VALUE_NAMESPACE | MACRO_NAMESPACE),
-        ItemEnum::ExternCrate { .. } => TYPE_NAMESPACE,
-        ItemEnum::Impl(_) => 0,
-    })
+    krate
+        .paths
+        .get(&id)
+        .map(|summary| item_kind_namespaces(summary.kind))
+        .ok_or_else(|| {
+            SymbolError::InvalidRustdoc(format!(
+                "rustdoc item id {:?} missing from index and paths",
+                id
+            ))
+        })
+}
+
+fn struct_namespaces(krate: &Crate, struct_: &rustdoc_types::Struct) -> u8 {
+    let has_public_constructor = match &struct_.kind {
+        StructKind::Unit => true,
+        StructKind::Tuple(fields) => fields.iter().all(|field| {
+            field.is_some_and(|id| {
+                krate
+                    .index
+                    .get(&id)
+                    .is_some_and(|field| matches!(field.visibility, Visibility::Public))
+            })
+        }),
+        StructKind::Plain { .. } => false,
+    };
+    TYPE_NAMESPACE
+        | if has_public_constructor {
+            VALUE_NAMESPACE
+        } else {
+            0
+        }
+}
+
+fn variant_namespaces(variant: &rustdoc_types::Variant) -> u8 {
+    TYPE_NAMESPACE
+        | if matches!(variant.kind, VariantKind::Plain | VariantKind::Tuple(_)) {
+            VALUE_NAMESPACE
+        } else {
+            0
+        }
 }
 
 fn item_kind_namespaces(kind: rustdoc_types::ItemKind) -> u8 {
@@ -519,9 +736,8 @@ fn item_kind_namespaces(kind: rustdoc_types::ItemKind) -> u8 {
         | ItemKind::ExternType
         | ItemKind::Primitive
         | ItemKind::AssocType => TYPE_NAMESPACE,
-        ItemKind::Struct => TYPE_NAMESPACE | VALUE_NAMESPACE,
+        ItemKind::Struct | ItemKind::Variant => TYPE_NAMESPACE | VALUE_NAMESPACE,
         ItemKind::StructField
-        | ItemKind::Variant
         | ItemKind::Function
         | ItemKind::Constant
         | ItemKind::Static
@@ -534,21 +750,13 @@ fn item_kind_namespaces(kind: rustdoc_types::ItemKind) -> u8 {
 }
 
 fn symbol_namespaces(symbol: &SymbolDoc) -> u8 {
-    match symbol.kind {
-        "struct" => TYPE_NAMESPACE | VALUE_NAMESPACE,
-        "module" | "union" | "enum" | "trait" | "trait alias" | "type" | "extern type"
-        | "primitive" | "assoc type" | "extern crate" => TYPE_NAMESPACE,
-        "fn" | "field" | "variant" | "const" | "static" | "assoc const" => VALUE_NAMESPACE,
-        "macro" | "proc-attribute" | "proc-derive" | "proc macro" | "attribute macro"
-        | "derive macro" => MACRO_NAMESPACE,
-        _ => 0,
-    }
+    symbol.namespaces
 }
 
-pub(crate) fn reports_overlap_namespace(left: &SymbolReport, right: &SymbolReport) -> bool {
-    let left = left.resolved.as_ref().unwrap_or(&left.imported);
-    let right = right.resolved.as_ref().unwrap_or(&right.imported);
-    symbol_namespaces(left) & symbol_namespaces(right) != 0
+pub(crate) fn report_has_unshadowed_namespace(named: &SymbolReport, glob: &SymbolReport) -> bool {
+    let named = named.resolved.as_ref().unwrap_or(&named.imported);
+    let glob = glob.resolved.as_ref().unwrap_or(&glob.imported);
+    symbol_namespaces(glob) & !symbol_namespaces(named) != 0
 }
 
 pub(crate) fn report_item_label(report: &SymbolReport) -> String {
@@ -560,6 +768,7 @@ fn direct_matching_children(
     krate: &Crate,
     children: &[Id],
     name: &str,
+    namespace: Option<NamespaceConstraint>,
 ) -> Result<Vec<Id>, SymbolError> {
     let mut matches = Vec::new();
     for child_id in children {
@@ -568,11 +777,21 @@ fn direct_matching_children(
             && exported_name(child)
                 .as_deref()
                 .is_some_and(|exported| identifier_key(exported) == identifier_key(name))
+            && namespace.is_none_or(|namespace| {
+                item_namespaces(krate, *child_id)
+                    .is_ok_and(|item_namespaces| item_namespaces & namespace_mask(namespace) != 0)
+            })
         {
             matches.push(*child_id);
         }
     }
     Ok(matches)
+}
+
+fn namespace_mask(namespace: NamespaceConstraint) -> u8 {
+    match namespace {
+        NamespaceConstraint::Type => TYPE_NAMESPACE,
+    }
 }
 
 fn ambiguous_symbol(krate: &Crate, name: &str, ids: &[Id]) -> SymbolError {
@@ -799,14 +1018,7 @@ fn format_item(krate: &Crate, item: &Item) -> SymbolDoc {
         ),
         ItemEnum::AssocConst { type_, value } => (
             "assoc const",
-            format!(
-                "const {rendered_name}: {}{};",
-                type_str(type_),
-                value
-                    .as_ref()
-                    .map(|value| format!(" = {value}"))
-                    .unwrap_or_default()
-            ),
+            assoc_const_def(&rendered_name, type_, value.as_deref()),
             Vec::new(),
         ),
         ItemEnum::AssocType {
@@ -854,7 +1066,60 @@ fn format_item(krate: &Crate, item: &Item) -> SymbolDoc {
         derives: derives(krate, item),
         methods: methods(krate, item),
         impls: impls(krate, item),
+        namespaces: item_namespaces(krate, item.id).unwrap_or(0),
     }
+}
+
+fn primitive_reexport_name(use_item: &rustdoc_types::Use) -> Option<&str> {
+    if use_item.id.is_some() || use_item.is_glob {
+        return None;
+    }
+    let name = use_item.source.rsplit("::").next()?;
+    matches!(
+        name,
+        "bool"
+            | "char"
+            | "str"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "f16"
+            | "f32"
+            | "f64"
+            | "f128"
+    )
+    .then_some(name)
+}
+
+fn primitive_reexport_doc(item: &Item) -> Option<SymbolDoc> {
+    let ItemEnum::Use(use_item) = &item.inner else {
+        return None;
+    };
+    let name = primitive_reexport_name(use_item)?;
+    Some(SymbolDoc {
+        path: PathBuf::new(),
+        line: 0,
+        kind: "primitive",
+        name: name.to_string(),
+        definition: format!("definition rendering unsupported for built-in primitive {name}"),
+        deprecation: None,
+        attributes: Vec::new(),
+        details: Vec::new(),
+        docs: Vec::new(),
+        derives: Vec::new(),
+        methods: Vec::new(),
+        impls: Vec::new(),
+        namespaces: TYPE_NAMESPACE,
+    })
 }
 
 fn rust_identifier(name: &str) -> String {
@@ -1297,7 +1562,11 @@ fn variant_def(krate: &Crate, name: &str, variant: &rustdoc_types::Variant) -> S
         }
     };
     match &variant.discriminant {
-        Some(discriminant) => format!("{definition} = {}", discriminant.expr),
+        Some(discriminant) => format!(
+            "{definition} = {}",
+            constant_expression(&discriminant.expr, Some(&discriminant.value))
+                .expect("discriminants always have an evaluated value")
+        ),
         None => definition,
     }
 }
@@ -1483,15 +1752,27 @@ fn assoc_const_def(name: &str, type_: &Type, value: Option<&str>) -> String {
     format!(
         "const {name}: {}{};",
         type_str(type_),
-        value.map(|value| format!(" = {value}")).unwrap_or_default()
+        value
+            .map(|value| {
+                format!(
+                    " = {}",
+                    constant_expression(value, None)
+                        .unwrap_or("/* unsupported constant expression */")
+                )
+            })
+            .unwrap_or_default()
     )
 }
 
 fn constant_initializer(constant: &rustdoc_types::Constant) -> Option<&str> {
-    if matches!(constant.expr.as_str(), "_" | "{ _ }") {
-        constant.value.as_deref()
+    constant_expression(&constant.expr, constant.value.as_deref())
+}
+
+fn constant_expression<'a>(expr: &'a str, value: Option<&'a str>) -> Option<&'a str> {
+    if matches!(expr.trim(), "_" | "{ _ }") {
+        value
     } else {
-        Some(&constant.expr)
+        Some(expr)
     }
 }
 
@@ -1585,7 +1866,11 @@ fn generic_param_decl(p: &rustdoc_types::GenericParamDef) -> String {
         GenericParamDefKind::Const { type_, default } => {
             let mut param = format!("const {}: {}", rust_identifier(&p.name), type_str(type_));
             if let Some(default) = default {
-                param.push_str(&format!(" = {default}"));
+                param.push_str(&format!(
+                    " = {}",
+                    constant_expression(default, None)
+                        .unwrap_or("/* unsupported constant expression */")
+                ));
             }
             param
         }
@@ -1678,7 +1963,11 @@ fn type_str(ty: &Type) -> String {
             }
         }
         Type::Slice(inner) => format!("[{}]", type_str(inner)),
-        Type::Array { type_, len } => format!("[{}; {len}]", type_str(type_)),
+        Type::Array { type_, len } => format!(
+            "[{}; {}]",
+            type_str(type_),
+            constant_expression(len, None).unwrap_or("/* unsupported constant expression */")
+        ),
         Type::Pat {
             type_,
             __pat_unstable_do_not_use: pattern,
@@ -1783,7 +2072,9 @@ fn generic_arg_str(arg: &GenericArg) -> String {
     match arg {
         GenericArg::Lifetime(lifetime) => lifetime_str(lifetime),
         GenericArg::Type(ty) => type_str(ty),
-        GenericArg::Const(c) => c.expr.clone(),
+        GenericArg::Const(c) => constant_expression(&c.expr, c.value.as_deref())
+            .unwrap_or("/* unsupported constant expression */")
+            .to_string(),
         GenericArg::Infer => "_".to_string(),
     }
 }
@@ -1791,7 +2082,9 @@ fn generic_arg_str(arg: &GenericArg) -> String {
 fn term_str(term: &Term) -> String {
     match term {
         Term::Type(ty) => type_str(ty),
-        Term::Constant(c) => c.expr.clone(),
+        Term::Constant(c) => constant_expression(&c.expr, c.value.as_deref())
+            .unwrap_or("/* unsupported constant expression */")
+            .to_string(),
     }
 }
 
@@ -2250,6 +2543,7 @@ mod tests {
                 crate_name: "x".into(),
                 segments: vec!["api".into()],
                 item: "Config".into(),
+                namespace: None,
             },
         )
         .unwrap();
@@ -2264,6 +2558,7 @@ mod tests {
                 crate_name: "x".into(),
                 segments: vec!["api".into()],
                 item: "Alias".into(),
+                namespace: None,
             },
         )
         .unwrap();
@@ -2275,6 +2570,7 @@ mod tests {
                 crate_name: "x".into(),
                 segments: vec!["api".into()],
                 item: "Alias".into(),
+                namespace: None,
             },
         )
         .unwrap();
@@ -2297,6 +2593,7 @@ mod tests {
                 crate_name: "x".into(),
                 segments: vec![],
                 item: "Globbed".into(),
+                namespace: None,
             },
         )
         .unwrap();
@@ -2308,7 +2605,8 @@ mod tests {
                 &ImportPath {
                     crate_name: "x".into(),
                     segments: vec!["api".into()],
-                    item: "Hidden".into()
+                    item: "Hidden".into(),
+                    namespace: None,
                 }
             )
             .unwrap_err()
@@ -2320,19 +2618,20 @@ mod tests {
                 &ImportPath {
                     crate_name: "x".into(),
                     segments: vec!["api".into()],
-                    item: "Cycle".into()
+                    item: "Cycle".into(),
+                    namespace: None,
                 }
             )
             .unwrap_err()
             .contains("cycle")
         );
         assert!(
-            find_child(&krate, Id(1), "Nope", &mut HashSet::new())
+            find_child(&krate, Id(1), "Nope", None, &mut HashSet::new())
                 .unwrap_err()
                 .contains("glob import")
         );
         assert!(
-            find_child(&krate, Id(5), "Nope", &mut HashSet::new())
+            find_child(&krate, Id(5), "Nope", None, &mut HashSet::new())
                 .unwrap_err()
                 .contains("cannot contain imported names")
         );
@@ -2449,12 +2748,13 @@ mod tests {
                 crate_name: "x".into(),
                 segments: vec![],
                 item: "Hit".into(),
+                namespace: None,
             },
         )
         .unwrap();
         assert_eq!(found.name, "Hit");
 
-        let err = find_child(&krate, Id(1), "Miss", &mut HashSet::new()).unwrap_err();
+        let err = find_child(&krate, Id(1), "Miss", None, &mut HashSet::new()).unwrap_err();
         assert!(err.contains("glob branches failed"));
         assert!(err.contains("missing::*"));
         assert!(err.contains("cyclic::*"));
@@ -2506,6 +2806,7 @@ mod tests {
                 crate_name: "fixture".into(),
                 segments: vec![],
                 item: "Thing".into(),
+                namespace: None,
             },
         )
         .unwrap()
@@ -2516,6 +2817,7 @@ mod tests {
                 crate_name: "dep_crate".into(),
                 path: vec!["module".into(), "Thing".into()],
                 via_glob: false,
+                namespace: None,
             }
         );
         assert_eq!(
@@ -2570,6 +2872,7 @@ mod tests {
                 crate_name: "fixture".into(),
                 segments: vec![],
                 item: "dep".into(),
+                namespace: None,
             },
         )
         .unwrap()
@@ -2580,6 +2883,7 @@ mod tests {
                 crate_name: "dep_crate".into(),
                 path: Vec::new(),
                 via_glob: false,
+                namespace: None,
             }
         );
         assert!(root_external.import_path().is_none());
@@ -2590,6 +2894,7 @@ mod tests {
                 crate_name: "fixture".into(),
                 segments: vec!["dep".into()],
                 item: "Thing".into(),
+                namespace: None,
             },
         )
         .unwrap()
@@ -2600,6 +2905,7 @@ mod tests {
                 crate_name: "dep_crate".into(),
                 path: vec!["Thing".into()],
                 via_glob: false,
+                namespace: None,
             }
         );
         assert_eq!(
@@ -2655,6 +2961,7 @@ mod tests {
                     crate_name: "fixture".into(),
                     segments: vec![],
                     item: "Thing".into(),
+                    namespace: None,
                 },
             )
             .unwrap(),
@@ -2662,6 +2969,7 @@ mod tests {
                 crate_name: "middle".into(),
                 path: vec!["api".into(), "Thing".into()],
                 via_glob: true,
+                namespace: None,
             }]
         );
     }
@@ -2726,6 +3034,7 @@ mod tests {
                 crate_name: "fixture".into(),
                 segments: vec!["Number".into()],
                 item: "One".into(),
+                namespace: None,
             },
         )
         .unwrap();
@@ -2738,6 +3047,7 @@ mod tests {
                 crate_name: "fixture".into(),
                 segments: vec!["r#match".into()],
                 item: "r#type".into(),
+                namespace: None,
             },
         )
         .unwrap();
@@ -2803,6 +3113,7 @@ mod tests {
                 crate_name: "fixture".into(),
                 segments: vec![],
                 item: "Serialize".into(),
+                namespace: None,
             },
         )
         .unwrap_err();
@@ -2901,6 +3212,7 @@ mod tests {
                 crate_name: "fixture".into(),
                 segments: vec![],
                 item: "Thing".into(),
+                namespace: None,
             },
         )
         .unwrap_err();
@@ -2914,6 +3226,7 @@ mod tests {
                 crate_name: "fixture".into(),
                 segments: vec![],
                 item: "Same".into(),
+                namespace: None,
             },
         )
         .unwrap();
@@ -3996,5 +4309,224 @@ mod tests {
             type_str(&pointer),
             "extern \"C-unwind\" fn(*const u8, ...) -> i32"
         );
+    }
+
+    #[test]
+    fn placeholder_constants_use_values_or_an_explicit_marker() {
+        let discriminant = Variant {
+            kind: VariantKind::Plain,
+            discriminant: Some(rustdoc_types::Discriminant {
+                expr: "{ _ }".into(),
+                value: "42".into(),
+            }),
+        };
+        assert_eq!(
+            variant_def(&krate(Vec::new(), Id(0)), "Answer", &discriminant),
+            "Answer = 42"
+        );
+
+        let evaluated = Constant {
+            expr: "_".into(),
+            value: Some("7".into()),
+            is_literal: false,
+        };
+        assert_eq!(generic_arg_str(&GenericArg::Const(evaluated.clone())), "7");
+        assert_eq!(term_str(&Term::Constant(evaluated)), "7");
+
+        let unavailable = Constant {
+            expr: "{ _ }".into(),
+            value: None,
+            is_literal: false,
+        };
+        assert_eq!(
+            generic_arg_str(&GenericArg::Const(unavailable.clone())),
+            "/* unsupported constant expression */"
+        );
+        assert_eq!(
+            term_str(&Term::Constant(unavailable)),
+            "/* unsupported constant expression */"
+        );
+        assert_eq!(
+            assoc_const_def("VALUE", &Type::Primitive("usize".into()), Some("{ _ }")),
+            "const VALUE: usize = /* unsupported constant expression */;"
+        );
+    }
+
+    #[test]
+    fn constructor_namespaces_follow_shape_and_visibility() {
+        let public_field = item(
+            1,
+            Some("value"),
+            Visibility::Public,
+            ItemEnum::StructField(Type::Primitive("u8".into())),
+        );
+        let private_field = item(
+            2,
+            Some("hidden"),
+            Visibility::Default,
+            ItemEnum::StructField(Type::Primitive("u8".into())),
+        );
+        let plain = item(
+            3,
+            Some("Plain"),
+            Visibility::Public,
+            ItemEnum::Struct(Struct {
+                kind: StructKind::Plain {
+                    fields: vec![Id(1)],
+                    has_stripped_fields: false,
+                },
+                generics: generics_empty(),
+                impls: vec![],
+            }),
+        );
+        let tuple = item(
+            4,
+            Some("Tuple"),
+            Visibility::Public,
+            ItemEnum::Struct(Struct {
+                kind: StructKind::Tuple(vec![Some(Id(1))]),
+                generics: generics_empty(),
+                impls: vec![],
+            }),
+        );
+        let private_tuple = item(
+            5,
+            Some("PrivateTuple"),
+            Visibility::Public,
+            ItemEnum::Struct(Struct {
+                kind: StructKind::Tuple(vec![Some(Id(2))]),
+                generics: generics_empty(),
+                impls: vec![],
+            }),
+        );
+        let unit_variant = item(
+            6,
+            Some("Unit"),
+            Visibility::Default,
+            ItemEnum::Variant(Variant {
+                kind: VariantKind::Plain,
+                discriminant: None,
+            }),
+        );
+        let struct_variant = item(
+            7,
+            Some("Fields"),
+            Visibility::Default,
+            ItemEnum::Variant(Variant {
+                kind: VariantKind::Struct {
+                    fields: vec![Id(1)],
+                    has_stripped_fields: false,
+                },
+                discriminant: None,
+            }),
+        );
+        let docs = krate(
+            vec![
+                public_field,
+                private_field,
+                plain,
+                tuple,
+                private_tuple,
+                unit_variant,
+                struct_variant,
+            ],
+            Id(3),
+        );
+
+        assert_eq!(item_namespaces(&docs, Id(3)).unwrap(), TYPE_NAMESPACE);
+        assert_eq!(
+            item_namespaces(&docs, Id(4)).unwrap(),
+            TYPE_NAMESPACE | VALUE_NAMESPACE
+        );
+        assert_eq!(item_namespaces(&docs, Id(5)).unwrap(), TYPE_NAMESPACE);
+        assert_eq!(
+            item_namespaces(&docs, Id(6)).unwrap(),
+            TYPE_NAMESPACE | VALUE_NAMESPACE
+        );
+        assert_eq!(item_namespaces(&docs, Id(7)).unwrap(), TYPE_NAMESPACE);
+    }
+
+    #[test]
+    fn type_constrained_self_import_selects_the_type_namespace() {
+        let root = item(
+            1,
+            Some("fixture"),
+            Visibility::Public,
+            ItemEnum::Module(Module {
+                is_crate: true,
+                items: vec![Id(2), Id(3)],
+                is_stripped: false,
+            }),
+        );
+        let module = item(
+            2,
+            Some("foo"),
+            Visibility::Public,
+            ItemEnum::Module(Module {
+                is_crate: false,
+                items: vec![],
+                is_stripped: false,
+            }),
+        );
+        let function = item(
+            3,
+            Some("foo"),
+            Visibility::Public,
+            ItemEnum::Function(function()),
+        );
+        let docs = krate(vec![root, module, function], Id(1));
+        let found = find_symbol_report(
+            &docs,
+            &ImportPath {
+                crate_name: "fixture".into(),
+                segments: vec![],
+                item: "foo".into(),
+                namespace: Some(NamespaceConstraint::Type),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(found.imported.kind, "module");
+    }
+
+    #[test]
+    fn primitive_reexports_do_not_require_a_rustdoc_id() {
+        let root = item(
+            1,
+            Some("fixture"),
+            Visibility::Public,
+            ItemEnum::Module(Module {
+                is_crate: true,
+                items: vec![Id(2)],
+                is_stripped: false,
+            }),
+        );
+        let primitive = item(
+            2,
+            Some("MyI32"),
+            Visibility::Public,
+            ItemEnum::Use(Use {
+                source: "i32".into(),
+                name: "MyI32".into(),
+                id: None,
+                is_glob: false,
+            }),
+        );
+        let docs = krate(vec![root, primitive], Id(1));
+        let report = find_symbol_report(
+            &docs,
+            &ImportPath {
+                crate_name: "fixture".into(),
+                segments: vec![],
+                item: "MyI32".into(),
+                namespace: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.imported.definition, "pub use i32 as MyI32;");
+        let resolved = report.resolved.unwrap();
+        assert_eq!(resolved.kind, "primitive");
+        assert_eq!(resolved.name, "i32");
     }
 }

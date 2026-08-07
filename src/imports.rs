@@ -1,10 +1,16 @@
 use syn::{ItemUse, UseTree};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum NamespaceConstraint {
+    Type,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ImportPath {
     pub(crate) crate_name: String,
     pub(crate) segments: Vec<String>,
     pub(crate) item: String,
+    pub(crate) namespace: Option<NamespaceConstraint>,
 }
 
 pub(crate) fn identifier_key(name: &str) -> &str {
@@ -100,13 +106,15 @@ fn collect_use_tree(
 
 fn emit_path(prefix: &[String], item: String, imports: &mut Vec<ImportPath>) -> Result<(), String> {
     let mut parts = prefix.to_vec();
-    if item == "self" {
+    let namespace = if item == "self" {
         if parts.len() < 2 {
             return Err("expected external use path, got crate root `self` import".to_string());
         }
+        Some(NamespaceConstraint::Type)
     } else {
         parts.push(item);
-    }
+        None
+    };
 
     if parts.len() < 2 {
         return Err("expected external use path".to_string());
@@ -119,6 +127,7 @@ fn emit_path(prefix: &[String], item: String, imports: &mut Vec<ImportPath>) -> 
         crate_name: parts[0].replace('-', "_"),
         segments: parts[1..parts.len() - 1].to_vec(),
         item: parts.last().expect("parts has len >= 2").clone(),
+        namespace,
     });
     Ok(())
 }
@@ -133,6 +142,7 @@ mod tests {
         assert_eq!(import.crate_name, "syn");
         assert_eq!(import.segments, Vec::<String>::new());
         assert_eq!(import.item, "ItemUse");
+        assert_eq!(import.namespace, None);
 
         let import = parse_use_line("use syn::ItemUse").unwrap();
         assert_eq!(import.full_path(), "syn::ItemUse");
@@ -177,6 +187,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["syn::ItemUse", "syn::UseTree"]
         );
+        assert_eq!(imports[0].namespace, None);
     }
 
     #[test]
@@ -230,6 +241,8 @@ mod tests {
                 "tokio::task::JoinHandle"
             ]
         );
+        assert_eq!(imports[0].namespace, Some(NamespaceConstraint::Type));
+        assert!(imports[1..].iter().all(|import| import.namespace.is_none()));
     }
 
     #[test]
@@ -271,6 +284,7 @@ mod tests {
             crate_name: "tokio".into(),
             segments: vec!["sync".into(), "mpsc".into()],
             item: "Sender".into(),
+            namespace: None,
         };
         assert_eq!(import.full_path(), "tokio::sync::mpsc::Sender");
     }

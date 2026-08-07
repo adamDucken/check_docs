@@ -1,3 +1,4 @@
+use crate::cli::FeatureSelection;
 use crate::resolver::{DependencyContext, is_library_target, package_spec};
 use cargo_metadata::{DependencyKind, Metadata, Package, Target};
 use rustdoc_types::{Crate, FORMAT_VERSION};
@@ -38,6 +39,7 @@ pub(crate) struct RustdocRequest<'a> {
     pub(crate) target: &'a Target,
     pub(crate) contexts: &'a [DependencyContext],
     pub(crate) target_selection: &'a CargoTargetSelection,
+    pub(crate) feature_selection: &'a FeatureSelection,
     pub(crate) unit: &'a CargoUnitIdentity,
 }
 
@@ -88,6 +90,7 @@ fn generation_target_dir(request: &RustdocRequest<'_>) -> PathBuf {
     request.package.id.hash(&mut hasher);
     request.target.name.hash(&mut hasher);
     request.unit.hash(&mut hasher);
+    request.feature_selection.hash(&mut hasher);
     for context in request.contexts {
         context.kind.hash(&mut hasher);
         context.target.hash(&mut hasher);
@@ -247,6 +250,7 @@ fn generate_json_with_toolchain(
 ) -> Result<(), String> {
     target_selector(request.target)?;
     let context_kind = exact_context_kind(request.contexts)?;
+    let original_rustc_wrapper = effective_general_rustc_wrapper(&request.manifest_path)?;
     let mut command = Command::new("cargo");
     if let Some(invocation_dir) = request
         .manifest_path
@@ -271,6 +275,7 @@ fn generate_json_with_toolchain(
             "--target-dir",
         ])
         .arg(target_dir);
+    command.args(request.feature_selection.cargo_args());
     if let Some(target_triple) = &request.target_selection.command_line_override {
         command.args(["--target", target_triple]);
     }
@@ -278,6 +283,7 @@ fn generate_json_with_toolchain(
         .map_err(|err| format!("failed to locate check-docs executable for Rustdoc: {err}"))?;
     command
         .env("RUSTC_WRAPPER", current_exe)
+        .env_remove("CHECK_DOCS_ORIGINAL_RUSTC_WRAPPER")
         .env("CHECK_DOCS_RUSTC_WRAPPER_MODE", "1")
         .env("CHECK_DOCS_WRAPPER_PACKAGE_NAME", &request.package.name)
         .env(
@@ -304,6 +310,9 @@ fn generate_json_with_toolchain(
             serde_json::to_string(&request.unit.platform).expect("unit platform serializes"),
         )
         .env("CHECK_DOCS_WRAPPER_DOC_DIR", doc_dir);
+    if let Some(wrapper) = original_rustc_wrapper {
+        command.env("CHECK_DOCS_ORIGINAL_RUSTC_WRAPPER", wrapper);
+    }
     let output = command
         .output()
         .map_err(|err| {
@@ -321,7 +330,15 @@ pub(crate) fn run_rustc_wrapper() -> ! {
         eprintln!("check-docs Rust compiler wrapper was not given a compiler executable");
         std::process::exit(1);
     };
-    let status = Command::new(compiler)
+    let original_wrapper = env::var_os("CHECK_DOCS_ORIGINAL_RUSTC_WRAPPER");
+    let mut compile = if let Some(wrapper) = &original_wrapper {
+        let mut command = Command::new(wrapper);
+        command.arg(compiler);
+        command
+    } else {
+        Command::new(compiler)
+    };
+    let status = compile
         .args(&command_arguments[1..])
         .status()
         .unwrap_or_else(|err| {
@@ -354,12 +371,23 @@ pub(crate) fn run_rustc_wrapper() -> ! {
         "rustdoc"
     });
     let rustdoc_arguments = rustdoc_arguments(invocation.arguments);
-    let mut command = if let Some(workspace_wrapper) = invocation.workspace_wrapper {
-        let mut command = Command::new(workspace_wrapper);
-        command.arg(&rustdoc);
-        command
-    } else {
-        Command::new(&rustdoc)
+    let mut command = match (original_wrapper, invocation.workspace_wrapper) {
+        (Some(wrapper), Some(workspace_wrapper)) => {
+            let mut command = Command::new(wrapper);
+            command.arg(workspace_wrapper).arg(&rustdoc);
+            command
+        }
+        (Some(wrapper), None) => {
+            let mut command = Command::new(wrapper);
+            command.arg(&rustdoc);
+            command
+        }
+        (None, Some(workspace_wrapper)) => {
+            let mut command = Command::new(workspace_wrapper);
+            command.arg(&rustdoc);
+            command
+        }
+        (None, None) => Command::new(&rustdoc),
     };
     let status = command
         .args(rustdoc_arguments)
@@ -567,10 +595,73 @@ struct CargoBuildConfig {
 }
 
 #[derive(Debug, Deserialize)]
+struct CargoRustcWrapperConfig {
+    build: CargoRustcWrapperBuildConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoRustcWrapperBuildConfig {
+    #[serde(rename = "rustc-wrapper")]
+    rustc_wrapper: String,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum ConfiguredCargoTargets {
     One(String),
     Many(Vec<String>),
+}
+
+fn effective_general_rustc_wrapper(manifest_path: &Path) -> Result<Option<OsString>, String> {
+    for name in ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"] {
+        if let Some(wrapper) = env::var_os(name) {
+            return Ok((!wrapper.is_empty()).then_some(wrapper));
+        }
+    }
+
+    let mut command = Command::new("cargo");
+    if let Some(invocation_dir) = manifest_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        command.current_dir(invocation_dir);
+    }
+    let output = command
+        .arg(format!("+{PINNED_TOOLCHAIN}"))
+        .args([
+            "-Z",
+            "unstable-options",
+            "config",
+            "get",
+            "build.rustc-wrapper",
+            "--format",
+            "json",
+        ])
+        .output()
+        .map_err(|error| {
+            format!("failed to ask Cargo for the configured rustc wrapper: {error}")
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("config value `build.rustc-wrapper` is not set") {
+            return Ok(None);
+        }
+        return Err(format!(
+            "failed to read Cargo's configured rustc wrapper: {}",
+            stderr.trim()
+        ));
+    }
+    let config: CargoRustcWrapperConfig =
+        serde_json::from_slice(&output.stdout).map_err(|error| {
+            format!(
+                "failed to parse Cargo's configured rustc wrapper: {error}: {}",
+                String::from_utf8_lossy(&output.stdout).trim()
+            )
+        })?;
+    Ok(
+        (!config.build.rustc_wrapper.is_empty())
+            .then(|| OsString::from(config.build.rustc_wrapper)),
+    )
 }
 
 pub(crate) fn target_selection(
@@ -657,6 +748,7 @@ pub(crate) fn resolved_unit(
     target: &Target,
     contexts: &[DependencyContext],
     target_selection: &CargoTargetSelection,
+    feature_selection: &FeatureSelection,
 ) -> Result<CargoUnitIdentity, String> {
     let toolchain =
         env::var("CHECK_DOCS_TOOLCHAIN").unwrap_or_else(|_| PINNED_TOOLCHAIN.to_string());
@@ -685,6 +777,7 @@ pub(crate) fn resolved_unit(
         "-Z",
         "unstable-options",
     ]);
+    command.args(feature_selection.cargo_args());
     if let Some(target_triple) = &target_selection.command_line_override {
         command.args(["--target", target_triple]);
     }
@@ -695,11 +788,17 @@ pub(crate) fn resolved_unit(
         )
     })?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let hint = if is_lockfile_failure(&stderr) {
+            "; Cargo.lock is missing or stale; run `cargo check` or `cargo build` to refresh it, then retry"
+        } else {
+            ""
+        };
         return Err(format!(
-            "failed to resolve the exact Cargo feature unit for {} {} without changing Cargo.lock: {}; run `cargo check` or `cargo build` to create or refresh the lockfile, then retry",
+            "failed to resolve the exact Cargo feature unit for {} {} without changing Cargo.lock: {}{hint}",
             package.name,
             package.version,
-            String::from_utf8_lossy(&output.stderr).trim()
+            stderr.trim()
         ));
     }
     let graph: UnitGraph = serde_json::from_slice(&output.stdout).map_err(|err| {
@@ -817,6 +916,14 @@ fn format_generate_error(package: &Package, _toolchain: &str, stderr: &str) -> S
         package.version,
         stderr.trim()
     )
+}
+
+fn is_lockfile_failure(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("lock file")
+        && (lower.contains("needs to be updated")
+            || lower.contains("needs to be generated")
+            || lower.contains("--locked"))
 }
 
 #[cfg(test)]
@@ -1035,6 +1142,7 @@ mod tests {
             platform: None,
             profile: "{}".into(),
         };
+        let feature_selection = FeatureSelection::default();
         let request = RustdocRequest {
             manifest_path: PathBuf::from("Cargo.toml"),
             metadata: &metadata(),
@@ -1043,6 +1151,7 @@ mod tests {
             target: &target,
             contexts: &contexts,
             target_selection: &target_selection,
+            feature_selection: &feature_selection,
             unit: &unit,
         };
         let err = generate_json_with_toolchain(

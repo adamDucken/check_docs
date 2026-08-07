@@ -1,5 +1,5 @@
 use cargo_metadata::{DependencyKind, Metadata, Package, PackageId, Target};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::path::Path;
 use std::{error::Error, fmt};
 
@@ -175,89 +175,6 @@ pub(crate) fn resolve_dependency_from_package<'a>(
     }
 }
 
-pub(crate) fn resolve_reachable_dependencies<'a>(
-    metadata: &Metadata,
-    packages: &'a [Package],
-    source_package: &Package,
-    source_contexts: &[DependencyContext],
-    crate_name: &str,
-) -> Result<Vec<ResolvedDependency<'a>>, ResolveError> {
-    if let Ok(direct) = resolve_dependency_from_package(
-        metadata,
-        packages,
-        source_package,
-        source_contexts,
-        crate_name,
-    ) {
-        return Ok(vec![direct]);
-    }
-
-    let Some(resolve) = metadata.resolve.as_ref() else {
-        return Err(ResolveError::Other(
-            "cargo metadata did not include a dependency graph".to_string(),
-        ));
-    };
-    let mut queue = VecDeque::from([source_package.id.clone()]);
-    let mut visited = HashSet::new();
-    let mut matches = Vec::<DependencyEntry>::new();
-
-    while let Some(package_id) = queue.pop_front() {
-        if !visited.insert(package_id.clone()) {
-            continue;
-        }
-        let Some(node) = resolve.nodes.iter().find(|node| node.id == package_id) else {
-            continue;
-        };
-        for dep in &node.deps {
-            let normal_kinds = dep
-                .dep_kinds
-                .iter()
-                .filter(|dep_kind| dep_kind.kind == DependencyKind::Normal)
-                .collect::<Vec<_>>();
-            if normal_kinds.is_empty() {
-                continue;
-            }
-            queue.push_back(dep.pkg.clone());
-            if !dependency_matches_crate_name(dep, crate_name) {
-                continue;
-            }
-            for source_context in source_contexts {
-                push_dependency_context(
-                    &mut matches,
-                    dep.pkg.clone(),
-                    transitive_context(source_context, &source_package.name),
-                );
-            }
-        }
-    }
-
-    matches.sort_by(|left, right| left.package_id.repr.cmp(&right.package_id.repr));
-    if matches.is_empty() {
-        return Err(ResolveError::Other(format!(
-            "crate '{crate_name}' is not reachable through normal dependencies of '{}'",
-            source_package.name
-        )));
-    }
-
-    matches
-        .iter()
-        .map(|entry| {
-            let package = package_by_id(packages, &entry.package_id).ok_or_else(|| {
-                ResolveError::Other(format!(
-                    "reachable dependency '{crate_name}' of '{}' missing from cargo metadata",
-                    source_package.name
-                ))
-            })?;
-            let target = library_target(package).map_err(ResolveError::Other)?;
-            Ok(ResolvedDependency {
-                package,
-                target,
-                contexts: entry.contexts.clone(),
-            })
-        })
-        .collect()
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct DependencyEntry {
     pub(crate) package_id: PackageId,
@@ -411,6 +328,25 @@ pub(crate) fn package_dependencies(
         }
     }
     deps
+}
+
+pub(crate) fn merge_dependency_kind(
+    dependencies: &mut DependencyIndex,
+    additional: DependencyIndex,
+    kind: DependencyKind,
+) {
+    for (crate_name, entries) in additional.entries {
+        let destination = dependencies.entries.entry(crate_name).or_default();
+        for entry in entries {
+            for context in entry
+                .contexts
+                .into_iter()
+                .filter(|context| context.kind == kind)
+            {
+                push_dependency_context(destination, entry.package_id.clone(), context);
+            }
+        }
+    }
 }
 
 fn dependency_kind_allowed(kind: DependencyKind, filter: DependencyFilter) -> bool {

@@ -3,6 +3,7 @@ use crate::resolver::{DependencyContext, is_library_target, package_spec};
 use cargo_metadata::{DependencyKind, Metadata, Package, Target};
 use rustdoc_types::{Crate, FORMAT_VERSION};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -10,11 +11,12 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const PINNED_TOOLCHAIN: &str = "nightly-2025-09-10";
+static GENERATION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CargoTargetSelection {
@@ -41,6 +43,17 @@ pub(crate) struct RustdocRequest<'a> {
     pub(crate) target_selection: &'a CargoTargetSelection,
     pub(crate) feature_selection: &'a FeatureSelection,
     pub(crate) unit: &'a CargoUnitIdentity,
+}
+
+pub(crate) struct CargoUnitRequest<'a> {
+    pub(crate) manifest_path: &'a Path,
+    pub(crate) metadata: &'a Metadata,
+    pub(crate) root_package: &'a Package,
+    pub(crate) package: &'a Package,
+    pub(crate) target: &'a Target,
+    pub(crate) contexts: &'a [DependencyContext],
+    pub(crate) target_selection: &'a CargoTargetSelection,
+    pub(crate) feature_selection: &'a FeatureSelection,
 }
 
 pub(crate) fn load_or_generate(
@@ -101,7 +114,16 @@ fn generation_target_dir(request: &RustdocRequest<'_>) -> PathBuf {
         .target_directory
         .as_std_path()
         .join("check-docs")
-        .join(format!("{:016x}", hasher.finish()))
+        .join(format!(
+            "{:016x}-{}-{}-{}",
+            hasher.finish(),
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            GENERATION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
 }
 
 #[derive(Debug)]
@@ -111,10 +133,15 @@ struct JsonGenerationLock {
 
 impl JsonGenerationLock {
     fn acquire(path: PathBuf) -> Result<Self, String> {
-        Self::acquire_with_timeout(path, LOCK_WAIT_TIMEOUT)
+        Self::acquire_until(path, None)
     }
 
+    #[cfg(test)]
     fn acquire_with_timeout(path: PathBuf, wait_timeout: Duration) -> Result<Self, String> {
+        Self::acquire_until(path, Some(Instant::now() + wait_timeout))
+    }
+
+    fn acquire_until(path: PathBuf, deadline: Option<Instant>) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
                 format!(
@@ -123,7 +150,6 @@ impl JsonGenerationLock {
                 )
             })?;
         }
-        let deadline = Instant::now() + wait_timeout;
         loop {
             let mut file = OpenOptions::new()
                 .read(true)
@@ -140,7 +166,7 @@ impl JsonGenerationLock {
                     return Ok(Self { _file: file });
                 }
                 Err(TryLockError::WouldBlock) => {
-                    if Instant::now() >= deadline {
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         return Err(lock_timeout_message(&path));
                     }
                     thread::sleep(Duration::from_millis(50));
@@ -250,7 +276,8 @@ fn generate_json_with_toolchain(
 ) -> Result<(), String> {
     target_selector(request.target)?;
     let context_kind = exact_context_kind(request.contexts)?;
-    let original_rustc_wrapper = effective_general_rustc_wrapper(&request.manifest_path)?;
+    let original_rustc_wrapper =
+        effective_general_rustc_wrapper(&request.manifest_path, toolchain)?;
     let mut command = Command::new("cargo");
     if let Some(invocation_dir) = request
         .manifest_path
@@ -317,7 +344,7 @@ fn generate_json_with_toolchain(
         .output()
         .map_err(|err| {
             format!(
-                "failed to run cargo +{toolchain} rustdoc for {} {}: {err}; install the pinned toolchain with `rustup toolchain install {PINNED_TOOLCHAIN}` or set CHECK_DOCS_TOOLCHAIN",
+                "failed to run cargo +{toolchain} rustdoc for {} {}: {err}; install it with `rustup toolchain install {toolchain}` or set CHECK_DOCS_TOOLCHAIN",
                 request.package.name, request.package.version
             )
         })?;
@@ -549,6 +576,7 @@ fn rustdoc_arguments(arguments: &[OsString]) -> Vec<OsString> {
 #[derive(Debug, Deserialize)]
 struct UnitGraph {
     version: u32,
+    roots: Vec<usize>,
     units: Vec<Unit>,
 }
 
@@ -560,11 +588,18 @@ struct Unit {
     platform: Option<String>,
     features: Vec<String>,
     profile: serde_json::Value,
+    dependencies: Vec<UnitDependency>,
 }
 
 #[derive(Debug, Deserialize)]
 struct UnitTarget {
     name: String,
+    kind: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UnitDependency {
+    index: usize,
 }
 
 fn exact_context_kind(contexts: &[DependencyContext]) -> Result<DependencyKind, String> {
@@ -612,14 +647,25 @@ enum ConfiguredCargoTargets {
     Many(Vec<String>),
 }
 
-fn effective_general_rustc_wrapper(manifest_path: &Path) -> Result<Option<OsString>, String> {
+fn effective_general_rustc_wrapper(
+    manifest_path: &Path,
+    toolchain: &str,
+) -> Result<Option<OsString>, String> {
     for name in ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"] {
         if let Some(wrapper) = env::var_os(name) {
             return Ok((!wrapper.is_empty()).then_some(wrapper));
         }
     }
 
-    let mut command = Command::new("cargo");
+    configured_general_rustc_wrapper(manifest_path, toolchain, OsStr::new("cargo"))
+}
+
+fn configured_general_rustc_wrapper(
+    manifest_path: &Path,
+    toolchain: &str,
+    cargo: &OsStr,
+) -> Result<Option<OsString>, String> {
+    let mut command = Command::new(cargo);
     if let Some(invocation_dir) = manifest_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -627,7 +673,7 @@ fn effective_general_rustc_wrapper(manifest_path: &Path) -> Result<Option<OsStri
         command.current_dir(invocation_dir);
     }
     let output = command
-        .arg(format!("+{PINNED_TOOLCHAIN}"))
+        .arg(format!("+{toolchain}"))
         .args([
             "-Z",
             "unstable-options",
@@ -639,7 +685,7 @@ fn effective_general_rustc_wrapper(manifest_path: &Path) -> Result<Option<OsStri
         ])
         .output()
         .map_err(|error| {
-            format!("failed to ask Cargo for the configured rustc wrapper: {error}")
+            format!("failed to ask Cargo +{toolchain} for the configured rustc wrapper: {error}")
         })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -647,7 +693,7 @@ fn effective_general_rustc_wrapper(manifest_path: &Path) -> Result<Option<OsStri
             return Ok(None);
         }
         return Err(format!(
-            "failed to read Cargo's configured rustc wrapper: {}",
+            "failed to read Cargo +{toolchain}'s configured rustc wrapper: {}",
             stderr.trim()
         ));
     }
@@ -658,10 +704,80 @@ fn effective_general_rustc_wrapper(manifest_path: &Path) -> Result<Option<OsStri
                 String::from_utf8_lossy(&output.stdout).trim()
             )
         })?;
-    Ok(
-        (!config.build.rustc_wrapper.is_empty())
-            .then(|| OsString::from(config.build.rustc_wrapper)),
-    )
+    let wrapper = config.build.rustc_wrapper;
+    if wrapper.is_empty() {
+        return Ok(None);
+    }
+    let wrapper_path = Path::new(&wrapper);
+    if wrapper_path.is_absolute() || wrapper_path.components().count() == 1 {
+        return Ok(Some(wrapper.into()));
+    }
+
+    let origin = configured_value_origin(manifest_path, toolchain, cargo)?;
+    let config_directory = origin.parent().ok_or_else(|| {
+        format!(
+            "Cargo rustc-wrapper configuration origin {} has no parent directory",
+            origin.display()
+        )
+    })?;
+    let relative_base = if config_directory.file_name() == Some(OsStr::new(".cargo")) {
+        config_directory.parent().unwrap_or(config_directory)
+    } else {
+        config_directory
+    };
+    let relative_wrapper = wrapper_path
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect::<PathBuf>();
+    Ok(Some(relative_base.join(relative_wrapper).into_os_string()))
+}
+
+fn configured_value_origin(
+    manifest_path: &Path,
+    toolchain: &str,
+    cargo: &OsStr,
+) -> Result<PathBuf, String> {
+    let mut command = Command::new(cargo);
+    if let Some(invocation_dir) = manifest_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        command.current_dir(invocation_dir);
+    }
+    let output = command
+        .arg(format!("+{toolchain}"))
+        .args([
+            "-Z",
+            "unstable-options",
+            "config",
+            "get",
+            "build.rustc-wrapper",
+            "--show-origin",
+        ])
+        .output()
+        .map_err(|error| {
+            format!(
+                "failed to ask Cargo +{toolchain} for the rustc wrapper configuration origin: {error}"
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to read Cargo +{toolchain}'s configured rustc wrapper origin: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let origin = stdout
+        .lines()
+        .find_map(|line| line.rsplit_once(" # ").map(|(_, origin)| origin.trim()))
+        .filter(|origin| !origin.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "failed to parse Cargo's configured rustc wrapper origin: {}",
+                stdout.trim()
+            )
+        })?;
+    Ok(PathBuf::from(origin))
 }
 
 pub(crate) fn target_selection(
@@ -684,9 +800,14 @@ pub(crate) fn target_selection(
             command_line_override: None,
         });
     };
+    let effective_target = if configured_target == "host" {
+        host_triple.to_string()
+    } else {
+        configured_target
+    };
     Ok(CargoTargetSelection {
-        effective_triple: configured_target.clone(),
-        cargo_platform: Some(configured_target),
+        effective_triple: effective_target.clone(),
+        cargo_platform: Some(effective_target),
         command_line_override: None,
     })
 }
@@ -741,15 +862,17 @@ fn configured_build_target(manifest_path: &Path) -> Result<Option<String>, Strin
     }
 }
 
-pub(crate) fn resolved_unit(
-    manifest_path: &Path,
-    root_package: &Package,
-    package: &Package,
-    target: &Target,
-    contexts: &[DependencyContext],
-    target_selection: &CargoTargetSelection,
-    feature_selection: &FeatureSelection,
-) -> Result<CargoUnitIdentity, String> {
+pub(crate) fn resolved_unit(request: CargoUnitRequest<'_>) -> Result<CargoUnitIdentity, String> {
+    let CargoUnitRequest {
+        manifest_path,
+        metadata,
+        root_package,
+        package,
+        target,
+        contexts,
+        target_selection,
+        feature_selection,
+    } = request;
     let toolchain =
         env::var("CHECK_DOCS_TOOLCHAIN").unwrap_or_else(|_| PINNED_TOOLCHAIN.to_string());
     let context_kind = exact_context_kind(contexts)?;
@@ -824,21 +947,19 @@ pub(crate) fn resolved_unit(
     } else {
         target_selection.cargo_platform.as_deref()
     };
-    let mut candidates = graph
-        .units
-        .into_iter()
-        .filter(|unit| unit.pkg_id == package.id.to_string() && unit.target.name == target.name)
-        .filter(|unit| unit.mode == expected_mode && unit.platform.as_deref() == expected_platform)
-        .map(|mut unit| {
-            unit.features.sort();
-            CargoUnitIdentity {
-                features: unit.features,
-                mode: unit.mode,
-                platform: unit.platform,
-                profile: serde_json::to_string(&unit.profile).expect("Cargo profile serializes"),
-            }
-        })
-        .collect::<Vec<_>>();
+    let mut candidates = units_for_context_edges(
+        &graph,
+        metadata,
+        root_package,
+        package,
+        target,
+        &contexts[0],
+    )
+    .into_iter()
+    .filter_map(|index| graph.units.get(index))
+    .filter(|unit| unit.mode == expected_mode && unit.platform.as_deref() == expected_platform)
+    .map(unit_identity)
+    .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
         left.features
             .cmp(&right.features)
@@ -863,6 +984,121 @@ pub(crate) fn resolved_unit(
             target.name,
             expected_platform.unwrap_or("the host platform")
         )),
+    }
+}
+
+fn units_for_context_edges(
+    graph: &UnitGraph,
+    metadata: &Metadata,
+    root_package: &Package,
+    package: &Package,
+    target: &Target,
+    context: &DependencyContext,
+) -> Vec<usize> {
+    let root_id = root_package.id.to_string();
+    let roots = graph
+        .roots
+        .iter()
+        .copied()
+        .filter(|index| {
+            graph
+                .units
+                .get(*index)
+                .is_some_and(|unit| unit.pkg_id == root_id)
+        })
+        .collect::<Vec<_>>();
+    let (anchors, exclude_custom_build) = if context.kind == DependencyKind::Build {
+        (
+            reachable_units(graph, &roots, false)
+                .into_iter()
+                .filter(|index| {
+                    graph
+                        .units
+                        .get(*index)
+                        .is_some_and(|unit| unit.pkg_id == root_id && is_custom_build_unit(unit))
+                })
+                .collect::<Vec<_>>(),
+            false,
+        )
+    } else {
+        (roots, true)
+    };
+
+    let parents = if let Some(via) = &context.via {
+        let parent_ids = metadata
+            .packages
+            .iter()
+            .filter(|candidate| candidate.name == *via)
+            .map(|candidate| candidate.id.to_string())
+            .collect::<HashSet<_>>();
+        reachable_units(graph, &anchors, exclude_custom_build)
+            .into_iter()
+            .filter(|index| {
+                graph
+                    .units
+                    .get(*index)
+                    .is_some_and(|unit| parent_ids.contains(&unit.pkg_id))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        anchors
+    };
+
+    let package_id = package.id.to_string();
+    let mut candidates = parents
+        .into_iter()
+        .filter_map(|index| graph.units.get(index))
+        .flat_map(|unit| unit.dependencies.iter())
+        .filter_map(|dependency| {
+            let unit = graph.units.get(dependency.index)?;
+            (unit.pkg_id == package_id && unit.target.name == target.name)
+                .then_some(dependency.index)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+}
+
+fn reachable_units(graph: &UnitGraph, roots: &[usize], exclude_custom_build: bool) -> Vec<usize> {
+    let mut visited = HashSet::new();
+    let mut pending = roots.to_vec();
+    while let Some(index) = pending.pop() {
+        if !visited.insert(index) {
+            continue;
+        }
+        let Some(unit) = graph.units.get(index) else {
+            continue;
+        };
+        for dependency in &unit.dependencies {
+            if exclude_custom_build
+                && graph
+                    .units
+                    .get(dependency.index)
+                    .is_some_and(is_custom_build_unit)
+            {
+                continue;
+            }
+            pending.push(dependency.index);
+        }
+    }
+    let mut reachable = visited.into_iter().collect::<Vec<_>>();
+    reachable.sort_unstable();
+    reachable
+}
+
+fn is_custom_build_unit(unit: &Unit) -> bool {
+    unit.target.kind.iter().any(|kind| kind == "custom-build")
+}
+
+fn unit_identity(unit: &Unit) -> CargoUnitIdentity {
+    let mut features = unit.features.clone();
+    features.sort();
+    CargoUnitIdentity {
+        features,
+        mode: unit.mode.clone(),
+        platform: unit.platform.clone(),
+        profile: serde_json::to_string(&unit.profile).expect("Cargo profile serializes"),
     }
 }
 
@@ -900,15 +1136,17 @@ fn handle_generate_output(
     Ok(())
 }
 
-fn format_generate_error(package: &Package, _toolchain: &str, stderr: &str) -> String {
+fn format_generate_error(package: &Package, toolchain: &str, stderr: &str) -> String {
     let hint = if stderr.contains("toolchain") || stderr.contains("not installed") {
-        "; compatible nightly toolchain not found; install with `rustup toolchain install nightly-2025-09-10` or set CHECK_DOCS_TOOLCHAIN"
+        format!(
+            "; compatible nightly toolchain not found; install with `rustup toolchain install {toolchain}` or set CHECK_DOCS_TOOLCHAIN"
+        )
     } else if stderr.contains("lock file") && stderr.contains("needs to be updated") {
-        "; Cargo.lock is missing or stale; run `cargo check` or `cargo build` to refresh it, then retry"
+        "; Cargo.lock is missing or stale; run `cargo check` or `cargo build` to refresh it, then retry".to_string()
     } else if stderr.contains("unstable-options") || stderr.contains("output-format") {
-        "; rustdoc JSON requires nightly and `-Z unstable-options`"
+        "; rustdoc JSON requires nightly and `-Z unstable-options`".to_string()
     } else {
-        ""
+        String::new()
     };
     format!(
         "failed to generate rustdoc JSON for {} {}{hint}: {}",
@@ -933,6 +1171,8 @@ mod tests {
     use rustdoc_types::{Id, Item, ItemEnum, Module, Target as RustdocTarget, Visibility};
     use std::collections::HashMap;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     #[cfg(windows)]
@@ -1161,7 +1401,10 @@ mod tests {
             "definitely_missing_check_docs_toolchain",
         )
         .unwrap_err();
-        assert!(err.contains("failed to generate rustdoc JSON"));
+        assert!(
+            err.contains("definitely_missing_check_docs_toolchain"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1224,6 +1467,122 @@ mod tests {
         assert_eq!(argument_value(&host_build, "--crate-name"), Some("shared"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn configured_wrapper_uses_selected_toolchain_and_cargo_origin() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        let cargo_dir = temp.path().join(".cargo");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&cargo_dir).unwrap();
+        let fake_cargo = temp.path().join("fake-cargo");
+        let origin = cargo_dir.join("config.toml");
+        fs::write(
+            &fake_cargo,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" != \"+alternate-nightly\" ]; then exit 41; fi\ncase \" $* \" in\n  *\" --show-origin \"*) printf '%s\\n' 'build.rustc-wrapper = \"./tools/wrapper\" # {}' ;;\n  *) printf '%s\\n' '{{\"build\":{{\"rustc-wrapper\":\"./tools/wrapper\"}}}}' ;;\nesac\n",
+                origin.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&fake_cargo).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_cargo, permissions).unwrap();
+
+        let wrapper = configured_general_rustc_wrapper(
+            &project.join("Cargo.toml"),
+            "alternate-nightly",
+            fake_cargo.as_os_str(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(wrapper, temp.path().join("tools/wrapper").into_os_string());
+    }
+
+    #[test]
+    fn cargo_unit_selection_follows_contextual_dependency_edges() {
+        fn unit(
+            pkg_id: String,
+            name: &str,
+            kind: &str,
+            features: &[&str],
+            dependencies: &[usize],
+        ) -> Unit {
+            Unit {
+                pkg_id,
+                target: UnitTarget {
+                    name: name.into(),
+                    kind: vec![kind.into()],
+                },
+                mode: "build".into(),
+                platform: None,
+                features: features.iter().map(|feature| (*feature).into()).collect(),
+                profile: serde_json::json!({"name": "test"}),
+                dependencies: dependencies
+                    .iter()
+                    .map(|index| UnitDependency { index: *index })
+                    .collect(),
+            }
+        }
+
+        let metadata = metadata();
+        let root = metadata.root_package().unwrap();
+        let dependency = metadata
+            .packages
+            .iter()
+            .find(|package| package.name == "cargo_metadata")
+            .unwrap();
+        let target = crate::resolver::library_target(dependency).unwrap();
+        let graph = UnitGraph {
+            version: 1,
+            roots: vec![0],
+            units: vec![
+                unit(root.id.to_string(), "check-docs", "bin", &[], &[1, 2]),
+                unit(
+                    dependency.id.to_string(),
+                    &target.name,
+                    "lib",
+                    &["dev-api"],
+                    &[],
+                ),
+                unit(
+                    root.id.to_string(),
+                    "build-script-build",
+                    "custom-build",
+                    &[],
+                    &[3],
+                ),
+                unit(
+                    dependency.id.to_string(),
+                    &target.name,
+                    "lib",
+                    &["build-api"],
+                    &[],
+                ),
+            ],
+        };
+        let dev = DependencyContext {
+            kind: DependencyKind::Development,
+            target: None,
+            via: None,
+        };
+        let build = DependencyContext {
+            kind: DependencyKind::Build,
+            target: None,
+            via: None,
+        };
+
+        assert_eq!(
+            units_for_context_edges(&graph, &metadata, root, dependency, target, &dev),
+            vec![1]
+        );
+        assert_eq!(
+            units_for_context_edges(&graph, &metadata, root, dependency, target, &build),
+            vec![3]
+        );
+    }
+
     #[test]
     fn cargo_unit_selection_rejects_mixed_contexts() {
         let contexts = [
@@ -1278,6 +1637,21 @@ mod tests {
         let text = fs::read_to_string(&lock_path).unwrap();
         assert!(text.contains(&format!("pid={}", std::process::id())));
         assert!(!text.contains("not metadata"));
+    }
+
+    #[test]
+    fn lock_waits_for_a_healthy_owner_to_release() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let lock_path = dir.path().join("concurrent.json.lock");
+        let first = JsonGenerationLock::acquire(lock_path.clone()).unwrap();
+        let holder = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            drop(first);
+        });
+
+        let second = JsonGenerationLock::acquire(lock_path).unwrap();
+        holder.join().unwrap();
+        drop(second);
     }
 
     #[test]

@@ -363,10 +363,27 @@ fn follow_use_or_external(
             .id
             .and_then(|target| external_from_id(krate, target))
             .is_some()
-            && let Some(local_target) = local_use_source_target(krate, id, use_item)?
         {
-            id = local_target;
-            continue;
+            match local_use_source_target(krate, id, use_item) {
+                Ok(Some(local_target)) => {
+                    id = local_target;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(SymbolError::InvalidRustdoc(message))
+                    if message.contains("is missing path segment") =>
+                {
+                    // Public Rustdoc strips private modules even when they form the
+                    // syntactic path of a valid public external re-export. The
+                    // canonical external id remains authoritative in that shape.
+                    return use_item
+                        .id
+                        .and_then(|target| external_from_id(krate, target))
+                        .map(Followed::External)
+                        .ok_or(SymbolError::InvalidRustdoc(message));
+                }
+                Err(error) => return Err(error),
+            }
         }
         if let Some(external) = external_from_use(krate, use_item) {
             return Ok(Followed::External(external));
@@ -658,13 +675,13 @@ fn item_namespaces_inner(
             | ItemEnum::ExternType
             | ItemEnum::Primitive(_)
             | ItemEnum::AssocType { .. } => TYPE_NAMESPACE,
-            ItemEnum::Struct(struct_) => struct_namespaces(krate, struct_),
+            ItemEnum::Struct(struct_) => struct_namespaces(krate, struct_, &item.attrs),
             ItemEnum::Function(_)
             | ItemEnum::StructField(_)
             | ItemEnum::Constant { .. }
             | ItemEnum::Static(_)
             | ItemEnum::AssocConst { .. } => VALUE_NAMESPACE,
-            ItemEnum::Variant(variant) => variant_namespaces(variant),
+            ItemEnum::Variant(variant) => variant_namespaces(variant, &item.attrs),
             ItemEnum::Macro(_) | ItemEnum::ProcMacro(_) => MACRO_NAMESPACE,
             ItemEnum::Use(use_item) => use_item
                 .id
@@ -693,19 +710,20 @@ fn item_namespaces_inner(
         })
 }
 
-fn struct_namespaces(krate: &Crate, struct_: &rustdoc_types::Struct) -> u8 {
-    let has_public_constructor = match &struct_.kind {
-        StructKind::Unit => true,
-        StructKind::Tuple(fields) => fields.iter().all(|field| {
-            field.is_some_and(|id| {
-                krate
-                    .index
-                    .get(&id)
-                    .is_some_and(|field| matches!(field.visibility, Visibility::Public))
-            })
-        }),
-        StructKind::Plain { .. } => false,
-    };
+fn struct_namespaces(krate: &Crate, struct_: &rustdoc_types::Struct, attrs: &[Attribute]) -> u8 {
+    let has_public_constructor = !is_non_exhaustive(attrs)
+        && match &struct_.kind {
+            StructKind::Unit => true,
+            StructKind::Tuple(fields) => fields.iter().all(|field| {
+                field.is_some_and(|id| {
+                    krate
+                        .index
+                        .get(&id)
+                        .is_some_and(|field| matches!(field.visibility, Visibility::Public))
+                })
+            }),
+            StructKind::Plain { .. } => false,
+        };
     TYPE_NAMESPACE
         | if has_public_constructor {
             VALUE_NAMESPACE
@@ -714,13 +732,21 @@ fn struct_namespaces(krate: &Crate, struct_: &rustdoc_types::Struct) -> u8 {
         }
 }
 
-fn variant_namespaces(variant: &rustdoc_types::Variant) -> u8 {
+fn variant_namespaces(variant: &rustdoc_types::Variant, attrs: &[Attribute]) -> u8 {
     TYPE_NAMESPACE
-        | if matches!(variant.kind, VariantKind::Plain | VariantKind::Tuple(_)) {
+        | if !is_non_exhaustive(attrs)
+            && matches!(variant.kind, VariantKind::Plain | VariantKind::Tuple(_))
+        {
             VALUE_NAMESPACE
         } else {
             0
         }
+}
+
+fn is_non_exhaustive(attrs: &[Attribute]) -> bool {
+    attrs
+        .iter()
+        .any(|attr| matches!(attr, Attribute::NonExhaustive))
 }
 
 fn item_kind_namespaces(kind: rustdoc_types::ItemKind) -> u8 {
@@ -2827,6 +2853,66 @@ mod tests {
     }
 
     #[test]
+    fn stripped_private_source_path_falls_back_to_canonical_external_id() {
+        let root = item(
+            1,
+            Some("fixture"),
+            Visibility::Public,
+            ItemEnum::Module(Module {
+                is_crate: true,
+                items: vec![Id(2)],
+                is_stripped: false,
+            }),
+        );
+        let reexport = item(
+            2,
+            Some("Ident"),
+            Visibility::Public,
+            ItemEnum::Use(Use {
+                source: "crate::ident::Ident".into(),
+                name: "Ident".into(),
+                id: Some(Id(99)),
+                is_glob: false,
+            }),
+        );
+        let mut docs = krate(vec![root, reexport], Id(1));
+        docs.external_crates.insert(
+            7,
+            ExternalCrate {
+                name: "proc_macro2".into(),
+                html_root_url: None,
+            },
+        );
+        docs.paths.insert(
+            Id(99),
+            ItemSummary {
+                crate_id: 7,
+                path: vec!["proc_macro2".into(), "Ident".into()],
+                kind: ItemKind::Struct,
+            },
+        );
+
+        assert_eq!(
+            external_reexports(
+                &docs,
+                &ImportPath {
+                    crate_name: "fixture".into(),
+                    segments: vec![],
+                    item: "Ident".into(),
+                    namespace: None,
+                },
+            )
+            .unwrap(),
+            vec![ExternalReexport {
+                crate_name: "proc_macro2".into(),
+                path: vec!["Ident".into()],
+                via_glob: false,
+                namespace: None,
+            }]
+        );
+    }
+
+    #[test]
     fn detects_external_crate_root_and_appends_unresolved_tail() {
         let root = item(
             1,
@@ -4420,6 +4506,27 @@ mod tests {
                 discriminant: None,
             }),
         );
+        let mut non_exhaustive_unit = item(
+            8,
+            Some("FutureUnit"),
+            Visibility::Public,
+            ItemEnum::Struct(Struct {
+                kind: StructKind::Unit,
+                generics: generics_empty(),
+                impls: vec![],
+            }),
+        );
+        non_exhaustive_unit.attrs = vec![Attribute::NonExhaustive];
+        let mut non_exhaustive_tuple_variant = item(
+            9,
+            Some("FutureTuple"),
+            Visibility::Default,
+            ItemEnum::Variant(Variant {
+                kind: VariantKind::Tuple(vec![Some(Id(1))]),
+                discriminant: None,
+            }),
+        );
+        non_exhaustive_tuple_variant.attrs = vec![Attribute::NonExhaustive];
         let docs = krate(
             vec![
                 public_field,
@@ -4429,6 +4536,8 @@ mod tests {
                 private_tuple,
                 unit_variant,
                 struct_variant,
+                non_exhaustive_unit,
+                non_exhaustive_tuple_variant,
             ],
             Id(3),
         );
@@ -4444,6 +4553,8 @@ mod tests {
             TYPE_NAMESPACE | VALUE_NAMESPACE
         );
         assert_eq!(item_namespaces(&docs, Id(7)).unwrap(), TYPE_NAMESPACE);
+        assert_eq!(item_namespaces(&docs, Id(8)).unwrap(), TYPE_NAMESPACE);
+        assert_eq!(item_namespaces(&docs, Id(9)).unwrap(), TYPE_NAMESPACE);
     }
 
     #[test]

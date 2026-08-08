@@ -184,6 +184,13 @@ pub(crate) struct DependencyEntry {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DependencyIndex {
     entries: HashMap<String, Vec<DependencyEntry>>,
+    excluded: HashMap<String, ExcludedDependencyKinds>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ExcludedDependencyKinds {
+    dev: bool,
+    build: bool,
 }
 
 impl DependencyIndex {
@@ -311,6 +318,12 @@ pub(crate) fn package_dependencies(
         for dep in &node.deps {
             for dep_kind in &dep.dep_kinds {
                 if !dependency_kind_allowed(dep_kind.kind, filter) {
+                    let excluded = deps.excluded.entry(dep.name.replace('-', "_")).or_default();
+                    match dep_kind.kind {
+                        DependencyKind::Development => excluded.dev = true,
+                        DependencyKind::Build => excluded.build = true,
+                        _ => {}
+                    }
                     continue;
                 }
                 let crate_name = dep.name.replace('-', "_");
@@ -362,14 +375,38 @@ pub(crate) fn resolve_dependency<'a>(
     packages: &'a [Package],
     dependencies: &DependencyIndex,
     crate_name: &str,
-) -> Result<ResolvedDependency<'a>, ResolveError> {
+) -> Result<Vec<ResolvedDependency<'a>>, ResolveError> {
     let crate_name = crate::imports::identifier_key(crate_name);
     let Some(entries) = dependencies.entries.get(crate_name) else {
+        if let Some(excluded) = dependencies.excluded.get(crate_name) {
+            let mut flags = Vec::new();
+            if excluded.dev {
+                flags.push("`--include-dev`");
+            }
+            if excluded.build {
+                flags.push("`--include-build`");
+            }
+            return Err(ResolveError::NotDirectDependency(format!(
+                "crate '{crate_name}' is declared only in dependency contexts excluded by default; retry with {}",
+                flags.join(" or ")
+            )));
+        }
         return Err(ResolveError::NotDirectDependency(format!(
             "crate '{crate_name}' is not a direct dependency of the selected package"
         )));
     };
-    if entries.len() > 1 {
+    let overlapping = entries.iter().enumerate().any(|(left_index, left)| {
+        entries.iter().skip(left_index + 1).any(|right| {
+            left.package_id != right.package_id
+                && left.contexts.iter().any(|left_context| {
+                    right
+                        .contexts
+                        .iter()
+                        .any(|right_context| left_context.kind == right_context.kind)
+                })
+        })
+    });
+    if overlapping {
         let candidates = entries
             .iter()
             .map(|entry| {
@@ -384,22 +421,25 @@ pub(crate) fn resolve_dependency<'a>(
             .collect::<Vec<_>>()
             .join(", ");
         return Err(ResolveError::Other(format!(
-            "crate '{crate_name}' matched multiple direct dependencies: {candidates}"
+            "crate '{crate_name}' matched multiple direct dependencies in the same Cargo context: {candidates}"
         )));
     }
-    let entry = &entries[0];
-
-    let package = package_by_id(packages, &entry.package_id).ok_or_else(|| {
-        ResolveError::Other(format!(
-            "direct dependency '{crate_name}' missing from cargo metadata"
-        ))
-    })?;
-    let target = library_target(package).map_err(ResolveError::Other)?;
-    Ok(ResolvedDependency {
-        package,
-        target,
-        contexts: entry.contexts.clone(),
-    })
+    entries
+        .iter()
+        .map(|entry| {
+            let package = package_by_id(packages, &entry.package_id).ok_or_else(|| {
+                ResolveError::Other(format!(
+                    "direct dependency '{crate_name}' missing from cargo metadata"
+                ))
+            })?;
+            let target = library_target(package).map_err(ResolveError::Other)?;
+            Ok(ResolvedDependency {
+                package,
+                target,
+                contexts: entry.contexts.clone(),
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn library_target(package: &Package) -> Result<&Target, String> {
@@ -442,6 +482,14 @@ mod tests {
             include_dev: false,
             include_build: false,
         }
+    }
+
+    fn one_dependency<'a>(
+        result: Result<Vec<ResolvedDependency<'a>>, ResolveError>,
+    ) -> ResolvedDependency<'a> {
+        let mut dependencies = result.unwrap();
+        assert_eq!(dependencies.len(), 1);
+        dependencies.pop().unwrap()
     }
 
     fn virtual_workspace() -> TempDir {
@@ -505,7 +553,11 @@ edition = "2024"
         let deps = package_dependencies(&metadata, &package.id, default_filter());
         assert!(deps.contains_key("cargo_metadata"));
 
-        let dep = resolve_dependency(&metadata.packages, &deps, "cargo_metadata").unwrap();
+        let dep = one_dependency(resolve_dependency(
+            &metadata.packages,
+            &deps,
+            "cargo_metadata",
+        ));
         assert_eq!(dep.package.name, "cargo_metadata");
         assert!(library_target(dep.package).is_ok());
     }
@@ -570,7 +622,11 @@ edition = "2024"
         let metadata = metadata();
         let package = select_package(&metadata, Path::new("Cargo.toml"), None).unwrap();
         let deps = package_dependencies(&metadata, &package.id, default_filter());
-        let dep = resolve_dependency(&metadata.packages, &deps, "cargo_metadata").unwrap();
+        let dep = one_dependency(resolve_dependency(
+            &metadata.packages,
+            &deps,
+            "cargo_metadata",
+        ));
         let spec = package_spec(dep.package);
 
         assert_eq!(spec, dep.package.id.to_string());
@@ -623,10 +679,11 @@ edition = "2024"
 
         let default_deps = package_dependencies(&metadata, &package.id, default_filter());
         assert!(!default_deps.contains_key("tempfile"));
-        assert!(
+        assert_eq!(
             resolve_dependency(&metadata.packages, &default_deps, "tempfile")
                 .unwrap_err()
-                .contains("not a direct dependency")
+                .to_string(),
+            "crate 'tempfile' is declared only in dependency contexts excluded by default; retry with `--include-dev`"
         );
 
         let dev_deps = package_dependencies(
@@ -637,7 +694,11 @@ edition = "2024"
                 include_build: false,
             },
         );
-        let dep = resolve_dependency(&metadata.packages, &dev_deps, "tempfile").unwrap();
+        let dep = one_dependency(resolve_dependency(
+            &metadata.packages,
+            &dev_deps,
+            "tempfile",
+        ));
         assert_eq!(dep.contexts[0].kind, DependencyKind::Development);
     }
 
@@ -646,7 +707,7 @@ edition = "2024"
         let metadata = metadata();
         let package = select_package(&metadata, Path::new("Cargo.toml"), None).unwrap();
         let deps = package_dependencies(&metadata, &package.id, default_filter());
-        let serde = resolve_dependency(&metadata.packages, &deps, "serde").unwrap();
+        let serde = one_dependency(resolve_dependency(&metadata.packages, &deps, "serde"));
 
         let serde_core = resolve_dependency_from_package(
             &metadata,
@@ -788,7 +849,11 @@ edition = "2024"
             },
         );
 
-        let dep = resolve_dependency(&metadata.packages, &deps, "cargo_metadata").unwrap();
+        let dep = one_dependency(resolve_dependency(
+            &metadata.packages,
+            &deps,
+            "cargo_metadata",
+        ));
         assert_eq!(dep.package.name, "cargo_metadata");
         assert_eq!(
             dep.contexts
@@ -800,17 +865,21 @@ edition = "2024"
     }
 
     #[test]
-    fn same_crate_name_with_different_package_ids_is_ambiguous() {
+    fn same_crate_name_can_resolve_to_different_packages_in_disjoint_contexts() {
         let metadata = metadata();
         let package = select_package(&metadata, Path::new("Cargo.toml"), None).unwrap();
         let mut deps = package_dependencies(&metadata, &package.id, default_filter());
+        let serde_id = metadata
+            .packages
+            .iter()
+            .find(|package| package.name == "serde")
+            .unwrap()
+            .id
+            .clone();
         deps.insert(
             "cargo_metadata".into(),
             DependencyEntry {
-                package_id: PackageId {
-                    repr: "registry+https://example.invalid#index#cargo_metadata@99.0.0"
-                        .to_string(),
-                },
+                package_id: serde_id.clone(),
                 contexts: vec![DependencyContext {
                     kind: DependencyKind::Development,
                     target: None,
@@ -819,9 +888,40 @@ edition = "2024"
             },
         );
 
+        let resolved = resolve_dependency(&metadata.packages, &deps, "cargo_metadata").unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].package.name, "cargo_metadata");
+        assert_eq!(resolved[0].contexts[0].kind, DependencyKind::Normal);
+        assert_eq!(resolved[1].package.id, serde_id);
+        assert_eq!(resolved[1].contexts[0].kind, DependencyKind::Development);
+    }
+
+    #[test]
+    fn same_crate_name_with_different_package_ids_overlapping_a_context_is_ambiguous() {
+        let metadata = metadata();
+        let package = select_package(&metadata, Path::new("Cargo.toml"), None).unwrap();
+        let mut deps = package_dependencies(&metadata, &package.id, default_filter());
+        let serde_id = metadata
+            .packages
+            .iter()
+            .find(|package| package.name == "serde")
+            .unwrap()
+            .id
+            .clone();
+        deps.insert(
+            "cargo_metadata".into(),
+            DependencyEntry {
+                package_id: serde_id,
+                contexts: vec![DependencyContext {
+                    kind: DependencyKind::Normal,
+                    target: Some("cfg(unix)".into()),
+                    via: None,
+                }],
+            },
+        );
+
         let err = resolve_dependency(&metadata.packages, &deps, "cargo_metadata").unwrap_err();
         assert!(err.contains("matched multiple direct dependencies"));
         assert!(err.contains("normal"));
-        assert!(err.contains("dev"));
     }
 }

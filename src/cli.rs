@@ -152,7 +152,7 @@ fn starts_with_dash(value: &OsStr) -> bool {
 }
 
 pub(crate) fn usage() -> String {
-    "usage: check-docs '<use crate_name::module::item;>' [--root PATH] [--package NAME_OR_ID] [--target TRIPLE] [--features FEATURES] [--all-features] [--no-default-features] [--include-dev] [--include-build]".to_string()
+    "usage: check-docs '<use crate_name::module::item;>' [--root PATH] [--package NAME_OR_ID] [--target TRIPLE] [--features FEATURES] [--all-features] [--no-default-features] [--include-dev] [--include-build]\n  --include-dev    include direct dev-dependencies (excluded by default)\n  --include-build  include direct build-dependencies (excluded by default)".to_string()
 }
 
 #[cfg(test)]

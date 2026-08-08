@@ -34,6 +34,12 @@ fn host_target_triple() -> String {
         .to_string()
 }
 
+fn write_member(workspace: &TempDir, name: &str, manifest: &str, source: &str) {
+    fs::create_dir_all(workspace.path().join(name).join("src")).unwrap();
+    fs::write(workspace.path().join(name).join("Cargo.toml"), manifest).unwrap();
+    fs::write(workspace.path().join(name).join("src/lib.rs"), source).unwrap();
+}
+
 #[test]
 fn binary_reports_dependency_item() {
     let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
@@ -2061,6 +2067,528 @@ fn binary_reports_non_unicode_roots_without_panicking() {
 }
 
 #[test]
+fn binary_keeps_non_exhaustive_constructors_out_of_the_external_value_namespace() {
+    let workspace = TempDir::new().unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"facade\", \"named\", \"globbed\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    write_member(
+        &workspace,
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nfacade = { path = \"../facade\" }\n",
+        "",
+    );
+    write_member(
+        &workspace,
+        "facade",
+        "[package]\nname = \"facade\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nnamed = { path = \"../named\" }\nglobbed = { path = \"../globbed\" }\n",
+        "pub use named::Token;\npub use globbed::*;\n",
+    );
+    write_member(
+        &workspace,
+        "named",
+        "[package]\nname = \"named\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        "#[non_exhaustive]\npub struct Token;\n",
+    );
+    write_member(
+        &workspace,
+        "globbed",
+        "[package]\nname = \"globbed\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        "#[allow(non_snake_case)]\npub fn Token() {}\n",
+    );
+    lock_workspace(&workspace);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use facade::Token;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ambiguous external re-export"), "{stderr}");
+}
+
+#[test]
+fn binary_follows_external_reexports_through_stripped_private_modules() {
+    let workspace = TempDir::new().unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"facade\", \"origin\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    write_member(
+        &workspace,
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nfacade = { path = \"../facade\" }\n",
+        "",
+    );
+    write_member(
+        &workspace,
+        "facade",
+        "[package]\nname = \"facade\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\norigin = { path = \"../origin\" }\n",
+        "mod hidden { pub use origin::Thing; }\npub use crate::hidden::Thing;\n",
+    );
+    write_member(
+        &workspace,
+        "origin",
+        "[package]\nname = \"origin\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        "pub struct Thing;\n",
+    );
+    lock_workspace(&workspace);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use facade::Thing;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("crate: origin 0.1.0"), "{stdout}");
+    assert!(stdout.contains("resolved item: struct Thing"), "{stdout}");
+
+    let syn = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args(["use syn::Ident;", "--root", "."])
+        .output()
+        .unwrap();
+    assert!(
+        syn.status.success(),
+        "{}",
+        String::from_utf8_lossy(&syn.stderr)
+    );
+    assert!(String::from_utf8_lossy(&syn.stdout).contains("resolved item: struct Ident"));
+}
+
+fn disjoint_alias_workspace(context_section: &str, build_script: bool) -> TempDir {
+    let workspace = TempDir::new().unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    write_member(
+        &workspace,
+        "app",
+        &format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies.shared]\npackage = \"serde\"\nversion = \"=1.0.228\"\n\n[{context_section}.shared]\npackage = \"serde_json\"\nversion = \"=1.0.149\"\n"
+        ),
+        "",
+    );
+    if build_script {
+        fs::write(workspace.path().join("app/build.rs"), "fn main() {}\n").unwrap();
+    }
+    lock_workspace(&workspace);
+    workspace
+}
+
+#[test]
+fn binary_resolves_one_extern_name_to_disjoint_normal_and_build_packages() {
+    let workspace = disjoint_alias_workspace("build-dependencies", true);
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use shared::{de::IgnoredAny, Value};",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+            "--include-build",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("crate: serde_core 1.0.228"), "{stdout}");
+    assert!(
+        stdout.contains("dependency: transitive via serde (normal)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("crate: serde_json 1.0.149"), "{stdout}");
+    assert!(stdout.contains("dependency: build"), "{stdout}");
+}
+
+#[test]
+fn binary_resolves_one_extern_name_to_disjoint_normal_and_dev_packages() {
+    let workspace = disjoint_alias_workspace("dev-dependencies", false);
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use shared::{de::IgnoredAny, Value};",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+            "--include-dev",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("crate: serde_core 1.0.228"), "{stdout}");
+    assert!(
+        stdout.contains("dependency: transitive via serde (normal)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("crate: serde_json 1.0.149"), "{stdout}");
+    assert!(stdout.contains("dependency: dev"), "{stdout}");
+}
+
+#[test]
+fn binary_selects_same_package_dev_and_build_units_from_cargo_edges() {
+    let workspace = TempDir::new().unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"shared\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    write_member(
+        &workspace,
+        "app",
+        r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[dev-dependencies]
+shared = { path = "../shared", default-features = false, features = ["dev-api"] }
+
+[build-dependencies]
+shared = { path = "../shared", default-features = false, features = ["build-api"] }
+"#,
+        "",
+    );
+    fs::write(workspace.path().join("app/build.rs"), "fn main() {}\n").unwrap();
+    write_member(
+        &workspace,
+        "shared",
+        r#"[package]
+name = "shared"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+dev-api = []
+build-api = []
+"#,
+        r#"#[cfg(feature = "dev-api")]
+pub struct DevOnly;
+
+#[cfg(feature = "build-api")]
+pub struct BuildOnly;
+"#,
+    );
+    lock_workspace(&workspace);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use shared::{DevOnly, BuildOnly};",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+            "--include-dev",
+            "--include-build",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("dependency: dev\n") && stdout.contains("definition: pub struct DevOnly;"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("dependency: build\n")
+            && stdout.contains("definition: pub struct BuildOnly;"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn binary_suggests_flags_for_dependencies_excluded_by_kind() {
+    let dev = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args(["use tempfile::TempDir;", "--root", "."])
+        .output()
+        .unwrap();
+    assert!(!dev.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&dev.stderr),
+        "check-docs: crate 'tempfile' is declared only in dependency contexts excluded by default; retry with `--include-dev`\n"
+    );
+
+    let workspace = TempDir::new().unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"only_build\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    write_member(
+        &workspace,
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[build-dependencies]\nonly_build = { path = \"../only_build\" }\n",
+        "",
+    );
+    fs::write(workspace.path().join("app/build.rs"), "fn main() {}\n").unwrap();
+    write_member(
+        &workspace,
+        "only_build",
+        "[package]\nname = \"only_build\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        "pub struct BuildThing;\n",
+    );
+    lock_workspace(&workspace);
+
+    let build = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use only_build::BuildThing;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .output()
+        .unwrap();
+    assert!(!build.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&build.stderr),
+        "check-docs: crate 'only_build' is declared only in dependency contexts excluded by default; retry with `--include-build`\n"
+    );
+}
+
+#[test]
+fn binary_normalizes_cargo_host_target_from_environment_and_config() {
+    let host = host_target_triple();
+    let environment = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args(["use cargo_metadata::Metadata;", "--root", "."])
+        .env("CARGO_BUILD_TARGET", "host")
+        .output()
+        .unwrap();
+    assert!(
+        environment.status.success(),
+        "{}",
+        String::from_utf8_lossy(&environment.stderr)
+    );
+    assert!(String::from_utf8_lossy(&environment.stdout).contains(&format!("target: {host}")));
+
+    let workspace = TempDir::new().unwrap();
+    fs::create_dir_all(workspace.path().join(".cargo")).unwrap();
+    fs::write(
+        workspace.path().join(".cargo/config.toml"),
+        "[build]\ntarget = \"host\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"dep\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    write_member(
+        &workspace,
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        "",
+    );
+    write_member(
+        &workspace,
+        "dep",
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        "pub struct Thing;\n",
+    );
+    lock_workspace(&workspace);
+    let configured = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use dep::Thing;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        configured.status.success(),
+        "{}",
+        String::from_utf8_lossy(&configured.stderr)
+    );
+    assert!(String::from_utf8_lossy(&configured.stdout).contains(&format!("target: {host}")));
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_regenerates_after_a_config_relative_wrapper_changes_semantics() {
+    let workspace = TempDir::new().unwrap();
+    fs::create_dir_all(workspace.path().join(".cargo")).unwrap();
+    fs::create_dir_all(workspace.path().join("tools")).unwrap();
+    fs::write(
+        workspace.path().join(".cargo/config.toml"),
+        "[build]\nrustc-wrapper = \"./tools/cfg-wrapper.sh\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"wrapped_dep\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    write_member(
+        &workspace,
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nwrapped_dep = { path = \"../wrapped_dep\" }\n",
+        "",
+    );
+    write_member(
+        &workspace,
+        "wrapped_dep",
+        "[package]\nname = \"wrapped_dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        "#[cfg(first)]\npub struct FirstOnly;\n#[cfg(second)]\npub struct SecondOnly;\n",
+    );
+    let wrapper = workspace.path().join("tools/cfg-wrapper.sh");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\ncompiler=\"$1\"\nshift\nexec \"$compiler\" --cfg first \"$@\"\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&wrapper).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&wrapper, permissions.clone()).unwrap();
+    lock_workspace(&workspace);
+
+    let first = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use wrapped_dep::FirstOnly;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\ncompiler=\"$1\"\nshift\nexec \"$compiler\" --cfg second \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, permissions).unwrap();
+    let second = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use wrapped_dep::SecondOnly;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(String::from_utf8_lossy(&second.stdout).contains("pub struct SecondOnly;"));
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_preserves_path_lookup_for_bare_general_wrapper_names() {
+    let workspace = TempDir::new().unwrap();
+    fs::create_dir_all(workspace.path().join(".cargo")).unwrap();
+    let tools = workspace.path().join("tools");
+    fs::create_dir_all(&tools).unwrap();
+    fs::write(
+        workspace.path().join(".cargo/config.toml"),
+        "[build]\nrustc-wrapper = \"bare-check-docs-wrapper\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"wrapped_dep\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    write_member(
+        &workspace,
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nwrapped_dep = { path = \"../wrapped_dep\" }\n",
+        "",
+    );
+    write_member(
+        &workspace,
+        "wrapped_dep",
+        "[package]\nname = \"wrapped_dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        "pub struct WrappedThing;\n",
+    );
+    let wrapper = tools.join("bare-check-docs-wrapper");
+    fs::write(&wrapper, "#!/bin/sh\nexec \"$@\"\n").unwrap();
+    let mut permissions = fs::metadata(&wrapper).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&wrapper, permissions).unwrap();
+    lock_workspace(&workspace);
+    let mut paths = vec![tools];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(paths).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use wrapped_dep::WrappedThing;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .env("PATH", path)
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("pub struct WrappedThing;"));
+}
+
+#[test]
 fn binary_rejects_bad_import() {
     let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
         .arg("use crate::local::Thing;")
@@ -2098,7 +2626,7 @@ fn binary_reports_unknown_argument() {
         assert!(!output.status.success());
         assert_eq!(
             String::from_utf8_lossy(&output.stderr),
-            "check-docs: unknown argument: --bad\nusage: check-docs '<use crate_name::module::item;>' [--root PATH] [--package NAME_OR_ID] [--target TRIPLE] [--features FEATURES] [--all-features] [--no-default-features] [--include-dev] [--include-build]\n"
+            "check-docs: unknown argument: --bad\nusage: check-docs '<use crate_name::module::item;>' [--root PATH] [--package NAME_OR_ID] [--target TRIPLE] [--features FEATURES] [--all-features] [--no-default-features] [--include-dev] [--include-build]\n  --include-dev    include direct dev-dependencies (excluded by default)\n  --include-build  include direct build-dependencies (excluded by default)\n"
         );
     }
 }

@@ -201,7 +201,7 @@ fn run() -> Result<(), String> {
     let mut rustdoc_cache = RustdocCache::new();
     let mut printed_report = false;
     for import in &imports {
-        let dep = resolve_dependency(
+        let dependencies = resolve_dependency(
             &metadata.target.packages,
             &root_dependencies,
             &import.crate_name,
@@ -210,27 +210,29 @@ fn run() -> Result<(), String> {
         let mut resolved_contexts = Vec::new();
         let mut absent_contexts = Vec::new();
         let mut incomplete_contexts = Vec::new();
-        for context in dep.contexts {
-            let context_label = context.label();
-            match resolve_query(
-                &mut rustdoc_cache,
-                &manifest_path,
-                &metadata,
-                root_package,
-                dep.package,
-                dep.target,
-                vec![context],
-                &target_selection,
-                &args.feature_selection,
-                import,
-                &mut HashSet::new(),
-            ) {
-                Ok(resolved) => resolved_contexts.push(resolved),
-                Err(QueryError::Absent(error)) => {
-                    absent_contexts.push(format!("{context_label}: {error}"));
-                }
-                Err(QueryError::Incomplete(error)) => {
-                    incomplete_contexts.push(format!("{context_label}: {error}"));
+        for dependency in dependencies {
+            for context in dependency.contexts {
+                let context_label = context.label();
+                match resolve_query(
+                    &mut rustdoc_cache,
+                    &manifest_path,
+                    &metadata,
+                    root_package,
+                    dependency.package,
+                    dependency.target,
+                    vec![context],
+                    &target_selection,
+                    &args.feature_selection,
+                    import,
+                    &mut HashSet::new(),
+                ) {
+                    Ok(resolved) => resolved_contexts.push(resolved),
+                    Err(QueryError::Absent(error)) => {
+                        absent_contexts.push(format!("{context_label}: {error}"));
+                    }
+                    Err(QueryError::Incomplete(error)) => {
+                        incomplete_contexts.push(format!("{context_label}: {error}"));
+                    }
                 }
             }
         }
@@ -600,15 +602,16 @@ fn load_docs_cached(
     cache: &mut RustdocCache,
     request: DependencyDocsRequest<'_>,
 ) -> Result<LoadedDocs, String> {
-    let unit = rustdoc_json::resolved_unit(
-        request.manifest_path,
-        request.root_package,
-        request.package,
-        request.target,
-        request.contexts,
-        request.target_selection,
-        request.feature_selection,
-    )?;
+    let unit = rustdoc_json::resolved_unit(rustdoc_json::CargoUnitRequest {
+        manifest_path: request.manifest_path,
+        metadata: request.metadata,
+        root_package: request.root_package,
+        package: request.package,
+        target: request.target,
+        contexts: request.contexts,
+        target_selection: request.target_selection,
+        feature_selection: request.feature_selection,
+    })?;
     let key = rustdoc_cache_key(request.package, request.target, &unit);
     if let Some(cached) = cache.get(&key) {
         return Ok(cached.clone());
@@ -854,7 +857,8 @@ mod tests {
                 include_build: false,
             },
         );
-        let dep = resolve_dependency(&metadata.packages, &deps, "cargo_metadata").unwrap();
+        let dependencies = resolve_dependency(&metadata.packages, &deps, "cargo_metadata").unwrap();
+        let dep = dependencies.first().unwrap();
         let unit = rustdoc_json::CargoUnitIdentity {
             features: vec!["serde".into()],
             mode: "check".into(),

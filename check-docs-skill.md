@@ -96,8 +96,12 @@ names apply to that selected package just as they do for `cargo check -p`.
   the `r#` prefix wherever Rustdoc reports an unescaped keyword name.
 - Concrete items behind public external globs and multi-package re-export chains
   are followed through the resolved Cargo dependency graph.
+- Canonical external targets remain usable when Rustdoc strips a private module
+  from the syntactic path of a public re-export.
 - Public primitive re-exports such as `pub use i32 as MyI32` are reported with
   both the public use declaration and the built-in primitive identity.
+- Constructor namespaces follow external usability: non-exhaustive unit and
+  tuple structs/variants are type-only outside their defining crate.
 
 Unsupported:
 
@@ -124,7 +128,8 @@ Consequences:
 - `--features`, `--all-features`, and `--no-default-features` are forwarded to
   metadata, unit selection, Rustdoc generation, and cache identity as one normalized selection.
 - With no `--target`, it honors Cargo's effective `build.target` configuration (including
-  `CARGO_BUILD_TARGET`); an explicit `--target` remains the highest-precedence override.
+  `CARGO_BUILD_TARGET` and Cargo's special `host` value); an explicit `--target`
+  remains the highest-precedence override.
 - Compiler-wrapper matching and cache paths include Cargo's compile mode, host/target
   platform, feature set, and profile identity, so equal-feature host and target units
   cannot overwrite one another's Rustdoc JSON.
@@ -135,14 +140,33 @@ Consequences:
 - If one package is selected in multiple contexts (for example, normal and dev with
   different features), each context in which the item exists is reported separately;
   output never labels one generated unit as though it represented all contexts.
+- Cargo unit roots and dependency edges select the exact dev/build unit, including
+  resolver-v2/v3 graphs that compile one package more than once with different features.
+- One extern name may identify different packages in disjoint normal, dev, and build
+  contexts. Package identities that overlap in one effective context remain an error.
 - Cargo's configured workspace compiler wrapper remains in the compiler chain and is
   replayed around the matching Rustdoc invocation.
 - Cargo's configured general compiler wrapper also remains in the chain for both
-  ordinary compiler work and the matching generated Rustdoc invocation.
+  ordinary compiler work and the matching generated Rustdoc invocation. Relative
+  wrapper paths retain Cargo's defining-config origin semantics, bare names use
+  `PATH`, and wrapper discovery uses `CHECK_DOCS_TOOLCHAIN` consistently.
+- Each generation uses an isolated Cargo target identity, so Cargo cannot reuse
+  Rustdoc JSON after a compiler wrapper changes its effective cfgs.
 - It uses exact versions from the project lockfile/resolution.
 - It respects dependency renames from `Cargo.toml`.
 - It uses exactly the features enabled by the target project.
 - It only works for direct dependencies of the selected package.
+
+Normal dependencies are included by default. Direct dev- and build-dependencies
+are excluded unless their Cargo contexts are requested explicitly:
+
+```bash
+check-docs 'use dev_dependency::Item;' --root . --include-dev
+check-docs 'use build_dependency::Item;' --root . --include-build
+```
+
+Both flags may be supplied together. Each selected context is resolved and reported
+separately.
 
 If dependency is missing:
 
@@ -201,7 +225,9 @@ the `rustdoc-types 0.56.x` schema.
 
 ## Error interpretation
 
-- `not a direct dependency`: add dependency to `Cargo.toml` or query from project where it is direct.
+- `not a direct dependency`: add dependency to `Cargo.toml` or query from a project
+  where it is direct. If the dependency is already declared only for dev or build,
+  the diagnostic instead suggests `--include-dev` or `--include-build` exactly.
 - `Rust standard library`: use <https://doc.rust-lang.org/std/>.
 - `glob imports are not supported`: query concrete item path.
 - `ambiguous across Rust namespaces`: the import spelling denotes more than one

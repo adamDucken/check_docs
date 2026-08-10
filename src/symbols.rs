@@ -347,6 +347,16 @@ fn follow_use_or_external(
     visited: &mut HashSet<Id>,
 ) -> Result<Followed, SymbolError> {
     loop {
+        if krate
+            .index
+            .get(&id)
+            .is_some_and(|item| !is_cfg_available(item))
+        {
+            return Err(SymbolError::NotFound(
+                "item is not available in the selected non-doc compilation configuration"
+                    .to_string(),
+            ));
+        }
         if let Some(external) = external_from_id(krate, id) {
             return Ok(Followed::External(external));
         }
@@ -364,6 +374,16 @@ fn follow_use_or_external(
             .and_then(|target| external_from_id(krate, target))
             .is_some()
         {
+            if use_source_starts_with_external_crate(krate, use_item) {
+                return external_from_use(krate, use_item)
+                    .map(Followed::External)
+                    .ok_or_else(|| {
+                        SymbolError::InvalidRustdoc(format!(
+                            "use '{}' has an invalid external source path",
+                            use_item.source
+                        ))
+                    });
+            }
             match local_use_source_target(krate, id, use_item) {
                 Ok(Some(local_target)) => {
                     id = local_target;
@@ -371,7 +391,8 @@ fn follow_use_or_external(
                 }
                 Ok(None) => {}
                 Err(SymbolError::InvalidRustdoc(message))
-                    if message.contains("is missing path segment") =>
+                    if message.contains("is missing path segment")
+                        || message.contains("traverses extern crate alias") =>
                 {
                     // Public Rustdoc strips private modules even when they form the
                     // syntactic path of a valid public external re-export. The
@@ -401,6 +422,16 @@ fn follow_use_or_external(
     }
 }
 
+fn use_source_starts_with_external_crate(krate: &Crate, use_item: &rustdoc_types::Use) -> bool {
+    let Some(first) = use_item.source.split("::").next() else {
+        return false;
+    };
+    krate
+        .external_crates
+        .values()
+        .any(|external| identifier_key(&external.name) == identifier_key(first))
+}
+
 fn local_use_source_target(
     krate: &Crate,
     use_id: Id,
@@ -422,9 +453,9 @@ fn local_use_source_target(
                 use_item.source
             ))
         })?,
-        _ => return Ok(None),
+        _ => krate.root,
     };
-    let mut offset = 1;
+    let mut offset = usize::from(matches!(first, "crate" | "self" | "super"));
     if first == "super" {
         while parts.get(offset) == Some(&"super") {
             container = containing_module(krate, container).ok_or_else(|| {
@@ -450,6 +481,13 @@ fn local_use_source_target(
     for (index, name) in path.iter().enumerate() {
         let current = item(krate, container)?;
         let ItemEnum::Module(module) = &current.inner else {
+            if matches!(current.inner, ItemEnum::ExternCrate { .. }) {
+                return Err(SymbolError::InvalidRustdoc(format!(
+                    "local use source '{}' traverses extern crate alias '{}'",
+                    use_item.source,
+                    current.name.as_deref().unwrap_or("<unnamed>")
+                )));
+            }
             return Err(SymbolError::InvalidRustdoc(format!(
                 "local use path '{}' traverses non-module item '{}'",
                 use_item.source,
@@ -461,11 +499,12 @@ fn local_use_source_target(
             .iter()
             .copied()
             .filter(|child_id| {
-                krate.index.get(child_id).is_some_and(|child| {
-                    exported_name(child)
-                        .as_deref()
-                        .is_some_and(|exported| identifier_key(exported) == identifier_key(name))
-                })
+                *child_id != use_id
+                    && krate.index.get(child_id).is_some_and(|child| {
+                        exported_name(child).as_deref().is_some_and(|exported| {
+                            identifier_key(exported) == identifier_key(name)
+                        })
+                    })
             })
             .collect::<Vec<_>>();
         if index + 1 != path.len() {
@@ -533,7 +572,13 @@ fn external_from_use(krate: &Crate, use_item: &rustdoc_types::Use) -> Option<Ext
 
 pub(crate) fn format_crate_root(krate: &Crate) -> Result<SymbolDoc, SymbolError> {
     let root = item(krate, krate.root)?;
-    Ok(format_item(krate, root))
+    let mut formatted = format_item(krate, root);
+    formatted.kind = "crate";
+    formatted.definition = format!(
+        "definition rendering unsupported for crate root {}",
+        rust_identifier(&formatted.name)
+    );
+    Ok(formatted)
 }
 
 fn find_child(
@@ -855,6 +900,12 @@ fn follow_use(krate: &Crate, mut id: Id, visited: &mut HashSet<Id>) -> Result<Id
             ));
         }
         let current = item(krate, id)?;
+        if !is_cfg_available(current) {
+            return Err(SymbolError::NotFound(
+                "item is not available in the selected non-doc compilation configuration"
+                    .to_string(),
+            ));
+        }
         let ItemEnum::Use(use_item) = &current.inner else {
             return Ok(id);
         };
@@ -911,7 +962,17 @@ fn exported_name(item: &Item) -> Option<String> {
 }
 
 fn is_public(item: &Item) -> bool {
-    matches!(item.visibility, Visibility::Public | Visibility::Default)
+    is_cfg_available(item) && matches!(item.visibility, Visibility::Public | Visibility::Default)
+}
+
+fn is_cfg_available(item: &Item) -> bool {
+    !item.attrs.iter().any(|attribute| {
+        matches!(
+            attribute,
+            Attribute::Other(attribute)
+                if attribute == crate::rustdoc_json::CFG_UNAVAILABLE_ATTRIBUTE
+        )
+    })
 }
 
 fn path_label(krate: &Crate, id: Id) -> String {
@@ -2869,13 +2930,149 @@ mod tests {
             Some("Ident"),
             Visibility::Public,
             ItemEnum::Use(Use {
-                source: "crate::ident::Ident".into(),
+                source: "ident::Ident".into(),
                 name: "Ident".into(),
                 id: Some(Id(99)),
                 is_glob: false,
             }),
         );
         let mut docs = krate(vec![root, reexport], Id(1));
+        docs.external_crates.insert(
+            7,
+            ExternalCrate {
+                name: "proc_macro2".into(),
+                html_root_url: None,
+            },
+        );
+        docs.paths.insert(
+            Id(99),
+            ItemSummary {
+                crate_id: 7,
+                path: vec!["proc_macro2".into(), "Ident".into()],
+                kind: ItemKind::Struct,
+            },
+        );
+
+        assert_eq!(
+            external_reexports(
+                &docs,
+                &ImportPath {
+                    crate_name: "fixture".into(),
+                    segments: vec![],
+                    item: "Ident".into(),
+                    namespace: None,
+                },
+            )
+            .unwrap(),
+            vec![ExternalReexport {
+                crate_name: "proc_macro2".into(),
+                path: vec!["Ident".into()],
+                via_glob: false,
+                namespace: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn known_external_source_keeps_the_immediate_dependency_edge() {
+        let root = item(
+            1,
+            Some("fixture"),
+            Visibility::Public,
+            ItemEnum::Module(Module {
+                is_crate: true,
+                items: vec![Id(2)],
+                is_stripped: false,
+            }),
+        );
+        let reexport = item(
+            2,
+            Some("Thing"),
+            Visibility::Public,
+            ItemEnum::Use(Use {
+                source: "middle::Thing".into(),
+                name: "Thing".into(),
+                id: Some(Id(99)),
+                is_glob: false,
+            }),
+        );
+        let mut docs = krate(vec![root, reexport], Id(1));
+        docs.external_crates.insert(
+            7,
+            ExternalCrate {
+                name: "origin".into(),
+                html_root_url: None,
+            },
+        );
+        docs.external_crates.insert(
+            8,
+            ExternalCrate {
+                name: "middle".into(),
+                html_root_url: None,
+            },
+        );
+        docs.paths.insert(
+            Id(99),
+            ItemSummary {
+                crate_id: 7,
+                path: vec!["origin".into(), "Thing".into()],
+                kind: ItemKind::Struct,
+            },
+        );
+
+        assert_eq!(
+            external_reexports(
+                &docs,
+                &ImportPath {
+                    crate_name: "fixture".into(),
+                    segments: vec![],
+                    item: "Thing".into(),
+                    namespace: None,
+                },
+            )
+            .unwrap(),
+            vec![ExternalReexport {
+                crate_name: "middle".into(),
+                path: vec!["Thing".into()],
+                via_glob: false,
+                namespace: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn source_level_extern_crate_alias_uses_the_canonical_external_id() {
+        let root = item(
+            1,
+            Some("fixture"),
+            Visibility::Public,
+            ItemEnum::Module(Module {
+                is_crate: true,
+                items: vec![Id(2), Id(3)],
+                is_stripped: false,
+            }),
+        );
+        let reexport = item(
+            2,
+            Some("Ident"),
+            Visibility::Public,
+            ItemEnum::Use(Use {
+                source: "source_alias::Ident".into(),
+                name: "Ident".into(),
+                id: Some(Id(99)),
+                is_glob: false,
+            }),
+        );
+        let alias = item(
+            3,
+            Some("source_alias"),
+            Visibility::Public,
+            ItemEnum::ExternCrate {
+                name: "proc_macro2".into(),
+                rename: Some("source_alias".into()),
+            },
+        );
+        let mut docs = krate(vec![root, reexport, alias], Id(1));
         docs.external_crates.insert(
             7,
             ExternalCrate {
@@ -2973,6 +3170,12 @@ mod tests {
             }
         );
         assert!(root_external.import_path().is_none());
+        let root_doc = format_crate_root(&krate).unwrap();
+        assert_eq!(root_doc.kind, "crate");
+        assert_eq!(
+            root_doc.definition,
+            "definition rendering unsupported for crate root fixture"
+        );
 
         let tailed_external = external_reexport(
             &krate,

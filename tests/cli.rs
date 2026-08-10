@@ -103,7 +103,11 @@ fn binary_reports_transitive_external_crate_root_reexport() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("crate: camino"));
-    assert!(stdout.contains("item: module camino"));
+    assert!(stdout.contains("item: crate camino"));
+    assert!(
+        stdout.contains("definition: definition rendering unsupported for crate root camino\n")
+    );
+    assert!(!stdout.contains("definition: pub mod camino;"));
 }
 
 #[test]
@@ -1616,6 +1620,83 @@ pub struct HostOnly;
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn binary_rejects_rustdoc_only_cfg_items_and_keeps_valid_platform_items() {
+    let workspace = TempDir::new().unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"platform_dep\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    write_member(
+        &workspace,
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nplatform_dep = { path = \"../platform_dep\" }\n",
+        "",
+    );
+    write_member(
+        &workspace,
+        "platform_dep",
+        "[package]\nname = \"platform_dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        r#"#[cfg(any(doc, all(unix, windows)))]
+pub struct DocOnly;
+
+#[cfg(any(doc, unix))]
+pub struct UnixOnly;
+
+#[cfg_attr(not(doc), cfg(windows))]
+pub struct CfgAttrOnly;
+"#,
+    );
+    lock_workspace(&workspace);
+
+    let valid = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use platform_dep::UnixOnly;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    assert!(String::from_utf8_lossy(&valid.stdout).contains("pub struct UnixOnly;"));
+
+    let doc_only = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use platform_dep::DocOnly;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .output()
+        .unwrap();
+    assert!(!doc_only.status.success());
+    let stderr = String::from_utf8_lossy(&doc_only.stderr);
+    assert!(stderr.contains("item 'DocOnly' not found"), "{stderr}");
+
+    let cfg_attr_only = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use platform_dep::CfgAttrOnly;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .output()
+        .unwrap();
+    assert!(!cfg_attr_only.status.success());
+    let stderr = String::from_utf8_lossy(&cfg_attr_only.stderr);
+    assert!(stderr.contains("item 'CfgAttrOnly' not found"), "{stderr}");
+}
+
 #[test]
 fn binary_supports_relative_child_and_sibling_roots() {
     let parent = TempDir::new().unwrap();
@@ -2134,19 +2215,19 @@ fn binary_follows_external_reexports_through_stripped_private_modules() {
         &workspace,
         "facade",
         "[package]\nname = \"facade\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\norigin = { path = \"../origin\" }\n",
-        "mod hidden { pub use origin::Thing; }\npub use crate::hidden::Thing;\n",
+        "mod hidden { pub use origin::Thing; }\npub use hidden::Thing;\npub extern crate origin as source_alias;\npub use source_alias::AliasThing;\n",
     );
     write_member(
         &workspace,
         "origin",
         "[package]\nname = \"origin\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-        "pub struct Thing;\n",
+        "pub struct Thing;\npub struct AliasThing;\n",
     );
     lock_workspace(&workspace);
 
     let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
         .args([
-            "use facade::Thing;",
+            "use facade::{Thing, AliasThing};",
             "--root",
             workspace.path().to_str().unwrap(),
             "--package",
@@ -2163,6 +2244,10 @@ fn binary_follows_external_reexports_through_stripped_private_modules() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("crate: origin 0.1.0"), "{stdout}");
     assert!(stdout.contains("resolved item: struct Thing"), "{stdout}");
+    assert!(
+        stdout.contains("resolved item: struct AliasThing"),
+        "{stdout}"
+    );
 
     let syn = Command::new(env!("CARGO_BIN_EXE_check-docs"))
         .args(["use syn::Ident;", "--root", "."])
@@ -2335,6 +2420,95 @@ pub struct BuildOnly;
 }
 
 #[test]
+fn binary_matches_same_feature_dev_and_build_units_by_profile_cfg() {
+    let workspace = TempDir::new().unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        r#"[workspace]
+members = ["app", "shared"]
+resolver = "3"
+
+[profile.dev]
+debug-assertions = true
+overflow-checks = true
+
+[profile.dev.build-override]
+debug-assertions = false
+overflow-checks = false
+
+[profile.test]
+debug-assertions = true
+overflow-checks = true
+
+[profile.test.build-override]
+debug-assertions = false
+overflow-checks = false
+"#,
+    )
+    .unwrap();
+    write_member(
+        &workspace,
+        "app",
+        r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[dev-dependencies]
+shared = { path = "../shared" }
+
+[build-dependencies]
+shared = { path = "../shared" }
+"#,
+        "",
+    );
+    fs::write(workspace.path().join("app/build.rs"), "fn main() {}\n").unwrap();
+    write_member(
+        &workspace,
+        "shared",
+        "[package]\nname = \"shared\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        r#"#[cfg(any(debug_assertions, doc))]
+pub struct DevProfile;
+
+#[cfg(any(not(debug_assertions), doc))]
+pub struct BuildProfile;
+"#,
+    );
+    lock_workspace(&workspace);
+
+    for (item, flag, dependency) in [
+        ("DevProfile", "--include-dev", "dev"),
+        ("BuildProfile", "--include-build", "build"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+            .args([
+                &format!("use shared::{item};"),
+                "--root",
+                workspace.path().to_str().unwrap(),
+                "--package",
+                "app",
+                flag,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{item}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("dependency: {dependency}\n")),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("definition: pub struct {item};")),
+            "{stdout}"
+        );
+    }
+}
+
+#[test]
 fn binary_suggests_flags_for_dependencies_excluded_by_kind() {
     let dev = Command::new(env!("CARGO_BIN_EXE_check-docs"))
         .args(["use tempfile::TempDir;", "--root", "."])
@@ -2440,6 +2614,28 @@ fn binary_normalizes_cargo_host_target_from_environment_and_config() {
         String::from_utf8_lossy(&configured.stderr)
     );
     assert!(String::from_utf8_lossy(&configured.stdout).contains(&format!("target: {host}")));
+
+    fs::write(
+        workspace.path().join(".cargo/config.toml"),
+        "[build]\ntarget = [\"host\"]\n",
+    )
+    .unwrap();
+    let singleton = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use dep::Thing;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        singleton.status.success(),
+        "{}",
+        String::from_utf8_lossy(&singleton.stderr)
+    );
+    assert!(String::from_utf8_lossy(&singleton.stdout).contains(&format!("target: {host}")));
 }
 
 #[cfg(unix)]
@@ -2523,6 +2719,78 @@ fn binary_regenerates_after_a_config_relative_wrapper_changes_semantics() {
         String::from_utf8_lossy(&second.stderr)
     );
     assert!(String::from_utf8_lossy(&second.stdout).contains("pub struct SecondOnly;"));
+}
+
+#[test]
+fn binary_bounds_managed_generation_retention_for_sequential_and_concurrent_queries() {
+    let workspace = TempDir::new().unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"dep\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    write_member(
+        &workspace,
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        "",
+    );
+    write_member(
+        &workspace,
+        "dep",
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        "pub struct Thing;\n",
+    );
+    lock_workspace(&workspace);
+    let root = workspace.path().to_path_buf();
+
+    let query = |root: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_check-docs"))
+            .args([
+                "use dep::Thing;",
+                "--root",
+                root.to_str().unwrap(),
+                "--package",
+                "app",
+            ])
+            .env("CARGO_TARGET_DIR", root.join("target"))
+            .output()
+            .unwrap()
+    };
+    for _ in 0..2 {
+        let output = query(&root);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let first_root = root.clone();
+    let second_root = root.clone();
+    let first = std::thread::spawn(move || query(&first_root));
+    let second = std::thread::spawn(move || query(&second_root));
+    for output in [first.join().unwrap(), second.join().unwrap()] {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let managed_root = workspace.path().join("target/check-docs");
+    let mut directories = fs::read_dir(&managed_root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.file_name())
+        .collect::<Vec<_>>();
+    directories.sort();
+    assert_eq!(directories, [OsString::from("generation")]);
+    assert_eq!(
+        fs::read_to_string(managed_root.join("generation/.check-docs-generation")).unwrap(),
+        "check-docs managed generation\n"
+    );
 }
 
 #[cfg(unix)]

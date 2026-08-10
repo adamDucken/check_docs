@@ -11,7 +11,7 @@ It reports:
 - crate name + exact resolved version
 - normalized root feature selection
 - rustdoc JSON/source location
-- item kind/name, including modules
+- item kind/name, including modules and external crate roots
 - absolute file + line where declared when available
 - definition/signature, including higher-ranked function-pointer binders
 - deprecation details (`since` and `note`) when present
@@ -91,13 +91,16 @@ names apply to that selected package just as they do for `cargo check -p`.
 - `self` imports inside non-root braces: `use tokio::sync::{self, mpsc};`.
   These bind only the parent's type namespace, matching Rust import semantics.
 - Modules are supported and labeled: `use tokio::sync::watch;` -> `item: module watch`
+- External crate-root re-exports are labeled as crates and use an explicit unsupported
+  definition marker rather than inventing a module declaration.
 - Enum variants are supported: `use facade::Number::One;`
 - Raw identifiers are supported in crate aliases and item paths; declarations restore
   the `r#` prefix wherever Rustdoc reports an unescaped keyword name.
 - Concrete items behind public external globs and multi-package re-export chains
   are followed through the resolved Cargo dependency graph.
 - Canonical external targets remain usable when Rustdoc strips a private module
-  from the syntactic path of a public re-export.
+  from the syntactic path of a public re-export, including bare crate-root-relative
+  paths and source-level `extern crate` aliases.
 - Public primitive re-exports such as `pub use i32 as MyI32` are reported with
   both the public use declaration and the built-in primitive identity.
 - Constructor namespaces follow external usability: non-exhaustive unit and
@@ -131,8 +134,8 @@ Consequences:
   `CARGO_BUILD_TARGET` and Cargo's special `host` value); an explicit `--target`
   remains the highest-precedence override.
 - Compiler-wrapper matching and cache paths include Cargo's compile mode, host/target
-  platform, feature set, and profile identity, so equal-feature host and target units
-  cannot overwrite one another's Rustdoc JSON.
+  platform, feature set, and profile cfg identity, so equal-feature units built with
+  different profile cfgs cannot overwrite one another's Rustdoc JSON.
 - Dev-only queries use Cargo's test graph, build-only queries use the host build unit,
   and external re-export traversal preserves that originating context at every hop.
 - Target-specific normal/dev edges are evaluated for the selected target, while
@@ -150,8 +153,13 @@ Consequences:
   ordinary compiler work and the matching generated Rustdoc invocation. Relative
   wrapper paths retain Cargo's defining-config origin semantics, bare names use
   `PATH`, and wrapper discovery uses `CHECK_DOCS_TOOLCHAIN` consistently.
-- Each generation uses an isolated Cargo target identity, so Cargo cannot reuse
-  Rustdoc JSON after a compiler wrapper changes its effective cfgs.
+- Each generation starts from one clean, ownership-marked Cargo target tree under
+  `target/check-docs`, guarded by an inter-process lock. This prevents stale wrapper
+  semantics while bounding retained build artifacts to one inactive generation tree.
+- Rustdoc's implicit `cfg(doc)` is not treated as part of the selected Cargo unit.
+  Retained item cfg expressions are evaluated against the exact non-doc cfg set from
+  the matched compiler-wrapper invocation, so documentation-only platform APIs are
+  excluded while APIs valid for the selected target/profile remain available.
 - It uses exact versions from the project lockfile/resolution.
 - It respects dependency renames from `Cargo.toml`.
 - It uses exactly the features enabled by the target project.
@@ -243,7 +251,8 @@ the `rustdoc-types 0.56.x` schema.
 - `failed to read cargo metadata without changing Cargo.lock`: follow lockfile-refresh
   guidance only when Cargo specifically reports a missing or stale lockfile; otherwise
   fix the manifest, target, feature, or other Cargo error shown.
-- `item not found`: likely wrong path, private item, disabled feature, or unsupported Rustdoc shape.
+- `item not found`: likely wrong path, private item, disabled feature, target/profile cfg,
+  or unsupported Rustdoc shape. Items enabled only by Rustdoc's `cfg(doc)` are intentionally absent.
 - `definition rendering unsupported for ...`: Rustdoc identified the item, but its schema does not contain enough source information to print a trustworthy Rust declaration.
 
 ## Best practices

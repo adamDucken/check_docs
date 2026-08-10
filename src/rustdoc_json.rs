@@ -7,16 +7,16 @@ use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use syn::parse::Parser;
 
 const PINNED_TOOLCHAIN: &str = "nightly-2025-09-10";
-static GENERATION_COUNTER: AtomicU64 = AtomicU64::new(0);
+const GENERATION_MARKER: &str = "check-docs managed generation\n";
+pub(crate) const CFG_UNAVAILABLE_ATTRIBUTE: &str = "#[check_docs_cfg_unavailable]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CargoTargetSelection {
@@ -75,7 +75,13 @@ pub(crate) fn load_or_generate(
             )
         })?
         .to_path_buf();
-    let target_dir = generation_target_dir(&request);
+    let generation_root = request
+        .metadata
+        .target_directory
+        .as_std_path()
+        .join("check-docs");
+    let _lock = JsonGenerationLock::acquire(generation_root.join("generation.lock"))?;
+    let target_dir = reset_generation_target_dir(&generation_root)?;
     let mut doc_dir = target_dir.clone();
     if let Some(platform) = &request.unit.platform {
         doc_dir.push(platform);
@@ -83,47 +89,67 @@ pub(crate) fn load_or_generate(
     let json_path = doc_dir
         .join("doc")
         .join(format!("{}.json", request.target.name.replace('-', "_")));
-    let _lock = JsonGenerationLock::acquire(json_path.with_extension("json.lock"))?;
-
-    // Always regenerate. Existing JSON does not encode enough of Cargo's resolved state
-    // to prove it matches the selected package's current features/source graph.
     generate_json(
         &request,
         &target_dir,
         json_path.parent().expect("JSON path has doc directory"),
     )?;
     let mut krate = load_valid_json(&json_path, request.package)?;
+    let cfg = load_rustc_cfg(&json_path.with_extension("cfg"))?;
+    apply_non_doc_cfg(&mut krate, &cfg);
     normalize_span_paths(&mut krate, &invocation_dir);
     Ok((krate, json_path))
 }
 
-fn generation_target_dir(request: &RustdocRequest<'_>) -> PathBuf {
-    let mut hasher = DefaultHasher::new();
-    request.root_package.id.hash(&mut hasher);
-    request.package.id.hash(&mut hasher);
-    request.target.name.hash(&mut hasher);
-    request.unit.hash(&mut hasher);
-    request.feature_selection.hash(&mut hasher);
-    for context in request.contexts {
-        context.kind.hash(&mut hasher);
-        context.target.hash(&mut hasher);
-        context.via.hash(&mut hasher);
+fn reset_generation_target_dir(generation_root: &Path) -> Result<PathBuf, String> {
+    let target_dir = generation_root.join("generation");
+    if target_dir.exists() {
+        let metadata = fs::symlink_metadata(&target_dir).map_err(|err| {
+            format!(
+                "failed to inspect managed generation directory {}: {err}",
+                target_dir.display()
+            )
+        })?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "refusing to replace unowned check-docs generation path {}",
+                target_dir.display()
+            ));
+        }
+        let marker = target_dir.join(".check-docs-generation");
+        let contents = fs::read_to_string(&marker).map_err(|err| {
+            format!(
+                "refusing to replace unowned check-docs generation directory {}: failed to read ownership marker {}: {err}",
+                target_dir.display(),
+                marker.display()
+            )
+        })?;
+        if contents != GENERATION_MARKER {
+            return Err(format!(
+                "refusing to replace unowned check-docs generation directory {}: invalid ownership marker",
+                target_dir.display()
+            ));
+        }
+        fs::remove_dir_all(&target_dir).map_err(|err| {
+            format!(
+                "failed to reset managed check-docs generation directory {}: {err}",
+                target_dir.display()
+            )
+        })?;
     }
-    request
-        .metadata
-        .target_directory
-        .as_std_path()
-        .join("check-docs")
-        .join(format!(
-            "{:016x}-{}-{}-{}",
-            hasher.finish(),
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-            GENERATION_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ))
+    fs::create_dir_all(&target_dir).map_err(|err| {
+        format!(
+            "failed to create managed check-docs generation directory {}: {err}",
+            target_dir.display()
+        )
+    })?;
+    fs::write(target_dir.join(".check-docs-generation"), GENERATION_MARKER).map_err(|err| {
+        format!(
+            "failed to write ownership marker in {}: {err}",
+            target_dir.display()
+        )
+    })?;
+    Ok(target_dir)
 }
 
 #[derive(Debug)]
@@ -258,6 +284,219 @@ fn load_valid_json(path: &PathBuf, package: &Package) -> Result<Crate, String> {
     Ok(krate)
 }
 
+#[derive(Debug, Default)]
+struct RustcCfg {
+    flags: HashSet<String>,
+    values: HashSet<(String, String)>,
+}
+
+impl RustcCfg {
+    fn parse(output: &[u8]) -> Self {
+        let mut cfg = Self::default();
+        for line in String::from_utf8_lossy(output).lines().map(str::trim) {
+            if let Some((name, value)) = line.split_once('=') {
+                if let Ok(value) = syn::parse_str::<syn::LitStr>(value) {
+                    cfg.values.insert((name.to_string(), value.value()));
+                }
+            } else if !line.is_empty()
+                && line
+                    .chars()
+                    .all(|character| character == '_' || character.is_ascii_alphanumeric())
+            {
+                cfg.flags.insert(line.to_string());
+            }
+        }
+        cfg
+    }
+
+    fn contains_flag(&self, name: &str) -> bool {
+        self.flags.contains(name)
+    }
+
+    fn contains_value(&self, name: &str, value: &str) -> bool {
+        self.values.contains(&(name.to_string(), value.to_string()))
+    }
+}
+
+fn load_rustc_cfg(path: &Path) -> Result<RustcCfg, String> {
+    let output = fs::read(path).map_err(|err| {
+        format!(
+            "non-doc rustc cfg output missing at {}: {err}",
+            path.display()
+        )
+    })?;
+    Ok(RustcCfg::parse(&output))
+}
+
+fn apply_non_doc_cfg(krate: &mut Crate, cfg: &RustcCfg) {
+    let unavailable = krate
+        .index
+        .iter()
+        .filter_map(|(id, item)| (!item_matches_cfg(item, cfg)).then_some(*id))
+        .collect::<HashSet<_>>();
+    for id in &unavailable {
+        if let Some(item) = krate.index.get_mut(id) {
+            item.attrs.push(rustdoc_types::Attribute::Other(
+                CFG_UNAVAILABLE_ATTRIBUTE.to_string(),
+            ));
+        }
+    }
+    for item in krate.index.values_mut() {
+        prune_unavailable_references(&mut item.inner, &unavailable);
+    }
+}
+
+fn item_matches_cfg(item: &rustdoc_types::Item, cfg: &RustcCfg) -> bool {
+    item.attrs.iter().all(|attribute| {
+        let rustdoc_types::Attribute::Other(attribute) = attribute else {
+            return true;
+        };
+        if let Some(expression) = retained_attribute_expression(attribute, "cfg") {
+            cfg_expression_matches(expression, cfg)
+        } else if let Some(expression) = retained_attribute_expression(attribute, "cfg_attr") {
+            cfg_attr_expression_matches(expression, cfg)
+        } else {
+            true
+        }
+    })
+}
+
+fn retained_attribute_expression<'a>(attribute: &'a str, name: &str) -> Option<&'a str> {
+    let retained_prefix = format!("#[<{name}>(");
+    let source_prefix = format!("#[{name}(");
+    attribute
+        .strip_prefix(&retained_prefix)
+        .or_else(|| attribute.strip_prefix(&source_prefix))?
+        .strip_suffix(")]")
+}
+
+fn cfg_expression_matches(expression: &str, cfg: &RustcCfg) -> bool {
+    syn::parse_str::<syn::Meta>(expression).is_ok_and(|meta| cfg_meta_matches(&meta, cfg))
+}
+
+fn cfg_attr_expression_matches(expression: &str, cfg: &RustcCfg) -> bool {
+    let Ok(nested) = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+        .parse_str(expression)
+    else {
+        return false;
+    };
+    let Some(predicate) = nested.first() else {
+        return false;
+    };
+    !cfg_meta_matches(predicate, cfg)
+        || nested
+            .iter()
+            .skip(1)
+            .all(|attribute| cfg_attr_output_matches(attribute, cfg))
+}
+
+fn cfg_attr_output_matches(attribute: &syn::Meta, cfg: &RustcCfg) -> bool {
+    let syn::Meta::List(list) = attribute else {
+        return true;
+    };
+    match cfg_path(&list.path).as_str() {
+        "cfg" => syn::parse2::<syn::Meta>(list.tokens.clone())
+            .is_ok_and(|meta| cfg_meta_matches(&meta, cfg)),
+        "cfg_attr" => syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+            .parse2(list.tokens.clone())
+            .is_ok_and(|nested| {
+                let Some(predicate) = nested.first() else {
+                    return false;
+                };
+                !cfg_meta_matches(predicate, cfg)
+                    || nested
+                        .iter()
+                        .skip(1)
+                        .all(|attribute| cfg_attr_output_matches(attribute, cfg))
+            }),
+        _ => true,
+    }
+}
+
+fn cfg_meta_matches(meta: &syn::Meta, cfg: &RustcCfg) -> bool {
+    match meta {
+        syn::Meta::Path(path) => cfg.contains_flag(&cfg_path(path)),
+        syn::Meta::NameValue(name_value) => {
+            let syn::Expr::Lit(expression) = &name_value.value else {
+                return false;
+            };
+            let syn::Lit::Str(value) = &expression.lit else {
+                return false;
+            };
+            cfg.contains_value(&cfg_path(&name_value.path), &value.value())
+        }
+        syn::Meta::List(list) => {
+            let Ok(nested) =
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+                    .parse2(list.tokens.clone())
+            else {
+                return false;
+            };
+            match cfg_path(&list.path).as_str() {
+                "all" => nested.iter().all(|meta| cfg_meta_matches(meta, cfg)),
+                "any" => nested.iter().any(|meta| cfg_meta_matches(meta, cfg)),
+                "not" if nested.len() == 1 => !cfg_meta_matches(&nested[0], cfg),
+                _ => false,
+            }
+        }
+    }
+}
+
+fn cfg_path(path: &syn::Path) -> String {
+    path.segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+fn prune_unavailable_references(
+    inner: &mut rustdoc_types::ItemEnum,
+    unavailable: &HashSet<rustdoc_types::Id>,
+) {
+    fn retain(ids: &mut Vec<rustdoc_types::Id>, unavailable: &HashSet<rustdoc_types::Id>) {
+        ids.retain(|id| !unavailable.contains(id));
+    }
+
+    fn retain_optional(
+        ids: &mut Vec<Option<rustdoc_types::Id>>,
+        unavailable: &HashSet<rustdoc_types::Id>,
+    ) {
+        ids.retain(|id| id.is_none_or(|id| !unavailable.contains(&id)));
+    }
+
+    match inner {
+        rustdoc_types::ItemEnum::Module(module) => retain(&mut module.items, unavailable),
+        rustdoc_types::ItemEnum::Struct(struct_) => {
+            retain(&mut struct_.impls, unavailable);
+            match &mut struct_.kind {
+                rustdoc_types::StructKind::Tuple(fields) => retain_optional(fields, unavailable),
+                rustdoc_types::StructKind::Plain { fields, .. } => retain(fields, unavailable),
+                rustdoc_types::StructKind::Unit => {}
+            }
+        }
+        rustdoc_types::ItemEnum::Union(union_) => {
+            retain(&mut union_.fields, unavailable);
+            retain(&mut union_.impls, unavailable);
+        }
+        rustdoc_types::ItemEnum::Enum(enum_) => {
+            retain(&mut enum_.variants, unavailable);
+            retain(&mut enum_.impls, unavailable);
+        }
+        rustdoc_types::ItemEnum::Variant(variant) => match &mut variant.kind {
+            rustdoc_types::VariantKind::Tuple(fields) => retain_optional(fields, unavailable),
+            rustdoc_types::VariantKind::Struct { fields, .. } => retain(fields, unavailable),
+            rustdoc_types::VariantKind::Plain => {}
+        },
+        rustdoc_types::ItemEnum::Trait(trait_) => {
+            retain(&mut trait_.items, unavailable);
+            retain(&mut trait_.implementations, unavailable);
+        }
+        rustdoc_types::ItemEnum::Impl(impl_) => retain(&mut impl_.items, unavailable),
+        _ => {}
+    }
+}
+
 fn generate_json(
     request: &RustdocRequest<'_>,
     target_dir: &Path,
@@ -336,6 +575,11 @@ fn generate_json_with_toolchain(
             "CHECK_DOCS_WRAPPER_UNIT_PLATFORM",
             serde_json::to_string(&request.unit.platform).expect("unit platform serializes"),
         )
+        .env("CHECK_DOCS_WRAPPER_UNIT_PROFILE", &request.unit.profile)
+        .env(
+            "CHECK_DOCS_WRAPPER_CFG_PATH",
+            doc_dir.join(format!("{}.cfg", request.target.name.replace('-', "_"))),
+        )
         .env("CHECK_DOCS_WRAPPER_DOC_DIR", doc_dir);
     if let Some(wrapper) = original_rustc_wrapper {
         command.env("CHECK_DOCS_ORIGINAL_RUSTC_WRAPPER", wrapper);
@@ -380,6 +624,33 @@ pub(crate) fn run_rustc_wrapper() -> ! {
         std::process::exit(0);
     }
 
+    let mut print_cfg = if let Some(wrapper) = &original_wrapper {
+        let mut command = Command::new(wrapper);
+        command.arg(compiler);
+        command
+    } else {
+        Command::new(compiler)
+    };
+    let cfg_output = print_cfg
+        .args(&command_arguments[1..])
+        .arg("--print=cfg")
+        .output()
+        .unwrap_or_else(|err| {
+            eprintln!("check-docs Rust compiler wrapper failed to inspect rustc cfgs: {err}");
+            std::process::exit(1);
+        });
+    if !cfg_output.status.success() {
+        eprintln!(
+            "check-docs Rust compiler wrapper failed to inspect rustc cfgs: {}",
+            String::from_utf8_lossy(&cfg_output.stderr).trim()
+        );
+        std::process::exit(cfg_output.status.code().unwrap_or(1));
+    }
+    let cfg = RustcCfg::parse(&cfg_output.stdout);
+    if !profile_matches_selected_unit(&cfg, invocation.arguments) {
+        std::process::exit(0);
+    }
+
     let Some(doc_dir) = env::var_os("CHECK_DOCS_WRAPPER_DOC_DIR").map(PathBuf::from) else {
         eprintln!("check-docs Rust compiler wrapper is missing its Rustdoc output directory");
         std::process::exit(1);
@@ -388,6 +659,17 @@ pub(crate) fn run_rustc_wrapper() -> ! {
         eprintln!(
             "check-docs Rust compiler wrapper failed to create {}: {err}",
             doc_dir.display()
+        );
+        std::process::exit(1);
+    }
+    let Some(cfg_path) = env::var_os("CHECK_DOCS_WRAPPER_CFG_PATH").map(PathBuf::from) else {
+        eprintln!("check-docs Rust compiler wrapper is missing its rustc cfg output path");
+        std::process::exit(1);
+    };
+    if let Err(err) = fs::write(&cfg_path, &cfg_output.stdout) {
+        eprintln!(
+            "check-docs Rust compiler wrapper failed to write {}: {err}",
+            cfg_path.display()
         );
         std::process::exit(1);
     }
@@ -521,6 +803,46 @@ fn wrapper_matches_selected_unit(arguments: &[OsString]) -> bool {
     actual_features == expected_features
 }
 
+fn profile_matches_selected_unit(cfg: &RustcCfg, arguments: &[OsString]) -> bool {
+    let Some(profile) = env::var("CHECK_DOCS_WRAPPER_UNIT_PROFILE")
+        .ok()
+        .and_then(|profile| serde_json::from_str::<serde_json::Value>(&profile).ok())
+    else {
+        return false;
+    };
+    let arguments = arguments
+        .iter()
+        .map(|argument| argument.to_string_lossy())
+        .collect::<Vec<_>>();
+    profile_matches_cfg(&profile, cfg, codegen_value(&arguments, "panic"))
+}
+
+fn profile_matches_cfg(
+    profile: &serde_json::Value,
+    cfg: &RustcCfg,
+    explicit_panic: Option<&str>,
+) -> bool {
+    let Some(debug_assertions) = profile
+        .get("debug_assertions")
+        .and_then(serde_json::Value::as_bool)
+    else {
+        return false;
+    };
+    let Some(overflow_checks) = profile
+        .get("overflow_checks")
+        .and_then(serde_json::Value::as_bool)
+    else {
+        return false;
+    };
+    let Some(panic) = profile.get("panic").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+
+    cfg.contains_flag("debug_assertions") == debug_assertions
+        && cfg.contains_flag("overflow_checks") == overflow_checks
+        && explicit_panic.is_none_or(|actual| actual == panic)
+}
+
 fn argument_value<'a>(arguments: &'a [std::borrow::Cow<'a, str>], flag: &str) -> Option<&'a str> {
     arguments.iter().enumerate().find_map(|(index, argument)| {
         if argument == flag {
@@ -528,6 +850,19 @@ fn argument_value<'a>(arguments: &'a [std::borrow::Cow<'a, str>], flag: &str) ->
         }
         argument
             .strip_prefix(flag)
+            .and_then(|value| value.strip_prefix('='))
+    })
+}
+
+fn codegen_value<'a>(arguments: &'a [std::borrow::Cow<'a, str>], option: &str) -> Option<&'a str> {
+    arguments.iter().enumerate().find_map(|(index, argument)| {
+        let value = if argument == "-C" {
+            arguments.get(index + 1).map(AsRef::as_ref)
+        } else {
+            argument.strip_prefix("-C")
+        }?;
+        value
+            .strip_prefix(option)
             .and_then(|value| value.strip_prefix('='))
     })
 }
@@ -853,8 +1188,14 @@ fn configured_build_target(manifest_path: &Path) -> Result<Option<String>, Strin
             String::from_utf8_lossy(&output.stdout).trim()
         )
     })?;
-    match config.build.target {
+    select_configured_targets(config.build.target)
+}
+
+fn select_configured_targets(targets: ConfiguredCargoTargets) -> Result<Option<String>, String> {
+    match targets {
         ConfiguredCargoTargets::One(target) => Ok(Some(target)),
+        ConfiguredCargoTargets::Many(targets) if targets.is_empty() => Ok(None),
+        ConfiguredCargoTargets::Many(mut targets) if targets.len() == 1 => Ok(targets.pop()),
         ConfiguredCargoTargets::Many(targets) => Err(format!(
             "Cargo build.target selects multiple targets ({}); pass --target TRIPLE to select one documentation target",
             targets.join(", ")
@@ -1465,6 +1806,131 @@ mod tests {
         assert_eq!(rustc_compile_mode(&host_build), Some("build"));
         assert_eq!(argument_value(&host_build, "--target"), None);
         assert_eq!(argument_value(&host_build, "--crate-name"), Some("shared"));
+    }
+
+    #[test]
+    fn compiler_wrapper_distinguishes_profile_cfgs() {
+        let selected = serde_json::json!({
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "panic": "unwind",
+        });
+        let dev_cfg = RustcCfg::parse(
+            b"debug_assertions\noverflow_checks\npanic=\"unwind\"\ntarget_os=\"linux\"\n",
+        );
+        let build_cfg = RustcCfg::parse(b"panic=\"unwind\"\ntarget_os=\"linux\"\n");
+
+        assert!(profile_matches_cfg(&selected, &dev_cfg, None));
+        assert!(!profile_matches_cfg(&selected, &build_cfg, None));
+        assert!(profile_matches_cfg(&selected, &dev_cfg, Some("unwind")));
+        assert!(!profile_matches_cfg(&selected, &dev_cfg, Some("abort")));
+    }
+
+    #[test]
+    fn retained_cfgs_are_evaluated_without_rustdocs_doc_flag() {
+        let mut docs = minimal_crate(None, FORMAT_VERSION);
+        let root = docs.root;
+        let mut doc_only = Item {
+            id: Id(2),
+            crate_id: 0,
+            name: Some("DocOnly".into()),
+            span: None,
+            visibility: Visibility::Public,
+            docs: None,
+            links: HashMap::new(),
+            attrs: vec![rustdoc_types::Attribute::Other(
+                "#[<cfg>(any(doc, windows))]".into(),
+            )],
+            deprecation: None,
+            inner: ItemEnum::Module(Module {
+                is_crate: false,
+                items: Vec::new(),
+                is_stripped: false,
+            }),
+        };
+        let unix_only = Item {
+            id: Id(3),
+            name: Some("UnixOnly".into()),
+            attrs: vec![rustdoc_types::Attribute::Other(
+                "#[<cfg>(all(unix, target_os = \"linux\"))]".into(),
+            )],
+            ..doc_only.clone()
+        };
+        let cfg_attr_only = Item {
+            id: Id(4),
+            name: Some("CfgAttrOnly".into()),
+            attrs: vec![rustdoc_types::Attribute::Other(
+                "#[<cfg_attr>(not(doc), cfg(windows))]".into(),
+            )],
+            ..doc_only.clone()
+        };
+        doc_only.id = Id(2);
+        docs.index.insert(Id(2), doc_only);
+        docs.index.insert(Id(3), unix_only);
+        docs.index.insert(Id(4), cfg_attr_only);
+        let ItemEnum::Module(root_module) = &mut docs.index.get_mut(&root).unwrap().inner else {
+            panic!("crate root is a module");
+        };
+        root_module.items = vec![Id(2), Id(3), Id(4)];
+        let cfg = RustcCfg::parse(b"unix\ntarget_os=\"linux\"\npanic=\"unwind\"\n");
+
+        apply_non_doc_cfg(&mut docs, &cfg);
+
+        let ItemEnum::Module(root_module) = &docs.index[&root].inner else {
+            panic!("crate root is a module");
+        };
+        assert_eq!(root_module.items, [Id(3)]);
+        assert!(docs.index[&Id(2)].attrs.iter().any(|attribute| {
+            matches!(attribute, rustdoc_types::Attribute::Other(attribute) if attribute == CFG_UNAVAILABLE_ATTRIBUTE)
+        }));
+        assert!(docs.index[&Id(4)].attrs.iter().any(|attribute| {
+            matches!(attribute, rustdoc_types::Attribute::Other(attribute) if attribute == CFG_UNAVAILABLE_ATTRIBUTE)
+        }));
+    }
+
+    #[test]
+    fn configured_target_forms_follow_cargo_semantics() {
+        assert_eq!(
+            select_configured_targets(ConfiguredCargoTargets::One("host".into())).unwrap(),
+            Some("host".into())
+        );
+        assert_eq!(
+            select_configured_targets(ConfiguredCargoTargets::Many(vec!["host".into()])).unwrap(),
+            Some("host".into())
+        );
+        assert_eq!(
+            select_configured_targets(ConfiguredCargoTargets::Many(Vec::new())).unwrap(),
+            None
+        );
+        let error = select_configured_targets(ConfiguredCargoTargets::Many(vec![
+            "host".into(),
+            "wasm32-unknown-unknown".into(),
+        ]))
+        .unwrap_err();
+        assert!(error.contains("selects multiple targets (host, wasm32-unknown-unknown)"));
+    }
+
+    #[test]
+    fn generation_directory_requires_and_refreshes_its_ownership_marker() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("check-docs");
+        let first = reset_generation_target_dir(&root).unwrap();
+        fs::write(first.join("stale"), "stale").unwrap();
+
+        let second = reset_generation_target_dir(&root).unwrap();
+        assert_eq!(first, second);
+        assert!(!second.join("stale").exists());
+        assert_eq!(
+            fs::read_to_string(second.join(".check-docs-generation")).unwrap(),
+            GENERATION_MARKER
+        );
+
+        fs::write(second.join(".check-docs-generation"), "not ours\n").unwrap();
+        assert!(
+            reset_generation_target_dir(&root)
+                .unwrap_err()
+                .contains("refusing to replace unowned")
+        );
     }
 
     #[cfg(unix)]

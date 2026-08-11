@@ -23,7 +23,8 @@ It reports:
 - trait associated items, including provided associated-constant defaults
 - constant and static initializers when Rustdoc preserves them; extern statics are
   labeled with their access safety instead of being shown with an invented initializer
-- derives when Rustdoc exposes them via attrs or derived impls
+- derives active for the selected Cargo unit when Rustdoc exposes them via top-level
+  attrs, matching `cfg_attr` payloads, or derived impls
 - inherent public methods for structs/enums/unions
 - direct non-blanket trait impls
 - Rust doc comments
@@ -153,13 +154,16 @@ Consequences:
   ordinary compiler work and the matching generated Rustdoc invocation. Relative
   wrapper paths retain Cargo's defining-config origin semantics, bare names use
   `PATH`, and wrapper discovery uses `CHECK_DOCS_TOOLCHAIN` consistently.
-- Each generation starts from one clean, ownership-marked Cargo target tree under
-  `target/check-docs`, guarded by an inter-process lock. This prevents stale wrapper
-  semantics while bounding retained build artifacts to one inactive generation tree.
+- Each invocation starts from one clean, ownership-marked Cargo target tree under
+  `target/check-docs` and holds its inter-process lock until all reports are emitted.
+  Selected Cargo units use distinct subdirectories, so every reported Rustdoc source
+  remains available and unit-correct until the next safely locked invocation, while
+  retained build artifacts stay bounded to one inactive generation tree.
 - Rustdoc's implicit `cfg(doc)` is not treated as part of the selected Cargo unit.
   Retained item cfg expressions are evaluated against the exact non-doc cfg set from
-  the matched compiler-wrapper invocation, so documentation-only platform APIs are
-  excluded while APIs valid for the selected target/profile remain available.
+  the matched compiler-wrapper invocation, so documentation-only platform APIs and
+  disabled conditional derives are excluded while APIs and derives valid for the
+  selected target/profile/features remain available.
 - It uses exact versions from the project lockfile/resolution.
 - It respects dependency renames from `Cargo.toml`.
 - It uses exactly the features enabled by the target project.

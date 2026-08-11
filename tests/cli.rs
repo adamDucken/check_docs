@@ -3,7 +3,10 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -32,6 +35,15 @@ fn host_target_triple() -> String {
         .find_map(|line| line.strip_prefix("host: "))
         .unwrap()
         .to_string()
+}
+
+fn report_source(report: &str) -> PathBuf {
+    PathBuf::from(
+        report
+            .lines()
+            .find_map(|line| line.strip_prefix("source: "))
+            .expect("report contains a source path"),
+    )
 }
 
 fn write_member(workspace: &TempDir, name: &str, manifest: &str, source: &str) {
@@ -1538,61 +1550,57 @@ pub struct HostOnly;
     .unwrap();
     lock_workspace(&workspace);
 
-    let target_output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+    let context_output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
         .args([
-            "use shared::TargetOnly;",
-            "--root",
-            workspace.path().to_str().unwrap(),
-            "--package",
-            "app",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        target_output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&target_output.stderr)
-    );
-    let target_stdout = String::from_utf8_lossy(&target_output.stdout);
-    assert!(
-        target_stdout.contains("target: wasm32-unknown-unknown"),
-        "{target_stdout}"
-    );
-    assert!(
-        target_stdout.contains("dependency: normal"),
-        "{target_stdout}"
-    );
-    assert!(
-        target_stdout.contains("definition: pub struct TargetOnly;"),
-        "{target_stdout}"
-    );
-
-    let host_output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
-        .args([
-            "use shared::HostOnly;",
+            "use shared::{TargetOnly, HostOnly};",
             "--root",
             workspace.path().to_str().unwrap(),
             "--package",
             "app",
             "--include-build",
         ])
+        .env("CARGO_TARGET_DIR", workspace.path().join("target"))
         .output()
         .unwrap();
     assert!(
-        host_output.status.success(),
+        context_output.status.success(),
         "stderr: {}",
-        String::from_utf8_lossy(&host_output.stderr)
+        String::from_utf8_lossy(&context_output.stderr)
     );
-    let host_stdout = String::from_utf8_lossy(&host_output.stdout);
+    let context_stdout = String::from_utf8_lossy(&context_output.stdout);
+    let target_report = context_stdout
+        .split("\n\n")
+        .find(|report| report.contains("definition: pub struct TargetOnly;"))
+        .expect("normal target report");
     assert!(
-        host_stdout.contains(&format!("target: {}", host_target_triple())),
-        "{host_stdout}"
+        target_report.contains("target: wasm32-unknown-unknown"),
+        "{target_report}"
     );
-    assert!(host_stdout.contains("dependency: build"), "{host_stdout}");
     assert!(
-        host_stdout.contains("definition: pub struct HostOnly;"),
-        "{host_stdout}"
+        target_report.contains("dependency: normal"),
+        "{target_report}"
     );
+    let host_report = context_stdout
+        .split("\n\n")
+        .find(|report| report.contains("definition: pub struct HostOnly;"))
+        .expect("build host report");
+    assert!(
+        host_report.contains(&format!("target: {}", host_target_triple())),
+        "{host_report}"
+    );
+    assert!(host_report.contains("dependency: build"), "{host_report}");
+
+    let target_source = report_source(target_report);
+    let host_source = report_source(host_report);
+    assert_ne!(target_source, host_source);
+    let target_json = fs::read_to_string(&target_source)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", target_source.display()));
+    let host_json = fs::read_to_string(&host_source)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", host_source.display()));
+    assert!(target_json.contains("\"TargetOnly\""), "{target_source:?}");
+    assert!(!target_json.contains("\"HostOnly\""), "{target_source:?}");
+    assert!(host_json.contains("\"HostOnly\""), "{host_source:?}");
+    assert!(!host_json.contains("\"TargetOnly\""), "{host_source:?}");
 
     let macro_output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
         .args([
@@ -1602,6 +1610,7 @@ pub struct HostOnly;
             "--package",
             "app",
         ])
+        .env("CARGO_TARGET_DIR", workspace.path().join("target"))
         .output()
         .unwrap();
     assert!(
@@ -1845,6 +1854,100 @@ extra = []
         .unwrap();
     assert!(!no_defaults.status.success());
     assert!(String::from_utf8_lossy(&no_defaults.stderr).contains("DefaultOnly' not found"));
+}
+
+#[test]
+fn binary_reports_cfg_attr_derives_only_when_the_feature_is_enabled() {
+    let workspace = TempDir::new().unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"dep\", \"marker_derive\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    write_member(
+        &workspace,
+        "app",
+        r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+marker = ["dep/marker"]
+
+[dependencies]
+dep = { path = "../dep", default-features = false }
+"#,
+        "",
+    );
+    write_member(
+        &workspace,
+        "dep",
+        r#"[package]
+name = "dep"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+marker = ["dep:marker_derive"]
+
+[dependencies]
+marker_derive = { path = "../marker_derive", optional = true }
+"#,
+        r#"#[cfg(feature = "marker")]
+use marker_derive::Marker;
+
+#[cfg_attr(feature = "marker", derive(Marker))]
+pub struct Thing;
+"#,
+    );
+    write_member(
+        &workspace,
+        "marker_derive",
+        "[package]\nname = \"marker_derive\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\nproc-macro = true\n",
+        "use proc_macro::TokenStream;\n#[proc_macro_derive(Marker)]\npub fn marker(_: TokenStream) -> TokenStream { TokenStream::new() }\n",
+    );
+    lock_workspace(&workspace);
+
+    let query = |feature_args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_check-docs"));
+        command.args([
+            "use dep::Thing;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ]);
+        command.args(feature_args);
+        command
+            .env("CARGO_TARGET_DIR", workspace.path().join("target"))
+            .output()
+            .unwrap()
+    };
+
+    let disabled = query(&[]);
+    assert!(
+        disabled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disabled.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&disabled.stdout).contains("derives:"),
+        "{}",
+        String::from_utf8_lossy(&disabled.stdout)
+    );
+
+    let enabled = query(&["--features", "marker"]);
+    assert!(
+        enabled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&enabled.stdout).contains("derives: Marker\n"),
+        "{}",
+        String::from_utf8_lossy(&enabled.stdout)
+    );
 }
 
 #[cfg(unix)]
@@ -2790,6 +2893,136 @@ fn binary_bounds_managed_generation_retention_for_sequential_and_concurrent_quer
     assert_eq!(
         fs::read_to_string(managed_root.join("generation/.check-docs-generation")).unwrap(),
         "check-docs managed generation\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_rejects_a_symlink_lock_without_modifying_its_target() {
+    let workspace = TempDir::new().unwrap();
+    fs::create_dir_all(workspace.path().join(".cargo")).unwrap();
+    let target_dir = workspace.path().join("cache");
+    fs::write(
+        workspace.path().join(".cargo/config.toml"),
+        format!("[build]\ntarget-dir = {:?}\n", target_dir.to_str().unwrap()),
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"dep\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    write_member(
+        &workspace,
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        "",
+    );
+    write_member(
+        &workspace,
+        "dep",
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        "pub struct Thing;\n",
+    );
+    lock_workspace(&workspace);
+
+    let manifest = workspace.path().join("Cargo.toml");
+    let original_manifest = fs::read_to_string(&manifest).unwrap();
+    let lock_dir = target_dir.join("check-docs");
+    fs::create_dir_all(&lock_dir).unwrap();
+    let lock_path = lock_dir.join("generation.lock");
+    symlink(Path::new("../../Cargo.toml"), &lock_path).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use dep::Thing;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(fs::read_to_string(&manifest).unwrap(), original_manifest);
+    assert!(fs::symlink_metadata(&lock_path).unwrap().is_symlink());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refusing to use non-regular or symlink rustdoc JSON lock path"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_rejects_a_symlink_managed_root_without_modifying_its_destination() {
+    let workspace = TempDir::new().unwrap();
+    fs::create_dir_all(workspace.path().join(".cargo")).unwrap();
+    let target_dir = workspace.path().join("cache");
+    fs::write(
+        workspace.path().join(".cargo/config.toml"),
+        format!("[build]\ntarget-dir = {:?}\n", target_dir.to_str().unwrap()),
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"dep\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    write_member(
+        &workspace,
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        "",
+    );
+    write_member(
+        &workspace,
+        "dep",
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        "pub struct Thing;\n",
+    );
+    lock_workspace(&workspace);
+
+    let victim_generation = workspace.path().join("victim/generation");
+    fs::create_dir_all(&victim_generation).unwrap();
+    fs::write(
+        victim_generation.join(".check-docs-generation"),
+        "check-docs managed generation\n",
+    )
+    .unwrap();
+    fs::write(victim_generation.join("keep.txt"), "keep me\n").unwrap();
+    fs::create_dir(&target_dir).unwrap();
+    let managed_root = target_dir.join("check-docs");
+    symlink(Path::new("../victim"), &managed_root).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use dep::Thing;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(victim_generation.join("keep.txt")).unwrap(),
+        "keep me\n"
+    );
+    assert_eq!(
+        fs::read_to_string(victim_generation.join(".check-docs-generation")).unwrap(),
+        "check-docs managed generation\n"
+    );
+    assert!(fs::symlink_metadata(&managed_root).unwrap().is_symlink());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refusing to use non-directory or symlink check-docs managed root"),
+        "{stderr}"
     );
 }
 

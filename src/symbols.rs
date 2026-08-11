@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
+use syn::parse::Parser;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SymbolError {
@@ -1360,22 +1361,43 @@ fn derive_attrs(attrs: &[Attribute]) -> Vec<String> {
         let Attribute::Other(text) = attr else {
             continue;
         };
-        let Some(start) = text.find("derive(") else {
+        let Some(expression) = top_level_derive_expression(text) else {
             continue;
         };
-        let after = &text[start + "derive(".len()..];
-        let Some(end) = after.find(')') else {
+        let Ok(paths) = syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated
+            .parse_str(expression)
+        else {
             continue;
         };
         derives.extend(
-            after[..end]
-                .split(',')
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(ToOwned::to_owned),
+            paths
+                .iter()
+                .filter(|path| {
+                    !path.segments.is_empty()
+                        && path
+                            .segments
+                            .iter()
+                            .all(|segment| matches!(segment.arguments, syn::PathArguments::None))
+                })
+                .map(|path| {
+                    path.segments
+                        .iter()
+                        .map(|segment| segment.ident.to_string())
+                        .collect::<Vec<_>>()
+                        .join("::")
+                }),
         );
     }
+    derives.sort();
+    derives.dedup();
     derives
+}
+
+fn top_level_derive_expression(attribute: &str) -> Option<&str> {
+    attribute
+        .strip_prefix("#[derive(")
+        .or_else(|| attribute.strip_prefix("#[<derive>("))?
+        .strip_suffix(")]")
 }
 
 fn methods(krate: &Crate, item: &Item) -> Vec<String> {
@@ -4179,6 +4201,24 @@ mod tests {
                 .any(|method| method == "pub fn new() -> Self")
         );
         assert!(doc.impls.iter().any(|imp| imp == "impl Clone for Widget"));
+    }
+
+    #[test]
+    fn derive_attributes_accept_only_genuine_top_level_derives() {
+        let attrs = vec![
+            Attribute::Other("#[derive(Clone, marker::Qualified)]".into()),
+            Attribute::Other("#[<derive>(Debug)]".into()),
+            Attribute::Other(
+                "#[<cfg_attr>(feature = \"builder\", derive(DisabledBuilder))]".into(),
+            ),
+            Attribute::Other("#[serde(note = \"derive(NotADerive)\")]".into()),
+            Attribute::Other("prefix #[derive(AlsoNotADerive)]".into()),
+        ];
+
+        assert_eq!(
+            derive_attrs(&attrs),
+            ["Clone", "Debug", "marker::Qualified"]
+        );
     }
 
     #[test]

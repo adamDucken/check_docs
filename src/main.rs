@@ -198,6 +198,7 @@ fn run() -> Result<(), String> {
             cargo_metadata::DependencyKind::Build,
         );
     }
+    let mut generation = rustdoc_json::GenerationSession::start(&metadata.target)?;
     let mut rustdoc_cache = RustdocCache::new();
     let mut printed_report = false;
     for import in &imports {
@@ -215,6 +216,7 @@ fn run() -> Result<(), String> {
                 let context_label = context.label();
                 match resolve_query(
                     &mut rustdoc_cache,
+                    &mut generation,
                     &manifest_path,
                     &metadata,
                     root_package,
@@ -318,6 +320,7 @@ fn is_lockfile_failure(error: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn resolve_query(
     cache: &mut RustdocCache,
+    generation: &mut rustdoc_json::GenerationSession,
     manifest_path: &Path,
     metadata: &MetadataSet,
     root_package: &Package,
@@ -340,6 +343,7 @@ fn resolve_query(
     let context_metadata = metadata.for_contexts(&contexts);
     let (krate, json_path) = load_docs_cached(
         cache,
+        generation,
         DependencyDocsRequest {
             manifest_path,
             metadata: context_metadata,
@@ -417,6 +421,7 @@ fn resolve_query(
         let result = if let Some(external_import) = external.import_path() {
             resolve_query(
                 cache,
+                generation,
                 manifest_path,
                 metadata,
                 root_package,
@@ -431,6 +436,7 @@ fn resolve_query(
         } else {
             load_docs_cached(
                 cache,
+                generation,
                 DependencyDocsRequest {
                     manifest_path,
                     metadata: context_metadata,
@@ -600,6 +606,7 @@ fn host_target_triple() -> Result<String, String> {
 
 fn load_docs_cached(
     cache: &mut RustdocCache,
+    generation: &mut rustdoc_json::GenerationSession,
     request: DependencyDocsRequest<'_>,
 ) -> Result<LoadedDocs, String> {
     let unit = rustdoc_json::resolved_unit(rustdoc_json::CargoUnitRequest {
@@ -617,17 +624,20 @@ fn load_docs_cached(
         return Ok(cached.clone());
     }
 
-    let (krate, json_path) = rustdoc_json::load_or_generate(rustdoc_json::RustdocRequest {
-        manifest_path: request.manifest_path.to_path_buf(),
-        metadata: request.metadata,
-        root_package: request.root_package,
-        package: request.package,
-        target: request.target,
-        contexts: request.contexts,
-        target_selection: request.target_selection,
-        feature_selection: request.feature_selection,
-        unit: &unit,
-    })?;
+    let (krate, json_path) = rustdoc_json::load_or_generate(
+        generation,
+        rustdoc_json::RustdocRequest {
+            manifest_path: request.manifest_path.to_path_buf(),
+            metadata: request.metadata,
+            root_package: request.root_package,
+            package: request.package,
+            target: request.target,
+            contexts: request.contexts,
+            target_selection: request.target_selection,
+            feature_selection: request.feature_selection,
+            unit: &unit,
+        },
+    )?;
     let loaded = (Arc::new(krate), json_path);
     cache.insert(key, loaded.clone());
     Ok(loaded)

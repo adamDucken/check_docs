@@ -7,11 +7,10 @@ use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use syn::parse::Parser;
 
 const PINNED_TOOLCHAIN: &str = "nightly-2025-09-10";
@@ -56,7 +55,43 @@ pub(crate) struct CargoUnitRequest<'a> {
     pub(crate) feature_selection: &'a FeatureSelection,
 }
 
+pub(crate) struct GenerationSession {
+    generation_root: PathBuf,
+    target_dir: PathBuf,
+    next_unit: usize,
+    _lock: JsonGenerationLock,
+}
+
+impl GenerationSession {
+    pub(crate) fn start(metadata: &Metadata) -> Result<Self, String> {
+        let generation_root = prepare_generation_root(metadata.target_directory.as_std_path())?;
+        let lock = JsonGenerationLock::acquire(generation_root.join("generation.lock"))?;
+        let target_dir = reset_generation_target_dir(&generation_root)?;
+        Ok(Self {
+            generation_root,
+            target_dir,
+            next_unit: 0,
+            _lock: lock,
+        })
+    }
+
+    fn next_target_dir(&mut self, metadata: &Metadata) -> Result<PathBuf, String> {
+        let requested_root = prepare_generation_root(metadata.target_directory.as_std_path())?;
+        if requested_root != self.generation_root {
+            return Err(format!(
+                "cannot retain rustdoc JSON from target directories {} and {} in one generation session",
+                self.generation_root.display(),
+                requested_root.display()
+            ));
+        }
+        let target_dir = self.target_dir.join(format!("unit-{}", self.next_unit));
+        self.next_unit += 1;
+        Ok(target_dir)
+    }
+}
+
 pub(crate) fn load_or_generate(
+    generation: &mut GenerationSession,
     mut request: RustdocRequest<'_>,
 ) -> Result<(Crate, PathBuf), String> {
     request.manifest_path = request.manifest_path.canonicalize().map_err(|err| {
@@ -75,13 +110,7 @@ pub(crate) fn load_or_generate(
             )
         })?
         .to_path_buf();
-    let generation_root = request
-        .metadata
-        .target_directory
-        .as_std_path()
-        .join("check-docs");
-    let _lock = JsonGenerationLock::acquire(generation_root.join("generation.lock"))?;
-    let target_dir = reset_generation_target_dir(&generation_root)?;
+    let target_dir = generation.next_target_dir(request.metadata)?;
     let mut doc_dir = target_dir.clone();
     if let Some(platform) = &request.unit.platform {
         doc_dir.push(platform);
@@ -101,41 +130,125 @@ pub(crate) fn load_or_generate(
     Ok((krate, json_path))
 }
 
+fn prepare_generation_root(target_directory: &Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(target_directory).map_err(|err| {
+        format!(
+            "failed to create Cargo target directory {}: {err}",
+            target_directory.display()
+        )
+    })?;
+    let target_directory = target_directory.canonicalize().map_err(|err| {
+        format!(
+            "failed to resolve Cargo target directory {}: {err}",
+            target_directory.display()
+        )
+    })?;
+    let generation_root = target_directory.join("check-docs");
+    match fs::symlink_metadata(&generation_root) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(format!(
+                "refusing to use non-directory or symlink check-docs managed root {}",
+                generation_root.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(err) = fs::create_dir(&generation_root) {
+                if err.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(format!(
+                        "failed to create check-docs managed root {}: {err}",
+                        generation_root.display()
+                    ));
+                }
+                let metadata = fs::symlink_metadata(&generation_root).map_err(|err| {
+                    format!(
+                        "failed to inspect concurrently created check-docs managed root {}: {err}",
+                        generation_root.display()
+                    )
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(format!(
+                        "refusing to use non-directory or symlink check-docs managed root {}",
+                        generation_root.display()
+                    ));
+                }
+            }
+        }
+        Err(err) => {
+            return Err(format!(
+                "failed to inspect check-docs managed root {}: {err}",
+                generation_root.display()
+            ));
+        }
+    }
+    let resolved_root = generation_root.canonicalize().map_err(|err| {
+        format!(
+            "failed to resolve check-docs managed root {}: {err}",
+            generation_root.display()
+        )
+    })?;
+    if resolved_root.parent() != Some(target_directory.as_path()) {
+        return Err(format!(
+            "refusing to use check-docs managed root {} outside Cargo target directory {}",
+            resolved_root.display(),
+            target_directory.display()
+        ));
+    }
+    Ok(resolved_root)
+}
+
 fn reset_generation_target_dir(generation_root: &Path) -> Result<PathBuf, String> {
     let target_dir = generation_root.join("generation");
-    if target_dir.exists() {
-        let metadata = fs::symlink_metadata(&target_dir).map_err(|err| {
-            format!(
+    match fs::symlink_metadata(&target_dir) {
+        Ok(metadata) => {
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "refusing to replace unowned check-docs generation path {}",
+                    target_dir.display()
+                ));
+            }
+            let marker = target_dir.join(".check-docs-generation");
+            let marker_metadata = fs::symlink_metadata(&marker).map_err(|err| {
+                format!(
+                    "refusing to replace unowned check-docs generation directory {}: failed to inspect ownership marker {}: {err}",
+                    target_dir.display(),
+                    marker.display()
+                )
+            })?;
+            if marker_metadata.file_type().is_symlink() || !marker_metadata.is_file() {
+                return Err(format!(
+                    "refusing to replace unowned check-docs generation directory {}: ownership marker {} is not a regular non-symlink file",
+                    target_dir.display(),
+                    marker.display()
+                ));
+            }
+            let contents = fs::read_to_string(&marker).map_err(|err| {
+                format!(
+                    "refusing to replace unowned check-docs generation directory {}: failed to read ownership marker {}: {err}",
+                    target_dir.display(),
+                    marker.display()
+                )
+            })?;
+            if contents != GENERATION_MARKER {
+                return Err(format!(
+                    "refusing to replace unowned check-docs generation directory {}: invalid ownership marker",
+                    target_dir.display()
+                ));
+            }
+            fs::remove_dir_all(&target_dir).map_err(|err| {
+                format!(
+                    "failed to reset managed check-docs generation directory {}: {err}",
+                    target_dir.display()
+                )
+            })?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(format!(
                 "failed to inspect managed generation directory {}: {err}",
                 target_dir.display()
-            )
-        })?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(format!(
-                "refusing to replace unowned check-docs generation path {}",
-                target_dir.display()
             ));
         }
-        let marker = target_dir.join(".check-docs-generation");
-        let contents = fs::read_to_string(&marker).map_err(|err| {
-            format!(
-                "refusing to replace unowned check-docs generation directory {}: failed to read ownership marker {}: {err}",
-                target_dir.display(),
-                marker.display()
-            )
-        })?;
-        if contents != GENERATION_MARKER {
-            return Err(format!(
-                "refusing to replace unowned check-docs generation directory {}: invalid ownership marker",
-                target_dir.display()
-            ));
-        }
-        fs::remove_dir_all(&target_dir).map_err(|err| {
-            format!(
-                "failed to reset managed check-docs generation directory {}: {err}",
-                target_dir.display()
-            )
-        })?;
     }
     fs::create_dir_all(&target_dir).map_err(|err| {
         format!(
@@ -177,18 +290,9 @@ impl JsonGenerationLock {
             })?;
         }
         loop {
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)
-                .map_err(|err| {
-                    format!("failed to open rustdoc JSON lock {}: {err}", path.display())
-                })?;
+            let file = open_lock_file(&path)?;
             match file.try_lock() {
                 Ok(()) => {
-                    write_lock_metadata(&mut file, &path)?;
                     return Ok(Self { _file: file });
                 }
                 Err(TryLockError::WouldBlock) => {
@@ -208,40 +312,87 @@ impl JsonGenerationLock {
     }
 }
 
-fn write_lock_metadata(file: &mut File, path: &Path) -> Result<(), String> {
-    file.set_len(0).map_err(|err| {
+fn open_lock_file(path: &Path) -> Result<File, String> {
+    let file = match File::create_new(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            validate_lock_path(path)?;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(|error| {
+                    format!(
+                        "failed to open rustdoc JSON lock {}: {error}",
+                        path.display()
+                    )
+                })?
+        }
+        Err(error) => {
+            return Err(format!(
+                "failed to create rustdoc JSON lock {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let path_metadata = validate_lock_path(path)?;
+    let file_metadata = file.metadata().map_err(|error| {
         format!(
-            "failed to truncate rustdoc JSON lock metadata {}: {err}",
+            "failed to inspect open rustdoc JSON lock {}: {error}",
             path.display()
         )
     })?;
-    file.rewind().map_err(|err| {
-        format!(
-            "failed to seek rustdoc JSON lock metadata {}: {err}",
-            path.display()
-        )
-    })?;
-    file.write_all(lock_metadata().as_bytes()).map_err(|err| {
-        format!(
-            "failed to write rustdoc JSON lock metadata {}: {err}",
-            path.display()
-        )
-    })
+    if !file_metadata.is_file() {
+        return Err(invalid_lock_path_message(path));
+    }
+    validate_lock_identity(path, &path_metadata, &file_metadata)?;
+    Ok(file)
 }
 
-fn lock_metadata() -> String {
+fn validate_lock_path(path: &Path) -> Result<fs::Metadata, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "failed to inspect rustdoc JSON lock {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(invalid_lock_path_message(path));
+    }
+    Ok(metadata)
+}
+
+fn invalid_lock_path_message(path: &Path) -> String {
     format!(
-        "pid={}\ncreated_unix_secs={}\n",
-        std::process::id(),
-        current_unix_secs()
+        "refusing to use non-regular or symlink rustdoc JSON lock path {}",
+        path.display()
     )
 }
 
-fn current_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+#[cfg(unix)]
+fn validate_lock_identity(
+    path: &Path,
+    path_metadata: &fs::Metadata,
+    file_metadata: &fs::Metadata,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    if path_metadata.dev() != file_metadata.dev() || path_metadata.ino() != file_metadata.ino() {
+        return Err(format!(
+            "rustdoc JSON lock path {} changed while it was being opened",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_lock_identity(
+    _path: &Path,
+    _path_metadata: &fs::Metadata,
+    _file_metadata: &fs::Metadata,
+) -> Result<(), String> {
+    Ok(())
 }
 
 fn lock_timeout_message(path: &Path) -> String {
@@ -334,6 +485,9 @@ fn apply_non_doc_cfg(krate: &mut Crate, cfg: &RustcCfg) {
         .iter()
         .filter_map(|(id, item)| (!item_matches_cfg(item, cfg)).then_some(*id))
         .collect::<HashSet<_>>();
+    for item in krate.index.values_mut() {
+        activate_cfg_attr_derives(&mut item.attrs, cfg);
+    }
     for id in &unavailable {
         if let Some(item) = krate.index.get_mut(id) {
             item.attrs.push(rustdoc_types::Attribute::Other(
@@ -344,6 +498,71 @@ fn apply_non_doc_cfg(krate: &mut Crate, cfg: &RustcCfg) {
     for item in krate.index.values_mut() {
         prune_unavailable_references(&mut item.inner, &unavailable);
     }
+}
+
+fn activate_cfg_attr_derives(attrs: &mut Vec<rustdoc_types::Attribute>, cfg: &RustcCfg) {
+    let mut derives = Vec::new();
+    for attr in attrs.iter() {
+        let rustdoc_types::Attribute::Other(attribute) = attr else {
+            continue;
+        };
+        let Some(expression) = retained_attribute_expression(attribute, "cfg_attr") else {
+            continue;
+        };
+        collect_cfg_attr_derives(expression, cfg, &mut derives);
+    }
+    derives.sort();
+    derives.dedup();
+    if !derives.is_empty() {
+        attrs.push(rustdoc_types::Attribute::Other(format!(
+            "#[derive({})]",
+            derives.join(", ")
+        )));
+    }
+}
+
+fn collect_cfg_attr_derives(expression: &str, cfg: &RustcCfg, derives: &mut Vec<String>) {
+    let Ok(nested) = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+        .parse_str(expression)
+    else {
+        return;
+    };
+    let Some(predicate) = nested.first() else {
+        return;
+    };
+    if !cfg_meta_matches(predicate, cfg) {
+        return;
+    }
+    for attribute in nested.iter().skip(1) {
+        let syn::Meta::List(list) = attribute else {
+            continue;
+        };
+        match cfg_path(&list.path).as_str() {
+            "derive" => {
+                let Ok(paths) =
+                    syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated
+                        .parse2(list.tokens.clone())
+                else {
+                    continue;
+                };
+                derives.extend(paths.iter().filter_map(derive_path));
+            }
+            "cfg_attr" => collect_cfg_attr_derives(&list.tokens.to_string(), cfg, derives),
+            _ => {}
+        }
+    }
+}
+
+fn derive_path(path: &syn::Path) -> Option<String> {
+    if path.segments.is_empty()
+        || path
+            .segments
+            .iter()
+            .any(|segment| !matches!(segment.arguments, syn::PathArguments::None))
+    {
+        return None;
+    }
+    Some(cfg_path(path))
 }
 
 fn item_matches_cfg(item: &rustdoc_types::Item, cfg: &RustcCfg) -> bool {
@@ -1889,6 +2108,39 @@ mod tests {
     }
 
     #[test]
+    fn retained_cfg_attr_derives_follow_the_captured_non_doc_cfg() {
+        let mut attrs = vec![
+            rustdoc_types::Attribute::Other(
+                "#[<cfg_attr>(feature = \"enabled\", derive(Enabled, marker::Qualified))]".into(),
+            ),
+            rustdoc_types::Attribute::Other(
+                "#[<cfg_attr>(feature = \"disabled\", derive(Disabled))]".into(),
+            ),
+            rustdoc_types::Attribute::Other(
+                "#[<cfg_attr>(feature = \"enabled\", cfg_attr(unix, derive(Nested)))]".into(),
+            ),
+        ];
+        let cfg = RustcCfg::parse(b"feature=\"enabled\"\nunix\n");
+
+        activate_cfg_attr_derives(&mut attrs, &cfg);
+
+        assert!(attrs.iter().any(|attribute| {
+            matches!(
+                attribute,
+                rustdoc_types::Attribute::Other(attribute)
+                    if attribute == "#[derive(Enabled, Nested, marker::Qualified)]"
+            )
+        }));
+        assert!(!attrs.iter().any(|attribute| {
+            matches!(
+                attribute,
+                rustdoc_types::Attribute::Other(attribute)
+                    if attribute.starts_with("#[derive(") && attribute.contains("Disabled")
+            )
+        }));
+    }
+
+    #[test]
     fn configured_target_forms_follow_cargo_semantics() {
         assert_eq!(
             select_configured_targets(ConfiguredCargoTargets::One("host".into())).unwrap(),
@@ -1931,6 +2183,56 @@ mod tests {
                 .unwrap_err()
                 .contains("refusing to replace unowned")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generation_root_rejects_a_symlink_and_preserves_its_destination() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let target = temp.path().join("target");
+        let victim = temp.path().join("victim");
+        fs::create_dir(&target).unwrap();
+        fs::create_dir(&victim).unwrap();
+        fs::write(victim.join("keep.txt"), "keep me\n").unwrap();
+        symlink(&victim, target.join("check-docs")).unwrap();
+
+        let error = prepare_generation_root(&target).unwrap_err();
+
+        assert!(error.contains("non-directory or symlink check-docs managed root"));
+        assert_eq!(
+            fs::read_to_string(victim.join("keep.txt")).unwrap(),
+            "keep me\n"
+        );
+        assert!(
+            fs::symlink_metadata(target.join("check-docs"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generation_directory_rejects_a_symlink_ownership_marker() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("check-docs");
+        let generation = reset_generation_target_dir(&root).unwrap();
+        let marker = generation.join(".check-docs-generation");
+        let victim = temp.path().join("victim");
+        fs::write(&victim, GENERATION_MARKER).unwrap();
+        fs::remove_file(&marker).unwrap();
+        symlink(&victim, &marker).unwrap();
+
+        let error = reset_generation_target_dir(&root).unwrap_err();
+
+        assert!(error.contains("ownership marker"));
+        assert!(error.contains("not a regular non-symlink file"));
+        assert_eq!(fs::read_to_string(&victim).unwrap(), GENERATION_MARKER);
+        assert!(generation.is_dir());
     }
 
     #[cfg(unix)]
@@ -2070,14 +2372,12 @@ mod tests {
     }
 
     #[test]
-    fn lock_writes_metadata_and_releases_exclusive_lock_on_drop() {
+    fn lock_uses_an_empty_file_and_releases_exclusive_lock_on_drop() {
         let dir = tempfile::TempDir::new().unwrap();
         let lock_path = dir.path().join("crate.json.lock");
         let first =
             JsonGenerationLock::acquire_with_timeout(lock_path.clone(), Duration::ZERO).unwrap();
-        let text = fs::read_to_string(&lock_path).unwrap();
-        assert!(text.contains("pid="));
-        assert!(text.contains("created_unix_secs="));
+        assert_eq!(fs::read_to_string(&lock_path).unwrap(), "");
 
         let err = JsonGenerationLock::acquire_with_timeout(lock_path.clone(), Duration::ZERO)
             .unwrap_err();
@@ -2094,15 +2394,16 @@ mod tests {
     }
 
     #[test]
-    fn lock_ignores_stale_or_malformed_metadata_when_no_owner_is_active() {
+    fn lock_preserves_existing_contents_when_no_owner_is_active() {
         let dir = tempfile::TempDir::new().unwrap();
         let lock_path = dir.path().join("stale.json.lock");
-        fs::write(&lock_path, "not metadata").unwrap();
+        fs::write(&lock_path, "existing contents\n").unwrap();
         let _lock =
             JsonGenerationLock::acquire_with_timeout(lock_path.clone(), Duration::ZERO).unwrap();
-        let text = fs::read_to_string(&lock_path).unwrap();
-        assert!(text.contains(&format!("pid={}", std::process::id())));
-        assert!(!text.contains("not metadata"));
+        assert_eq!(
+            fs::read_to_string(&lock_path).unwrap(),
+            "existing contents\n"
+        );
     }
 
     #[test]
@@ -2121,15 +2422,30 @@ mod tests {
     }
 
     #[test]
-    fn metadata_write_failure_does_not_leave_an_owned_lock() {
+    fn lock_rejects_non_regular_paths() {
         let dir = tempfile::TempDir::new().unwrap();
-        let lock_path = dir.path().join("metadata-error.json.lock");
-        fs::write(&lock_path, "old").unwrap();
-        let mut read_only = File::open(&lock_path).unwrap();
-        assert!(write_lock_metadata(&mut read_only, &lock_path).is_err());
-        drop(read_only);
+        let lock_path = dir.path().join("lock-directory");
+        fs::create_dir(&lock_path).unwrap();
+        let error = JsonGenerationLock::acquire_with_timeout(lock_path.clone(), Duration::ZERO)
+            .unwrap_err();
+        assert_eq!(error, invalid_lock_path_message(&lock_path));
+    }
 
-        assert!(JsonGenerationLock::acquire_with_timeout(lock_path, Duration::ZERO).is_ok());
+    #[cfg(unix)]
+    #[test]
+    fn lock_rejects_symlinks_without_modifying_the_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let victim = dir.path().join("victim");
+        let lock_path = dir.path().join("symlink.lock");
+        fs::write(&victim, "keep me\n").unwrap();
+        symlink(&victim, &lock_path).unwrap();
+
+        let error = JsonGenerationLock::acquire_with_timeout(lock_path.clone(), Duration::ZERO)
+            .unwrap_err();
+        assert_eq!(error, invalid_lock_path_message(&lock_path));
+        assert_eq!(fs::read_to_string(victim).unwrap(), "keep me\n");
     }
 
     #[test]

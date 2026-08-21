@@ -91,21 +91,48 @@ pub(crate) struct SymbolReport {
 pub(crate) struct ExternalReexport {
     pub(crate) crate_name: String,
     pub(crate) path: Vec<String>,
+    pub(crate) canonical_fallback: Option<ExternalTarget>,
     pub(crate) via_glob: bool,
     pub(crate) namespace: Option<NamespaceConstraint>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExternalTarget {
+    pub(crate) crate_name: String,
+    pub(crate) path: Vec<String>,
+}
+
 impl ExternalReexport {
     pub(crate) fn import_path(&self) -> Option<ImportPath> {
-        let (item, segments) = self.path.split_last()?;
-        ImportPath {
-            crate_name: self.crate_name.clone(),
-            segments: segments.to_vec(),
-            item: item.clone(),
-            namespace: self.namespace,
-        }
-        .into()
+        import_path(&self.crate_name, &self.path, self.namespace)
     }
+
+    pub(crate) fn canonical_import_path(&self) -> Option<ImportPath> {
+        let fallback = self.canonical_fallback.as_ref()?;
+        import_path(&fallback.crate_name, &fallback.path, self.namespace)
+    }
+
+    fn extend_path(&mut self, parts: &[String]) {
+        self.path.extend(parts.iter().cloned());
+        if let Some(fallback) = &mut self.canonical_fallback {
+            fallback.path.extend(parts.iter().cloned());
+        }
+    }
+}
+
+fn import_path(
+    crate_name: &str,
+    path: &[String],
+    namespace: Option<NamespaceConstraint>,
+) -> Option<ImportPath> {
+    let (item, segments) = path.split_last()?;
+    ImportPath {
+        crate_name: crate_name.to_string(),
+        segments: segments.to_vec(),
+        item: item.clone(),
+        namespace,
+    }
+    .into()
 }
 
 #[cfg(test)]
@@ -279,7 +306,7 @@ fn external_candidates(
     for child_id in direct {
         match follow_use_or_external(krate, child_id, &mut HashSet::new())? {
             Followed::External(mut external) => {
-                external.path.extend(tail.iter().cloned());
+                external.extend_path(tail);
                 external.namespace = namespace;
                 push_external_candidate(&mut candidates, external);
             }
@@ -310,7 +337,7 @@ fn external_candidates(
         };
         match follow_use_or_external(krate, *child_id, &mut HashSet::new())? {
             Followed::External(mut external) => {
-                external.path.extend(parts.iter().cloned());
+                external.extend_path(parts);
                 external.via_glob = true;
                 external.namespace = namespace;
                 push_external_candidate(&mut candidates, external);
@@ -392,12 +419,21 @@ fn follow_use_or_external(
                 }
                 Ok(None) => {}
                 Err(SymbolError::InvalidRustdoc(message))
-                    if message.contains("is missing path segment")
-                        || message.contains("traverses extern crate alias") =>
+                    if message.contains("is missing path segment") =>
                 {
                     // Public Rustdoc strips private modules even when they form the
-                    // syntactic path of a valid public external re-export. The
-                    // canonical external id remains authoritative in that shape.
+                    // syntactic path of a valid public external re-export. A missing
+                    // first segment can also be a Cargo-renamed extern crate, so keep
+                    // the source-level edge and retain the canonical id as fallback.
+                    return external_from_use_with_canonical_fallback(krate, use_item)
+                        .map(Followed::External)
+                        .ok_or(SymbolError::InvalidRustdoc(message));
+                }
+                Err(SymbolError::InvalidRustdoc(message))
+                    if message.contains("traverses extern crate alias") =>
+                {
+                    // A source-level `extern crate` alias is local syntax rather than
+                    // Cargo's effective dependency name. Follow its canonical id.
                     return use_item
                         .id
                         .and_then(|target| external_from_id(krate, target))
@@ -509,7 +545,11 @@ fn local_use_source_target(
             })
             .collect::<Vec<_>>();
         if index + 1 != path.len() {
-            matches.retain(|child_id| krate.index.get(child_id).is_some_and(is_path_container));
+            matches.retain(|child_id| {
+                krate.index.get(child_id).is_some_and(|child| {
+                    is_path_container(child) || matches!(child.inner, ItemEnum::ExternCrate { .. })
+                })
+            });
         }
         match matches.as_slice() {
             [matched] => container = *matched,
@@ -547,6 +587,7 @@ fn external_from_id(krate: &Crate, id: Id) -> Option<ExternalReexport> {
     Some(ExternalReexport {
         crate_name: external.name.clone(),
         path,
+        canonical_fallback: None,
         via_glob: false,
         namespace: None,
     })
@@ -566,9 +607,25 @@ fn external_from_use(krate: &Crate, use_item: &rustdoc_types::Use) -> Option<Ext
     Some(ExternalReexport {
         crate_name,
         path: source.into_iter().skip(1).collect(),
+        canonical_fallback: None,
         via_glob: use_item.is_glob,
         namespace: None,
     })
+}
+
+fn external_from_use_with_canonical_fallback(
+    krate: &Crate,
+    use_item: &rustdoc_types::Use,
+) -> Option<ExternalReexport> {
+    let canonical = use_item.id.and_then(|id| external_from_id(krate, id))?;
+    let mut source = external_from_use(krate, use_item)?;
+    if source.crate_name != canonical.crate_name || source.path != canonical.path {
+        source.canonical_fallback = Some(ExternalTarget {
+            crate_name: canonical.crate_name,
+            path: canonical.path,
+        });
+    }
+    Some(source)
 }
 
 pub(crate) fn format_crate_root(krate: &Crate) -> Result<SymbolDoc, SymbolError> {
@@ -2925,6 +2982,7 @@ mod tests {
             ExternalReexport {
                 crate_name: "dep_crate".into(),
                 path: vec!["module".into(), "Thing".into()],
+                canonical_fallback: None,
                 via_glob: false,
                 namespace: None,
             }
@@ -2936,7 +2994,7 @@ mod tests {
     }
 
     #[test]
-    fn stripped_private_source_path_falls_back_to_canonical_external_id() {
+    fn missing_source_path_keeps_immediate_edge_and_canonical_fallback() {
         let root = item(
             1,
             Some("fixture"),
@@ -2987,8 +3045,12 @@ mod tests {
             )
             .unwrap(),
             vec![ExternalReexport {
-                crate_name: "proc_macro2".into(),
+                crate_name: "ident".into(),
                 path: vec!["Ident".into()],
+                canonical_fallback: Some(ExternalTarget {
+                    crate_name: "proc_macro2".into(),
+                    path: vec!["Ident".into()],
+                }),
                 via_glob: false,
                 namespace: None,
             }]
@@ -3056,6 +3118,7 @@ mod tests {
             vec![ExternalReexport {
                 crate_name: "middle".into(),
                 path: vec!["Thing".into()],
+                canonical_fallback: None,
                 via_glob: false,
                 namespace: None,
             }]
@@ -3125,6 +3188,7 @@ mod tests {
             vec![ExternalReexport {
                 crate_name: "proc_macro2".into(),
                 path: vec!["Ident".into()],
+                canonical_fallback: None,
                 via_glob: false,
                 namespace: None,
             }]
@@ -3187,6 +3251,7 @@ mod tests {
             ExternalReexport {
                 crate_name: "dep_crate".into(),
                 path: Vec::new(),
+                canonical_fallback: None,
                 via_glob: false,
                 namespace: None,
             }
@@ -3215,6 +3280,7 @@ mod tests {
             ExternalReexport {
                 crate_name: "dep_crate".into(),
                 path: vec!["Thing".into()],
+                canonical_fallback: None,
                 via_glob: false,
                 namespace: None,
             }
@@ -3279,6 +3345,7 @@ mod tests {
             vec![ExternalReexport {
                 crate_name: "middle".into(),
                 path: vec!["api".into(), "Thing".into()],
+                canonical_fallback: None,
                 via_glob: true,
                 namespace: None,
             }]

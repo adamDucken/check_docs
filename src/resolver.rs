@@ -139,7 +139,7 @@ pub(crate) fn resolve_dependency_from_package<'a>(
     package_ids.dedup();
 
     match package_ids.as_slice() {
-        [] => Err(ResolveError::Other(format!(
+        [] => Err(ResolveError::NotDirectDependency(format!(
             "crate '{crate_name}' is not a dependency of direct dependency '{}'",
             source_package.name
         ))),
@@ -358,6 +358,14 @@ pub(crate) fn merge_dependency_kind(
             {
                 push_dependency_context(destination, entry.package_id.clone(), context);
             }
+        }
+    }
+    for (crate_name, excluded) in additional.excluded {
+        let destination = dependencies.excluded.entry(crate_name).or_default();
+        match kind {
+            DependencyKind::Development if excluded.dev => destination.dev = true,
+            DependencyKind::Build if excluded.build => destination.build = true,
+            _ => {}
         }
     }
 }
@@ -700,6 +708,28 @@ edition = "2024"
             "tempfile",
         ));
         assert_eq!(dep.contexts[0].kind, DependencyKind::Development);
+    }
+
+    #[test]
+    fn merging_a_host_graph_preserves_excluded_build_guidance() {
+        let mut dependencies = DependencyIndex::default();
+        let mut host_dependencies = DependencyIndex::default();
+        host_dependencies.excluded.insert(
+            "host_build".into(),
+            ExcludedDependencyKinds {
+                dev: false,
+                build: true,
+            },
+        );
+
+        merge_dependency_kind(&mut dependencies, host_dependencies, DependencyKind::Build);
+
+        assert_eq!(
+            resolve_dependency(&[], &dependencies, "host_build")
+                .unwrap_err()
+                .to_string(),
+            "crate 'host_build' is declared only in dependency contexts excluded by default; retry with `--include-build`"
+        );
     }
 
     #[test]

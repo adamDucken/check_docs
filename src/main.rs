@@ -8,8 +8,9 @@ use cargo_metadata::{Metadata, MetadataCommand, Package, PackageId, Target};
 use cli::{FeatureSelection, ParsedCommand, parse_command};
 use imports::ImportPath;
 use resolver::{
-    DependencyContext, DependencyFilter, is_rust_library_crate, merge_dependency_kind,
-    package_dependencies, resolve_dependency, resolve_dependency_from_package, select_package,
+    DependencyContext, DependencyFilter, ResolveError, is_rust_library_crate,
+    merge_dependency_kind, package_dependencies, resolve_dependency,
+    resolve_dependency_from_package, select_package,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -198,16 +199,43 @@ fn run() -> Result<(), String> {
             cargo_metadata::DependencyKind::Build,
         );
     }
+    let mut host_classification_loaded =
+        dependency_filter.include_build || host_target == target_selection.effective_triple;
     let mut generation = rustdoc_json::GenerationSession::start(&metadata.target)?;
     let mut rustdoc_cache = RustdocCache::new();
     let mut printed_report = false;
     for import in &imports {
-        let dependencies = resolve_dependency(
+        let mut dependency_result = resolve_dependency(
             &metadata.target.packages,
             &root_dependencies,
             &import.crate_name,
-        )
-        .map_err(|err| err.to_string())?;
+        );
+        if matches!(dependency_result, Err(ResolveError::NotDirectDependency(_)))
+            && !host_classification_loaded
+        {
+            let diagnostic_host_metadata =
+                cargo_metadata_for(&metadata_manifest, &host_target, &args.feature_selection)?;
+            let host_dependencies = package_dependencies(
+                &diagnostic_host_metadata,
+                &root_package.id,
+                DependencyFilter {
+                    include_dev: false,
+                    include_build: false,
+                },
+            );
+            merge_dependency_kind(
+                &mut root_dependencies,
+                host_dependencies,
+                cargo_metadata::DependencyKind::Build,
+            );
+            host_classification_loaded = true;
+            dependency_result = resolve_dependency(
+                &metadata.target.packages,
+                &root_dependencies,
+                &import.crate_name,
+            );
+        }
+        let dependencies = dependency_result.map_err(|err| err.to_string())?;
         let mut resolved_contexts = Vec::new();
         let mut absent_contexts = Vec::new();
         let mut incomplete_contexts = Vec::new();
@@ -404,21 +432,47 @@ fn resolve_query(
     let mut absent_branch_errors = Vec::new();
     let mut incomplete_branch_errors = Vec::new();
     for external in external_candidates {
-        let external_dep = match resolve_dependency_from_package(
+        let preferred = resolve_dependency_from_package(
             context_metadata,
             &context_metadata.packages,
             package,
             &contexts,
             &external.crate_name,
-        ) {
-            Ok(dep) => dep,
-            Err(error) => {
-                incomplete_branch_errors.push(format!("{}: {error}", external.crate_name));
-                continue;
+        );
+        let (external_dep, external_import, external_crate_name) = match preferred {
+            Ok(dep) => (dep, external.import_path(), external.crate_name.clone()),
+            Err(preferred_error) => {
+                let Some(fallback) = external.canonical_fallback.as_ref() else {
+                    incomplete_branch_errors
+                        .push(format!("{}: {preferred_error}", external.crate_name));
+                    continue;
+                };
+                if !matches!(preferred_error, ResolveError::NotDirectDependency(_)) {
+                    incomplete_branch_errors
+                        .push(format!("{}: {preferred_error}", external.crate_name));
+                    continue;
+                }
+                match resolve_dependency_from_package(
+                    context_metadata,
+                    &context_metadata.packages,
+                    package,
+                    &contexts,
+                    &fallback.crate_name,
+                ) {
+                    Ok(dep) => (
+                        dep,
+                        external.canonical_import_path(),
+                        fallback.crate_name.clone(),
+                    ),
+                    Err(error) => {
+                        incomplete_branch_errors.push(format!("{}: {error}", fallback.crate_name));
+                        continue;
+                    }
+                }
             }
         };
         let mut branch_visited = visited.clone();
-        let result = if let Some(external_import) = external.import_path() {
+        let result = if let Some(external_import) = external_import {
             resolve_query(
                 cache,
                 generation,
@@ -468,11 +522,11 @@ fn resolve_query(
             Ok(resolved) => successes.push((external.via_glob, resolved)),
             Err(QueryError::Absent(error)) => absent_branch_errors.push(format!(
                 "{} ({}): {error}",
-                external.crate_name, external_dep.package.id
+                external_crate_name, external_dep.package.id
             )),
             Err(QueryError::Incomplete(error)) => incomplete_branch_errors.push(format!(
                 "{} ({}): {error}",
-                external.crate_name, external_dep.package.id
+                external_crate_name, external_dep.package.id
             )),
         }
     }

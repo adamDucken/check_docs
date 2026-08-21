@@ -158,12 +158,16 @@ Consequences:
   `target/check-docs` and holds its inter-process lock until all reports are emitted.
   Selected Cargo units use distinct subdirectories, so every reported Rustdoc source
   remains available and unit-correct until the next safely locked invocation, while
-  retained build artifacts stay bounded to one inactive generation tree.
+  retained build artifacts stay bounded to one inactive generation tree. A fresh
+  ownership-marked tree is staged and atomically installed, so interrupted staging
+  initialization cannot strand the managed cache; unowned paths are still preserved.
 - Rustdoc's implicit `cfg(doc)` is not treated as part of the selected Cargo unit.
   Retained item cfg expressions are evaluated against the exact non-doc cfg set from
   the matched compiler-wrapper invocation, so documentation-only platform APIs and
   disabled conditional derives are excluded while APIs and derives valid for the
-  selected target/profile/features remain available.
+  selected target/profile/features remain available. Raw cfg identifiers are matched
+  against rustc's normalized cfg keys while their raw spelling remains intact in
+  rendered Rust paths.
 - It uses exact versions from the project lockfile/resolution.
 - It respects dependency renames from `Cargo.toml`.
 - It uses exactly the features enabled by the target project.

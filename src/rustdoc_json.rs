@@ -198,8 +198,14 @@ fn prepare_generation_root(target_directory: &Path) -> Result<PathBuf, String> {
 }
 
 fn reset_generation_target_dir(generation_root: &Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(generation_root).map_err(|err| {
+        format!(
+            "failed to create check-docs generation root {}: {err}",
+            generation_root.display()
+        )
+    })?;
     let target_dir = generation_root.join("generation");
-    match fs::symlink_metadata(&target_dir) {
+    let target_exists = match fs::symlink_metadata(&target_dir) {
         Ok(metadata) => {
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 return Err(format!(
@@ -235,34 +241,109 @@ fn reset_generation_target_dir(generation_root: &Path) -> Result<PathBuf, String
                     target_dir.display()
                 ));
             }
-            fs::remove_dir_all(&target_dir).map_err(|err| {
-                format!(
-                    "failed to reset managed check-docs generation directory {}: {err}",
-                    target_dir.display()
-                )
-            })?;
+            true
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
         Err(err) => {
             return Err(format!(
                 "failed to inspect managed generation directory {}: {err}",
                 target_dir.display()
             ));
         }
+    };
+
+    cleanup_owned_generation_staging(generation_root)?;
+    let staging = create_marked_generation_staging(generation_root)?;
+    if target_exists {
+        fs::remove_dir_all(&target_dir).map_err(|err| {
+            format!(
+                "failed to reset managed check-docs generation directory {}: {err}",
+                target_dir.display()
+            )
+        })?;
     }
-    fs::create_dir_all(&target_dir).map_err(|err| {
+    fs::rename(&staging, &target_dir).map_err(|err| {
         format!(
-            "failed to create managed check-docs generation directory {}: {err}",
-            target_dir.display()
-        )
-    })?;
-    fs::write(target_dir.join(".check-docs-generation"), GENERATION_MARKER).map_err(|err| {
-        format!(
-            "failed to write ownership marker in {}: {err}",
-            target_dir.display()
+            "failed to atomically install managed check-docs generation directory {} from {}: {err}",
+            target_dir.display(),
+            staging.display()
         )
     })?;
     Ok(target_dir)
+}
+
+fn cleanup_owned_generation_staging(generation_root: &Path) -> Result<(), String> {
+    let entries = fs::read_dir(generation_root).map_err(|err| {
+        format!(
+            "failed to inspect check-docs generation root {}: {err}",
+            generation_root.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            format!(
+                "failed to inspect an entry in check-docs generation root {}: {err}",
+                generation_root.display()
+            )
+        })?;
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("generation.staging-") {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let marker = path.join(".check-docs-generation");
+        let Ok(marker_metadata) = fs::symlink_metadata(&marker) else {
+            continue;
+        };
+        if marker_metadata.file_type().is_symlink() || !marker_metadata.is_file() {
+            continue;
+        }
+        if !fs::read_to_string(&marker).is_ok_and(|contents| contents == GENERATION_MARKER) {
+            continue;
+        }
+        fs::remove_dir_all(&path).map_err(|err| {
+            format!(
+                "failed to remove interrupted managed generation staging directory {}: {err}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn create_marked_generation_staging(generation_root: &Path) -> Result<PathBuf, String> {
+    for index in 0_u64.. {
+        let staging = generation_root.join(format!("generation.staging-{index}"));
+        match fs::create_dir(&staging) {
+            Ok(()) => {
+                if let Err(err) =
+                    fs::write(staging.join(".check-docs-generation"), GENERATION_MARKER)
+                {
+                    let _ = fs::remove_file(staging.join(".check-docs-generation"));
+                    let _ = fs::remove_dir(&staging);
+                    return Err(format!(
+                        "failed to write ownership marker in generation staging directory {}: {err}",
+                        staging.display()
+                    ));
+                }
+                return Ok(staging);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "failed to create managed generation staging directory {}: {err}",
+                    staging.display()
+                ));
+            }
+        }
+    }
+    unreachable!("the generation staging index space is not exhausted")
 }
 
 #[derive(Debug)]
@@ -634,7 +715,7 @@ fn cfg_attr_output_matches(attribute: &syn::Meta, cfg: &RustcCfg) -> bool {
 
 fn cfg_meta_matches(meta: &syn::Meta, cfg: &RustcCfg) -> bool {
     match meta {
-        syn::Meta::Path(path) => cfg.contains_flag(&cfg_path(path)),
+        syn::Meta::Path(path) => cfg.contains_flag(&cfg_lookup_path(path)),
         syn::Meta::NameValue(name_value) => {
             let syn::Expr::Lit(expression) = &name_value.value else {
                 return false;
@@ -642,7 +723,7 @@ fn cfg_meta_matches(meta: &syn::Meta, cfg: &RustcCfg) -> bool {
             let syn::Lit::Str(value) = &expression.lit else {
                 return false;
             };
-            cfg.contains_value(&cfg_path(&name_value.path), &value.value())
+            cfg.contains_value(&cfg_lookup_path(&name_value.path), &value.value())
         }
         syn::Meta::List(list) => {
             let Ok(nested) =
@@ -665,6 +746,20 @@ fn cfg_path(path: &syn::Path) -> String {
     path.segments
         .iter()
         .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+fn cfg_lookup_path(path: &syn::Path) -> String {
+    path.segments
+        .iter()
+        .map(|segment| {
+            let identifier = segment.ident.to_string();
+            identifier
+                .strip_prefix("r#")
+                .unwrap_or(&identifier)
+                .to_string()
+        })
         .collect::<Vec<_>>()
         .join("::")
 }
@@ -1697,7 +1792,7 @@ fn handle_generate_output(
 }
 
 fn format_generate_error(package: &Package, toolchain: &str, stderr: &str) -> String {
-    let hint = if stderr.contains("toolchain") || stderr.contains("not installed") {
+    let hint = if is_missing_toolchain_diagnostic(stderr) {
         format!(
             "; compatible nightly toolchain not found; install with `rustup toolchain install {toolchain}` or set CHECK_DOCS_TOOLCHAIN"
         )
@@ -1714,6 +1809,14 @@ fn format_generate_error(package: &Package, toolchain: &str, stderr: &str) -> St
         package.version,
         stderr.trim()
     )
+}
+
+fn is_missing_toolchain_diagnostic(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        let line = line.to_ascii_lowercase();
+        (line.contains("toolchain") && line.contains("is not installed"))
+            || line.contains("no such installed toolchain")
+    })
 }
 
 fn is_lockfile_failure(error: &str) -> bool {
@@ -1865,7 +1968,26 @@ mod tests {
             stderr: b"toolchain 'nightly' is not installed".to_vec(),
         };
         let err = handle_generate_output(&pkg, "nightly", base).unwrap_err();
-        assert!(err.contains("rustup toolchain install nightly"));
+        assert_eq!(
+            err,
+            format!(
+                "failed to generate rustdoc JSON for {} {}; compatible nightly toolchain not found; install with `rustup toolchain install nightly` or set CHECK_DOCS_TOOLCHAIN: toolchain 'nightly' is not installed",
+                pkg.name, pkg.version
+            )
+        );
+
+        let unrelated = format_generate_error(
+            &pkg,
+            "nightly",
+            "error[E0425]: cannot find value `toolchain` in this scope",
+        );
+        assert_eq!(
+            unrelated,
+            format!(
+                "failed to generate rustdoc JSON for {} {}: error[E0425]: cannot find value `toolchain` in this scope",
+                pkg.name, pkg.version
+            )
+        );
 
         let unstable = Output {
             status: status(1),
@@ -2141,6 +2263,29 @@ mod tests {
     }
 
     #[test]
+    fn cfg_lookup_normalizes_raw_identifiers_without_changing_rendered_paths() {
+        let cfg = RustcCfg::parse(b"async\nmode=\"fast\"\n");
+
+        assert!(cfg_expression_matches("r#async", &cfg));
+        assert!(cfg_expression_matches("r#mode = \"fast\"", &cfg));
+        let path = syn::parse_str::<syn::Path>("r#async::r#type").unwrap();
+        assert_eq!(cfg_path(&path), "r#async::r#type");
+        assert_eq!(cfg_lookup_path(&path), "async::type");
+
+        let mut attrs = vec![rustdoc_types::Attribute::Other(
+            "#[<cfg_attr>(r#async, derive(RawEnabled))]".into(),
+        )];
+        activate_cfg_attr_derives(&mut attrs, &cfg);
+        assert!(attrs.iter().any(|attribute| {
+            matches!(
+                attribute,
+                rustdoc_types::Attribute::Other(attribute)
+                    if attribute == "#[derive(RawEnabled)]"
+            )
+        }));
+    }
+
+    #[test]
     fn configured_target_forms_follow_cargo_semantics() {
         assert_eq!(
             select_configured_targets(ConfiguredCargoTargets::One("host".into())).unwrap(),
@@ -2182,6 +2327,49 @@ mod tests {
             reset_generation_target_dir(&root)
                 .unwrap_err()
                 .contains("refusing to replace unowned")
+        );
+    }
+
+    #[test]
+    fn generation_directory_recovers_past_interrupted_staging_initialization() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("check-docs");
+        fs::create_dir_all(&root).unwrap();
+        let unmarked = root.join("generation.staging-0");
+        fs::create_dir(&unmarked).unwrap();
+        fs::write(unmarked.join("keep.txt"), "not owned\n").unwrap();
+        let owned = root.join("generation.staging-1");
+        fs::create_dir(&owned).unwrap();
+        fs::write(owned.join(".check-docs-generation"), GENERATION_MARKER).unwrap();
+        fs::write(owned.join("stale"), "stale\n").unwrap();
+
+        let generation = reset_generation_target_dir(&root).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(generation.join(".check-docs-generation")).unwrap(),
+            GENERATION_MARKER
+        );
+        assert_eq!(
+            fs::read_to_string(unmarked.join("keep.txt")).unwrap(),
+            "not owned\n"
+        );
+        assert!(!owned.exists());
+    }
+
+    #[test]
+    fn generation_directory_without_a_marker_remains_unowned() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("check-docs");
+        let generation = root.join("generation");
+        fs::create_dir_all(&generation).unwrap();
+        fs::write(generation.join("keep.txt"), "keep me\n").unwrap();
+
+        let error = reset_generation_target_dir(&root).unwrap_err();
+
+        assert!(error.contains("refusing to replace unowned"));
+        assert_eq!(
+            fs::read_to_string(generation.join("keep.txt")).unwrap(),
+            "keep me\n"
         );
     }
 

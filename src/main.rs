@@ -139,13 +139,19 @@ fn run() -> Result<(), String> {
             requested_manifest.display()
         )
     })?;
-    let host_target = host_target_triple()?;
-    let target_selection =
-        rustdoc_json::target_selection(&manifest_path, args.target.as_deref(), &host_target)?;
+    let toolchain = rustdoc_json::selected_toolchain();
+    let host_target = host_target_triple(&toolchain)?;
+    let target_selection = rustdoc_json::target_selection(
+        &manifest_path,
+        args.target.as_deref(),
+        &host_target,
+        &toolchain,
+    )?;
     let base_metadata = cargo_metadata_for(
         &manifest_path,
         &target_selection.effective_triple,
         &FeatureSelection::default(),
+        &toolchain,
     )?;
     let base_root = select_package(&base_metadata, &manifest_path, args.package.as_deref())?;
     let metadata_manifest = if args.feature_selection.is_default() {
@@ -160,10 +166,16 @@ fn run() -> Result<(), String> {
             &metadata_manifest,
             &target_selection.effective_triple,
             &args.feature_selection,
+            &toolchain,
         )?
     };
     let host_metadata = if args.include_build && host_target != target_selection.effective_triple {
-        cargo_metadata_for(&metadata_manifest, &host_target, &args.feature_selection)?
+        cargo_metadata_for(
+            &metadata_manifest,
+            &host_target,
+            &args.feature_selection,
+            &toolchain,
+        )?
     } else {
         target_metadata.clone()
     };
@@ -213,8 +225,12 @@ fn run() -> Result<(), String> {
         if matches!(dependency_result, Err(ResolveError::NotDirectDependency(_)))
             && !host_classification_loaded
         {
-            let diagnostic_host_metadata =
-                cargo_metadata_for(&metadata_manifest, &host_target, &args.feature_selection)?;
+            let diagnostic_host_metadata = cargo_metadata_for(
+                &metadata_manifest,
+                &host_target,
+                &args.feature_selection,
+                &toolchain,
+            )?;
             let host_dependencies = package_dependencies(
                 &diagnostic_host_metadata,
                 &root_package.id,
@@ -307,9 +323,12 @@ fn cargo_metadata_for(
     manifest_path: &Path,
     platform: &str,
     features: &FeatureSelection,
+    toolchain: &str,
 ) -> Result<Metadata, String> {
     let mut command = MetadataCommand::new();
+    command.cargo_path("cargo");
     command.manifest_path(manifest_path);
+    command.env("RUSTUP_TOOLCHAIN", toolchain);
     if let Some(invocation_dir) = manifest_path.parent() {
         command.current_dir(invocation_dir);
     }
@@ -639,14 +658,17 @@ fn resolve_query(
     }
 }
 
-fn host_target_triple() -> Result<String, String> {
+fn host_target_triple(toolchain: &str) -> Result<String, String> {
     let output = Command::new("rustc")
+        .arg(format!("+{toolchain}"))
         .arg("-vV")
         .output()
-        .map_err(|err| format!("failed to run rustc -vV to detect host target: {err}"))?;
+        .map_err(|err| {
+            format!("failed to run rustc +{toolchain} -vV to detect host target: {err}")
+        })?;
     if !output.status.success() {
         return Err(format!(
-            "failed to detect host target with rustc -vV: {}",
+            "failed to detect host target with rustc +{toolchain} -vV: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }

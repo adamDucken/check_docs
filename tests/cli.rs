@@ -69,6 +69,52 @@ fn binary_reports_dependency_item() {
 }
 
 #[test]
+fn binary_uses_check_docs_toolchain_for_the_entire_query() {
+    let workspace = TempDir::new().unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"dep\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    write_member(
+        &workspace,
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        "",
+    );
+    write_member(
+        &workspace,
+        "dep",
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        "pub struct Thing;\n",
+    );
+    lock_workspace(&workspace);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use dep::Thing;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .env(
+            "RUSTUP_TOOLCHAIN",
+            "definitely-missing-check-docs-ambient-toolchain",
+        )
+        .env("CHECK_DOCS_TOOLCHAIN", "nightly-2025-09-10")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("definition: pub struct Thing;"));
+}
+
+#[test]
 fn binary_reports_batch_brace_imports() {
     let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
         .args(["use cargo_metadata::{Metadata, Package};", "--root", "."])
@@ -2769,6 +2815,129 @@ pub struct BuildProfile;
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn binary_matches_same_feature_dev_and_build_units_by_opt_level() {
+    let workspace = TempDir::new().unwrap();
+    fs::create_dir_all(workspace.path().join(".cargo")).unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        r#"[workspace]
+members = ["app", "shared"]
+resolver = "3"
+
+[profile.test]
+opt-level = 1
+debug = 0
+debug-assertions = true
+overflow-checks = true
+incremental = false
+codegen-units = 1
+
+[profile.test.build-override]
+opt-level = 0
+debug = 0
+debug-assertions = true
+overflow-checks = true
+incremental = false
+codegen-units = 1
+"#,
+    )
+    .unwrap();
+    write_member(
+        &workspace,
+        "app",
+        r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[dev-dependencies]
+shared = { path = "../shared" }
+
+[build-dependencies]
+shared = { path = "../shared" }
+"#,
+        "",
+    );
+    fs::write(workspace.path().join("app/build.rs"), "fn main() {}\n").unwrap();
+    write_member(
+        &workspace,
+        "shared",
+        "[package]\nname = \"shared\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        r#"#[cfg(any(doc, dev_profile))]
+pub struct DevProfile;
+
+#[cfg(any(doc, build_profile))]
+pub struct BuildProfile;
+"#,
+    );
+    fs::write(
+        workspace.path().join("shared/build.rs"),
+        r#"fn main() {
+    println!("cargo::rustc-check-cfg=cfg(dev_profile)");
+    println!("cargo::rustc-check-cfg=cfg(build_profile)");
+    match std::env::var("OPT_LEVEL").as_deref() {
+        Ok("1") => println!("cargo::rustc-cfg=dev_profile"),
+        Ok("0") => println!("cargo::rustc-cfg=build_profile"),
+        other => panic!("unexpected OPT_LEVEL: {other:?}"),
+    }
+}
+"#,
+    )
+    .unwrap();
+    let wrapper = workspace.path().join("record-rustdoc.sh");
+    let rustdoc_log = workspace.path().join("rustdoc.log");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\ncase \"$1\" in\n  */rustdoc|rustdoc) printf '%s\\n' rustdoc >> \"$CHECK_DOCS_TEST_RUSTDOC_LOG\" ;;\nesac\nexec \"$@\"\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&wrapper).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&wrapper, permissions).unwrap();
+    fs::write(
+        workspace.path().join(".cargo/config.toml"),
+        format!(
+            "[build]\nrustc-workspace-wrapper = {:?}\n",
+            wrapper.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    lock_workspace(&workspace);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use shared::DevProfile;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+            "--include-dev",
+        ])
+        .env("CHECK_DOCS_TEST_RUSTDOC_LOG", &rustdoc_log)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let source = report_source(&stdout);
+    assert_eq!(
+        stdout,
+        format!(
+            "crate: shared 0.1.0\ndependency: dev\ntarget: {}\nroot features: default\nsource: {}\nimport: use shared::DevProfile;\nitem: struct DevProfile\nlocation: {}/shared/src/lib.rs:2\ndefinition: pub struct DevProfile;\ndocs: (none)\n",
+            host_target_triple(),
+            source.display(),
+            workspace.path().display()
+        )
+    );
+    assert_eq!(fs::read_to_string(rustdoc_log).unwrap(), "rustdoc\n");
+}
+
 #[test]
 fn binary_suggests_flags_for_dependencies_excluded_by_kind() {
     let dev = Command::new(env!("CARGO_BIN_EXE_check-docs"))
@@ -2881,11 +3050,6 @@ fn binary_normalizes_cargo_host_target_from_environment_and_config() {
     let workspace = TempDir::new().unwrap();
     fs::create_dir_all(workspace.path().join(".cargo")).unwrap();
     fs::write(
-        workspace.path().join(".cargo/config.toml"),
-        "[build]\ntarget = \"host\"\n",
-    )
-    .unwrap();
-    fs::write(
         workspace.path().join("Cargo.toml"),
         "[workspace]\nmembers = [\"app\", \"dep\"]\nresolver = \"3\"\n",
     )
@@ -2903,6 +3067,40 @@ fn binary_normalizes_cargo_host_target_from_environment_and_config() {
         "pub struct Thing;\n",
     );
     lock_workspace(&workspace);
+
+    let explicit = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use dep::Thing;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+            "--target",
+            "host",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        explicit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&explicit.stderr)
+    );
+    let explicit_stdout = String::from_utf8(explicit.stdout).unwrap();
+    let source = report_source(&explicit_stdout);
+    assert_eq!(
+        explicit_stdout,
+        format!(
+            "crate: dep 0.1.0\ndependency: normal\ntarget: {host}\nroot features: default\nsource: {}\nimport: use dep::Thing;\nitem: struct Thing\nlocation: {}/dep/src/lib.rs:1\ndefinition: pub struct Thing;\ndocs: (none)\n",
+            source.display(),
+            workspace.path().display()
+        )
+    );
+
+    fs::write(
+        workspace.path().join(".cargo/config.toml"),
+        "[build]\ntarget = \"host\"\n",
+    )
+    .unwrap();
     let configured = Command::new(env!("CARGO_BIN_EXE_check-docs"))
         .args([
             "use dep::Thing;",

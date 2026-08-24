@@ -17,8 +17,13 @@ const PINNED_TOOLCHAIN: &str = "nightly-2025-09-10";
 const GENERATION_MARKER: &str = "check-docs managed generation\n";
 pub(crate) const CFG_UNAVAILABLE_ATTRIBUTE: &str = "#[check_docs_cfg_unavailable]";
 
+pub(crate) fn selected_toolchain() -> String {
+    env::var("CHECK_DOCS_TOOLCHAIN").unwrap_or_else(|_| PINNED_TOOLCHAIN.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CargoTargetSelection {
+    pub(crate) toolchain: String,
     pub(crate) effective_triple: String,
     pub(crate) cargo_platform: Option<String>,
     pub(crate) command_line_override: Option<String>,
@@ -816,9 +821,12 @@ fn generate_json(
     target_dir: &Path,
     doc_dir: &Path,
 ) -> Result<(), String> {
-    let toolchain =
-        env::var("CHECK_DOCS_TOOLCHAIN").unwrap_or_else(|_| PINNED_TOOLCHAIN.to_string());
-    generate_json_with_toolchain(request, target_dir, doc_dir, &toolchain)
+    generate_json_with_toolchain(
+        request,
+        target_dir,
+        doc_dir,
+        &request.target_selection.toolchain,
+    )
 }
 
 fn generate_json_with_toolchain(
@@ -829,6 +837,7 @@ fn generate_json_with_toolchain(
 ) -> Result<(), String> {
     target_selector(request.target)?;
     let context_kind = exact_context_kind(request.contexts)?;
+    let target_default_panic = target_default_panic(toolchain, request.unit.platform.as_deref())?;
     let original_rustc_wrapper =
         effective_general_rustc_wrapper(&request.manifest_path, toolchain)?;
     let mut command = Command::new("cargo");
@@ -891,6 +900,10 @@ fn generate_json_with_toolchain(
         )
         .env("CHECK_DOCS_WRAPPER_UNIT_PROFILE", &request.unit.profile)
         .env(
+            "CHECK_DOCS_WRAPPER_TARGET_DEFAULT_PANIC",
+            target_default_panic,
+        )
+        .env(
             "CHECK_DOCS_WRAPPER_CFG_PATH",
             doc_dir.join(format!("{}.cfg", request.target.name.replace('-', "_"))),
         )
@@ -907,6 +920,32 @@ fn generate_json_with_toolchain(
             )
         })?;
     handle_generate_output(request.package, toolchain, output)
+}
+
+fn target_default_panic(toolchain: &str, platform: Option<&str>) -> Result<&'static str, String> {
+    let mut command = Command::new("rustc");
+    command.arg(format!("+{toolchain}"));
+    if let Some(platform) = platform {
+        command.args(["--target", platform]);
+    }
+    let output = command.arg("--print=cfg").output().map_err(|error| {
+        format!("failed to inspect the default panic cfg with rustc +{toolchain}: {error}")
+    })?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to inspect the default panic cfg with rustc +{toolchain}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let cfg = RustcCfg::parse(&output.stdout);
+    for strategy in ["abort", "unwind"] {
+        if cfg.contains_value("panic", strategy) {
+            return Ok(strategy);
+        }
+    }
+    Err(format!(
+        "failed to parse the default panic cfg from rustc +{toolchain} --print=cfg"
+    ))
 }
 
 pub(crate) fn run_rustc_wrapper() -> ! {
@@ -1124,18 +1163,40 @@ fn profile_matches_selected_unit(cfg: &RustcCfg, arguments: &[OsString]) -> bool
     else {
         return false;
     };
+    let Ok(target_default_panic) = env::var("CHECK_DOCS_WRAPPER_TARGET_DEFAULT_PANIC") else {
+        return false;
+    };
     let arguments = arguments
         .iter()
         .map(|argument| argument.to_string_lossy())
         .collect::<Vec<_>>();
-    profile_matches_cfg(&profile, cfg, codegen_value(&arguments, "panic"))
+    profile_matches_cfg(&profile, cfg, &arguments, &target_default_panic)
 }
 
 fn profile_matches_cfg(
     profile: &serde_json::Value,
     cfg: &RustcCfg,
-    explicit_panic: Option<&str>,
+    arguments: &[std::borrow::Cow<'_, str>],
+    target_default_panic: &str,
 ) -> bool {
+    let Some(opt_level) = profile.get("opt_level").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(lto) = profile.get("lto").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(codegen_backend) = optional_profile_string(profile, "codegen_backend") else {
+        return false;
+    };
+    let Some(codegen_units) = optional_profile_u64(profile, "codegen_units") else {
+        return false;
+    };
+    let Some(debuginfo) = profile_debuginfo(profile) else {
+        return false;
+    };
+    let Some(split_debuginfo) = optional_profile_string(profile, "split_debuginfo") else {
+        return false;
+    };
     let Some(debug_assertions) = profile
         .get("debug_assertions")
         .and_then(serde_json::Value::as_bool)
@@ -1148,13 +1209,99 @@ fn profile_matches_cfg(
     else {
         return false;
     };
+    let Some(rpath) = profile.get("rpath").and_then(serde_json::Value::as_bool) else {
+        return false;
+    };
+    let Some(incremental) = profile
+        .get("incremental")
+        .and_then(serde_json::Value::as_bool)
+    else {
+        return false;
+    };
     let Some(panic) = profile.get("panic").and_then(serde_json::Value::as_str) else {
         return false;
     };
+    let Some(strip) = profile_strip(profile) else {
+        return false;
+    };
+    let explicit_panic = codegen_value(arguments, "panic");
+    let effective_panic = explicit_panic.unwrap_or(target_default_panic);
 
-    cfg.contains_flag("debug_assertions") == debug_assertions
+    codegen_value(arguments, "opt-level").unwrap_or("0") == opt_level
+        && profile_lto_matches(lto, arguments)
+        && unstable_value(arguments, "codegen-backend") == codegen_backend
+        && codegen_units.is_none_or(|expected| {
+            codegen_value(arguments, "codegen-units").and_then(|actual| actual.parse::<u64>().ok())
+                == Some(expected)
+        })
+        && (codegen_units.is_some() || !codegen_option_present(arguments, "codegen-units"))
+        && codegen_value(arguments, "debuginfo").unwrap_or("0") == debuginfo
+        && codegen_value(arguments, "split-debuginfo") == split_debuginfo
+        && cfg.contains_flag("debug_assertions") == debug_assertions
         && cfg.contains_flag("overflow_checks") == overflow_checks
+        && codegen_bool(arguments, "rpath") == rpath
+        && codegen_option_present(arguments, "incremental") == incremental
         && explicit_panic.is_none_or(|actual| actual == panic)
+        && cfg.contains_value("panic", effective_panic)
+        && codegen_value(arguments, "strip").unwrap_or("none") == strip
+}
+
+fn optional_profile_string<'a>(
+    profile: &'a serde_json::Value,
+    field: &str,
+) -> Option<Option<&'a str>> {
+    match profile.get(field)? {
+        serde_json::Value::Null => Some(None),
+        serde_json::Value::String(value) => Some(Some(value)),
+        _ => None,
+    }
+}
+
+fn optional_profile_u64(profile: &serde_json::Value, field: &str) -> Option<Option<u64>> {
+    match profile.get(field)? {
+        serde_json::Value::Null => Some(None),
+        serde_json::Value::Number(value) => value.as_u64().map(Some),
+        _ => None,
+    }
+}
+
+fn profile_debuginfo(profile: &serde_json::Value) -> Option<String> {
+    match profile.get("debuginfo")? {
+        serde_json::Value::Null => Some("0".into()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::String(value) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn profile_strip(profile: &serde_json::Value) -> Option<&str> {
+    let strip = profile.get("strip")?.as_object()?;
+    let value = if let Some(value) = strip.get("deferred") {
+        value.as_str()?
+    } else {
+        strip.get("resolved")?.as_object()?.get("Named")?.as_str()?
+    };
+    match value {
+        "None" | "none" => Some("none"),
+        "Debuginfo" | "debuginfo" => Some("debuginfo"),
+        "Symbols" | "symbols" => Some("symbols"),
+        _ => None,
+    }
+}
+
+fn profile_lto_matches(lto: &str, arguments: &[std::borrow::Cow<'_, str>]) -> bool {
+    let linker_plugin = codegen_option_present(arguments, "linker-plugin-lto");
+    let explicit_lto = codegen_value(arguments, "lto");
+    match lto {
+        "false" => !linker_plugin && explicit_lto.is_none(),
+        "off" => !linker_plugin && explicit_lto.is_none_or(|value| value == "off"),
+        "true" | "fat" | "thin" => {
+            linker_plugin
+                || explicit_lto
+                    .is_some_and(|value| value == lto || (lto == "true" && value == "fat"))
+        }
+        _ => false,
+    }
 }
 
 fn argument_value<'a>(arguments: &'a [std::borrow::Cow<'a, str>], flag: &str) -> Option<&'a str> {
@@ -1169,16 +1316,56 @@ fn argument_value<'a>(arguments: &'a [std::borrow::Cow<'a, str>], flag: &str) ->
 }
 
 fn codegen_value<'a>(arguments: &'a [std::borrow::Cow<'a, str>], option: &str) -> Option<&'a str> {
-    arguments.iter().enumerate().find_map(|(index, argument)| {
+    compiler_option_value(arguments, "-C", option)
+}
+
+fn unstable_value<'a>(arguments: &'a [std::borrow::Cow<'a, str>], option: &str) -> Option<&'a str> {
+    compiler_option_value(arguments, "-Z", option)
+}
+
+fn compiler_option_value<'a>(
+    arguments: &'a [std::borrow::Cow<'a, str>],
+    prefix: &str,
+    option: &str,
+) -> Option<&'a str> {
+    arguments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| {
+            let value = if argument == prefix {
+                arguments.get(index + 1).map(AsRef::as_ref)
+            } else {
+                argument.strip_prefix(prefix)
+            }?;
+            value
+                .strip_prefix(option)
+                .and_then(|value| value.strip_prefix('='))
+        })
+        .next_back()
+}
+
+fn codegen_option_present(arguments: &[std::borrow::Cow<'_, str>], option: &str) -> bool {
+    arguments.iter().enumerate().any(|(index, argument)| {
         let value = if argument == "-C" {
             arguments.get(index + 1).map(AsRef::as_ref)
         } else {
             argument.strip_prefix("-C")
-        }?;
-        value
-            .strip_prefix(option)
-            .and_then(|value| value.strip_prefix('='))
+        };
+        value.is_some_and(|value| {
+            value == option
+                || value
+                    .strip_prefix(option)
+                    .is_some_and(|value| value.starts_with('='))
+        })
     })
+}
+
+fn codegen_bool(arguments: &[std::borrow::Cow<'_, str>], option: &str) -> bool {
+    if let Some(value) = codegen_value(arguments, option) {
+        matches!(value, "yes" | "on" | "true" | "y")
+    } else {
+        codegen_option_present(arguments, option)
+    }
 }
 
 fn rustc_compile_mode(arguments: &[std::borrow::Cow<'_, str>]) -> Option<&'static str> {
@@ -1433,17 +1620,25 @@ pub(crate) fn target_selection(
     manifest_path: &Path,
     command_line_target: Option<&str>,
     host_triple: &str,
+    toolchain: &str,
 ) -> Result<CargoTargetSelection, String> {
     if let Some(target) = command_line_target {
+        let effective_target = if target == "host" {
+            host_triple
+        } else {
+            target
+        };
         return Ok(CargoTargetSelection {
-            effective_triple: target.to_string(),
-            cargo_platform: Some(target.to_string()),
+            toolchain: toolchain.to_string(),
+            effective_triple: effective_target.to_string(),
+            cargo_platform: Some(effective_target.to_string()),
             command_line_override: Some(target.to_string()),
         });
     }
 
-    let Some(configured_target) = configured_build_target(manifest_path)? else {
+    let Some(configured_target) = configured_build_target(manifest_path, toolchain)? else {
         return Ok(CargoTargetSelection {
+            toolchain: toolchain.to_string(),
             effective_triple: host_triple.to_string(),
             cargo_platform: None,
             command_line_override: None,
@@ -1455,15 +1650,17 @@ pub(crate) fn target_selection(
         configured_target
     };
     Ok(CargoTargetSelection {
+        toolchain: toolchain.to_string(),
         effective_triple: effective_target.clone(),
         cargo_platform: Some(effective_target),
         command_line_override: None,
     })
 }
 
-fn configured_build_target(manifest_path: &Path) -> Result<Option<String>, String> {
-    let toolchain =
-        env::var("CHECK_DOCS_TOOLCHAIN").unwrap_or_else(|_| PINNED_TOOLCHAIN.to_string());
+fn configured_build_target(
+    manifest_path: &Path,
+    toolchain: &str,
+) -> Result<Option<String>, String> {
     let mut command = Command::new("cargo");
     if let Some(invocation_dir) = manifest_path
         .parent()
@@ -1528,8 +1725,7 @@ pub(crate) fn resolved_unit(request: CargoUnitRequest<'_>) -> Result<CargoUnitId
         target_selection,
         feature_selection,
     } = request;
-    let toolchain =
-        env::var("CHECK_DOCS_TOOLCHAIN").unwrap_or_else(|_| PINNED_TOOLCHAIN.to_string());
+    let toolchain = &target_selection.toolchain;
     let context_kind = exact_context_kind(contexts)?;
     let only_dev = context_kind == DependencyKind::Development;
     let host_unit = context_kind == DependencyKind::Build
@@ -2054,6 +2250,7 @@ mod tests {
             via: None,
         }];
         let target_selection = CargoTargetSelection {
+            toolchain: PINNED_TOOLCHAIN.into(),
             effective_triple: "x86_64-unknown-linux-gnu".into(),
             cargo_platform: None,
             command_line_override: None,
@@ -2150,21 +2347,110 @@ mod tests {
     }
 
     #[test]
-    fn compiler_wrapper_distinguishes_profile_cfgs() {
+    fn compiler_wrapper_distinguishes_complete_profile_identity() {
         let selected = serde_json::json!({
+            "name": "test",
+            "opt_level": "1",
+            "lto": "thin",
+            "codegen_backend": "llvm",
+            "codegen_units": 1,
+            "debuginfo": 1,
+            "split_debuginfo": "packed",
             "debug_assertions": true,
             "overflow_checks": true,
+            "rpath": true,
+            "incremental": true,
             "panic": "unwind",
+            "strip": { "resolved": { "Named": "debuginfo" } },
         });
-        let dev_cfg = RustcCfg::parse(
+        let selected_cfg = RustcCfg::parse(
             b"debug_assertions\noverflow_checks\npanic=\"unwind\"\ntarget_os=\"linux\"\n",
         );
-        let build_cfg = RustcCfg::parse(b"panic=\"unwind\"\ntarget_os=\"linux\"\n");
+        let arguments = [
+            OsString::from("-Copt-level=1"),
+            OsString::from("-Clinker-plugin-lto"),
+            OsString::from("-Z"),
+            OsString::from("codegen-backend=llvm"),
+            OsString::from("-Ccodegen-units=1"),
+            OsString::from("-C"),
+            OsString::from("debuginfo=1"),
+            OsString::from("-Csplit-debuginfo=packed"),
+            OsString::from("-Crpath"),
+            OsString::from("-Cincremental=/tmp/incremental"),
+            OsString::from("-Cpanic=unwind"),
+            OsString::from("-Cstrip=debuginfo"),
+        ];
+        let arguments = arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy())
+            .collect::<Vec<_>>();
 
-        assert!(profile_matches_cfg(&selected, &dev_cfg, None));
-        assert!(!profile_matches_cfg(&selected, &build_cfg, None));
-        assert!(profile_matches_cfg(&selected, &dev_cfg, Some("unwind")));
-        assert!(!profile_matches_cfg(&selected, &dev_cfg, Some("abort")));
+        assert!(profile_matches_cfg(
+            &selected,
+            &selected_cfg,
+            &arguments,
+            "unwind"
+        ));
+
+        for (field, value) in [
+            ("opt_level", serde_json::json!("0")),
+            ("lto", serde_json::json!("false")),
+            ("codegen_backend", serde_json::Value::Null),
+            ("codegen_units", serde_json::json!(2)),
+            ("debuginfo", serde_json::json!(2)),
+            ("split_debuginfo", serde_json::Value::Null),
+            ("rpath", serde_json::json!(false)),
+            ("incremental", serde_json::json!(false)),
+            ("panic", serde_json::json!("abort")),
+            (
+                "strip",
+                serde_json::json!({ "resolved": { "Named": "symbols" } }),
+            ),
+        ] {
+            let mut different = selected.clone();
+            different[field] = value;
+            assert!(
+                !profile_matches_cfg(&different, &selected_cfg, &arguments, "unwind"),
+                "profile field {field} was not matched"
+            );
+        }
+
+        let build_cfg = RustcCfg::parse(b"panic=\"unwind\"\ntarget_os=\"linux\"\n");
+        assert!(!profile_matches_cfg(
+            &selected, &build_cfg, &arguments, "unwind"
+        ));
+        let missing_panic = RustcCfg::parse(b"debug_assertions\noverflow_checks\n");
+        assert!(!profile_matches_cfg(
+            &selected,
+            &missing_panic,
+            &arguments,
+            "unwind"
+        ));
+
+        let defaults = serde_json::json!({
+            "name": "test",
+            "opt_level": "0",
+            "lto": "false",
+            "codegen_backend": null,
+            "codegen_units": null,
+            "debuginfo": 0,
+            "split_debuginfo": null,
+            "debug_assertions": false,
+            "overflow_checks": false,
+            "rpath": false,
+            "incremental": false,
+            "panic": "unwind",
+            "strip": { "deferred": "None" },
+        });
+        let default_cfg = RustcCfg::parse(b"panic=\"unwind\"\n");
+        assert!(profile_matches_cfg(&defaults, &default_cfg, &[], "unwind"));
+        let abort_default_cfg = RustcCfg::parse(b"panic=\"abort\"\n");
+        assert!(profile_matches_cfg(
+            &defaults,
+            &abort_default_cfg,
+            &[],
+            "abort"
+        ));
     }
 
     #[test]

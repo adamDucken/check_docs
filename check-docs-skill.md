@@ -133,10 +133,12 @@ Consequences:
   metadata, unit selection, Rustdoc generation, and cache identity as one normalized selection.
 - With no `--target`, it honors Cargo's effective `build.target` configuration (including
   `CARGO_BUILD_TARGET` and Cargo's special `host` value); an explicit `--target`
-  remains the highest-precedence override.
+  remains the highest-precedence override. Explicit `--target host` is forwarded to
+  Cargo in that form while metadata and unit matching use Cargo's normalized host triple.
 - Compiler-wrapper matching and cache paths include Cargo's compile mode, host/target
-  platform, feature set, and profile cfg identity, so equal-feature units built with
-  different profile cfgs cannot overwrite one another's Rustdoc JSON.
+  platform, feature set, and complete effective profile/codegen identity (including
+  normalized omitted defaults and the compiler's actual panic cfg), so equal-feature
+  units built with different profiles cannot overwrite one another's Rustdoc JSON.
 - Dev-only queries use Cargo's test graph, build-only queries use the host build unit,
   and external re-export traversal preserves that originating context at every hop.
 - Target-specific normal/dev edges are evaluated for the selected target, while
@@ -154,6 +156,9 @@ Consequences:
   ordinary compiler work and the matching generated Rustdoc invocation. Relative
   wrapper paths retain Cargo's defining-config origin semantics, bare names use
   `PATH`, and wrapper discovery uses `CHECK_DOCS_TOOLCHAIN` consistently.
+- The `CHECK_DOCS_TOOLCHAIN` selection is resolved once per query and applied to host
+  detection, metadata, Cargo configuration, unit-graph resolution, wrapper discovery,
+  compilation, and Rustdoc generation; ambient Rustup overrides do not split those phases.
 - Each invocation starts from one clean, ownership-marked Cargo target tree under
   `target/check-docs` and holds its inter-process lock until all reports are emitted.
   Selected Cargo units use distinct subdirectories, so every reported Rustdoc source
@@ -225,8 +230,9 @@ Or set:
 CHECK_DOCS_TOOLCHAIN=<toolchain> check-docs 'use dependency::Item;' --root .
 ```
 
-`CHECK_DOCS_TOOLCHAIN` is an advanced override; the selected toolchain must emit
-the `rustdoc-types 0.56.x` schema.
+`CHECK_DOCS_TOOLCHAIN` is an advanced whole-query override; the selected Cargo and
+Rust compiler must support the target workspace and emit the `rustdoc-types 0.56.x`
+schema.
 
 ## Agent workflow
 

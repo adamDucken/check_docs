@@ -1,5 +1,4 @@
 /target/
-Cargo.lock
 review.md
 AGENTS.md
 agent_loop.py

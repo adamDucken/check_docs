@@ -41,3 +41,18 @@ fn workflow_pins_actions_and_uses_the_committed_lockfile() {
 
     assert!(include_str!("../Cargo.lock").starts_with("# This file is automatically @generated"));
 }
+
+#[test]
+fn workflow_selects_cargo_llvm_cov_for_the_generic_installer() {
+    let workflow = include_str!("../.github/workflows/ci.yml");
+    let mut lines = workflow.lines();
+
+    lines
+        .find(|line| {
+            line.trim_start()
+                .starts_with("- uses: taiki-e/install-action@")
+        })
+        .expect("workflow uses taiki-e/install-action");
+    assert_eq!(lines.next(), Some("        with:"));
+    assert_eq!(lines.next(), Some("          tool: cargo-llvm-cov"));
+}

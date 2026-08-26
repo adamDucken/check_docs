@@ -1,7 +1,15 @@
 [package]
-name = "check_docs"
+name = "check-docs"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
+description = "CLI for inspecting exact local Rust dependency APIs from Cargo-resolved Rustdoc JSON"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/adamDucken/check_docs"
+readme = "README.md"
+keywords = ["rustdoc", "cargo", "documentation", "dependencies", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+publish = ["crates-io"]
 
 [[bin]]
 name = "check-docs"

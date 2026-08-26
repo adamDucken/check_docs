@@ -556,7 +556,7 @@ edition = "2024"
     fn resolves_package_for_exact_manifest_and_its_dependencies() {
         let metadata = metadata();
         let package = select_package(&metadata, Path::new("Cargo.toml"), None).unwrap();
-        assert_eq!(package.name, "check_docs");
+        assert_eq!(package.name, "check-docs");
 
         let deps = package_dependencies(&metadata, &package.id, default_filter());
         assert!(deps.contains_key("cargo_metadata"));

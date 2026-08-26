@@ -66,7 +66,7 @@ Quote the full use line as one shell argument.
 ```bash
 check-docs 'use syn::parse_file;' --root .
 check-docs 'use cargo_metadata::MetadataCommand;' --root /home/adam/Desktop/rust/arbre_v1
-check-docs 'use serde::Serialize;' --root .
+check-docs 'use serde::ser::Serialize;' --root .
 check-docs 'use tokio::sync::{Mutex, RwLock, Semaphore};' --root .
 ```
 

@@ -2273,6 +2273,151 @@ fn binary_fails_when_one_selected_context_cannot_be_verified() {
 }
 
 #[test]
+fn binary_preserves_bound_pointee_parentheses() {
+    let workspace = TempDir::new().unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"dep\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    write_member(
+        &workspace,
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        "",
+    );
+    let signature = "pub fn inspect<'a>(a: &(dyn Send + Sync), b: &'a mut (dyn Send + 'a), c: *const (dyn Send + Sync), d: *mut (dyn Send + Sync), e: &(impl Send + Sync))";
+    write_member(
+        &workspace,
+        "dep",
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        &format!("{signature} {{}}\n"),
+    );
+    lock_workspace(&workspace);
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use dep::inspect;",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let definition = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("definition: "))
+        .unwrap();
+    assert_eq!(definition, signature);
+    fs::write(
+        workspace.path().join("app/src/lib.rs"),
+        format!("{definition} {{}}\n"),
+    )
+    .unwrap();
+    let compiled = Command::new("cargo")
+        .args([
+            "check",
+            "--offline",
+            "--locked",
+            "--manifest-path",
+            workspace.path().join("Cargo.toml").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+}
+
+#[test]
+fn binary_respects_shadowed_intermediate_glob_paths() {
+    let workspace = TempDir::new().unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"facade\", \"origin\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    write_member(
+        &workspace,
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nfacade = { path = \"../facade\" }\n",
+        "",
+    );
+    write_member(
+        &workspace,
+        "facade",
+        "[package]\nname = \"facade\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\norigin = { path = \"../origin\" }\n",
+        "pub mod nested {}\npub use origin::nested as named;\npub use origin::*;\n",
+    );
+    write_member(
+        &workspace,
+        "origin",
+        "[package]\nname = \"origin\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        "pub mod nested { pub struct Thing; }\npub mod sibling { pub struct Thing; }\n",
+    );
+    lock_workspace(&workspace);
+    for (path, succeeds) in [("nested", false), ("sibling", true), ("named", true)] {
+        let query = format!("use facade::{path}::Thing;");
+        let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+            .args([
+                &query,
+                "--root",
+                workspace.path().to_str().unwrap(),
+                "--package",
+                "app",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            succeeds,
+            "{query}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if succeeds {
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line == "definition: pub struct Thing;")
+            );
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("item 'Thing' not found in facade 0.1.0"),
+                "{stderr}"
+            );
+        }
+        fs::write(workspace.path().join("app/src/lib.rs"), query).unwrap();
+        let compiled = Command::new("cargo")
+            .args([
+                "check",
+                "--offline",
+                "--locked",
+                "--manifest-path",
+                workspace.path().join("Cargo.toml").to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            compiled.status.success(),
+            succeeds,
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        fs::write(workspace.path().join("app/src/lib.rs"), "").unwrap();
+    }
+}
+
+#[test]
 fn binary_applies_named_shadowing_per_exact_namespace() {
     let workspace = TempDir::new().unwrap();
     for member in ["app", "facade", "direct_origin", "glob_origin"] {
@@ -2764,6 +2909,66 @@ pub struct BuildOnly;
 }
 
 #[test]
+fn binary_matches_profile_before_compiler_flag_overrides() {
+    let workspace = TempDir::new().unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"dep\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    write_member(
+        &workspace,
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        "",
+    );
+    write_member(
+        &workspace,
+        "dep",
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        "pub struct Thing;\n#[cfg(any(doc, not(debug_assertions)))]\npub struct NoDebug;\n",
+    );
+    lock_workspace(&workspace);
+
+    for (flags, query, definition) in [
+        (
+            "-C opt-level=1",
+            "use dep::Thing;",
+            "definition: pub struct Thing;",
+        ),
+        (
+            "-C opt-level=1 -C debug-assertions=no -C overflow-checks=no -C debuginfo=0 -C codegen-units=1 -C panic=abort",
+            "use dep::NoDebug;",
+            "definition: pub struct NoDebug;",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+            .args([
+                query,
+                "--root",
+                workspace.path().to_str().unwrap(),
+                "--package",
+                "app",
+            ])
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env("RUSTFLAGS", flags)
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{flags}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == definition)
+        );
+    }
+}
+
+#[test]
 fn binary_matches_same_feature_dev_and_build_units_by_profile_cfg() {
     let workspace = TempDir::new().unwrap();
     fs::write(
@@ -2943,36 +3148,41 @@ pub struct BuildProfile;
     .unwrap();
     lock_workspace(&workspace);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
-        .args([
-            "use shared::DevProfile;",
-            "--root",
-            workspace.path().to_str().unwrap(),
-            "--package",
-            "app",
-            "--include-dev",
-        ])
-        .env("CHECK_DOCS_TEST_RUSTDOC_LOG", &rustdoc_log)
-        .output()
-        .unwrap();
+    for flags in ["", "-C opt-level=2"] {
+        fs::write(&rustdoc_log, "").unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+            .args([
+                "use shared::DevProfile;",
+                "--root",
+                workspace.path().to_str().unwrap(),
+                "--package",
+                "app",
+                "--include-dev",
+            ])
+            .env("CHECK_DOCS_TEST_RUSTDOC_LOG", &rustdoc_log)
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env("RUSTFLAGS", flags)
+            .output()
+            .unwrap();
 
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let source = report_source(&stdout);
-    assert_eq!(
-        stdout,
-        format!(
-            "crate: shared 0.1.0\ndependency: dev\ntarget: {}\nroot features: default\nsource: {}\nimport: use shared::DevProfile;\nitem: struct DevProfile\nlocation: {}/shared/src/lib.rs:2\ndefinition: pub struct DevProfile;\ndocs: (none)\n",
-            host_target_triple(),
-            source.display(),
-            workspace.path().display()
-        )
-    );
-    assert_eq!(fs::read_to_string(rustdoc_log).unwrap(), "rustdoc\n");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let source = report_source(&stdout);
+        assert_eq!(
+            stdout,
+            format!(
+                "crate: shared 0.1.0\ndependency: dev\ntarget: {}\nroot features: default\nsource: {}\nimport: use shared::DevProfile;\nitem: struct DevProfile\nlocation: {}/shared/src/lib.rs:2\ndefinition: pub struct DevProfile;\ndocs: (none)\n",
+                host_target_triple(),
+                source.display(),
+                workspace.path().display()
+            )
+        );
+        assert_eq!(fs::read_to_string(&rustdoc_log).unwrap(), "rustdoc\n");
+    }
 }
 
 #[test]

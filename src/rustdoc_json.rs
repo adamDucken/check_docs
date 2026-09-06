@@ -977,32 +977,42 @@ pub(crate) fn run_rustc_wrapper() -> ! {
         std::process::exit(0);
     }
 
-    let mut print_cfg = if let Some(wrapper) = &original_wrapper {
-        let mut command = Command::new(wrapper);
-        command.arg(compiler);
-        command
-    } else {
-        Command::new(compiler)
+    // Cargo emits its profile options before dependency search paths, and appends
+    // user rustflags afterwards. Match the original profile so overrides cannot
+    // hide the selected unit or collapse distinct dev/build profiles.
+    let profile_arguments = cargo_profile_arguments(invocation.arguments);
+    let print_cfg = |arguments: &[OsString]| {
+        let mut command = if let Some(wrapper) = &original_wrapper {
+            let mut command = Command::new(wrapper);
+            command.arg(compiler);
+            command
+        } else {
+            Command::new(compiler)
+        };
+        let cfg_output = command
+            .args(&command_arguments[1..command_arguments.len() - invocation.arguments.len()])
+            .args(arguments)
+            .arg("--print=cfg")
+            .output()
+            .unwrap_or_else(|err| {
+                eprintln!("check-docs Rust compiler wrapper failed to inspect rustc cfgs: {err}");
+                std::process::exit(1);
+            });
+        if !cfg_output.status.success() {
+            eprintln!(
+                "check-docs Rust compiler wrapper failed to inspect rustc cfgs: {}",
+                String::from_utf8_lossy(&cfg_output.stderr).trim()
+            );
+            std::process::exit(cfg_output.status.code().unwrap_or(1));
+        }
+        cfg_output
     };
-    let cfg_output = print_cfg
-        .args(&command_arguments[1..])
-        .arg("--print=cfg")
-        .output()
-        .unwrap_or_else(|err| {
-            eprintln!("check-docs Rust compiler wrapper failed to inspect rustc cfgs: {err}");
-            std::process::exit(1);
-        });
-    if !cfg_output.status.success() {
-        eprintln!(
-            "check-docs Rust compiler wrapper failed to inspect rustc cfgs: {}",
-            String::from_utf8_lossy(&cfg_output.stderr).trim()
-        );
-        std::process::exit(cfg_output.status.code().unwrap_or(1));
-    }
-    let cfg = RustcCfg::parse(&cfg_output.stdout);
-    if !profile_matches_selected_unit(&cfg, invocation.arguments) {
+    let profile_cfg = print_cfg(profile_arguments);
+    if !profile_matches_selected_unit(&RustcCfg::parse(&profile_cfg.stdout), profile_arguments) {
         std::process::exit(0);
     }
+    // Item filtering must still see the effective cfgs, including user overrides.
+    let cfg_output = print_cfg(invocation.arguments);
 
     let Some(doc_dir) = env::var_os("CHECK_DOCS_WRAPPER_DOC_DIR").map(PathBuf::from) else {
         eprintln!("check-docs Rust compiler wrapper is missing its Rustdoc output directory");
@@ -1154,6 +1164,14 @@ fn wrapper_matches_selected_unit(arguments: &[OsString]) -> bool {
     expected_features.sort();
     expected_features.dedup();
     actual_features == expected_features
+}
+
+// ponytail: relies on pinned Cargo argument ordering; revisit when upgrading Cargo.
+fn cargo_profile_arguments(arguments: &[OsString]) -> &[OsString] {
+    let end = arguments
+        .windows(2)
+        .position(|pair| pair[0] == "-L" && pair[1].to_string_lossy().starts_with("dependency="));
+    &arguments[..end.unwrap_or(arguments.len())]
 }
 
 fn profile_matches_selected_unit(cfg: &RustcCfg, arguments: &[OsString]) -> bool {

@@ -136,9 +136,11 @@ Consequences:
   remains the highest-precedence override. Explicit `--target host` is forwarded to
   Cargo in that form while metadata and unit matching use Cargo's normalized host triple.
 - Compiler-wrapper matching and cache paths include Cargo's compile mode, host/target
-  platform, feature set, and complete effective profile/codegen identity (including
-  normalized omitted defaults and the compiler's actual panic cfg), so equal-feature
-  units built with different profiles cannot overwrite one another's Rustdoc JSON.
+  platform, feature set, and complete Cargo profile/codegen identity (including
+  normalized omitted defaults). Profile matching uses Cargo-generated options before
+  appended compiler flag overrides, so equal-feature units built with different
+  profiles cannot overwrite one another's Rustdoc JSON. Rustdoc generation and item
+  filtering use the final compiler arguments and cfgs, including those overrides.
 - Dev-only queries use Cargo's test graph, build-only queries use the host build unit,
   and external re-export traversal preserves that originating context at every hop.
 - Target-specific normal/dev edges are evaluated for the selected target, while

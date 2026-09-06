@@ -318,6 +318,7 @@ fn external_candidates(
             Some(NamespaceConstraint::Type)
         },
     )?;
+    let shadows_intermediate = !tail.is_empty() && !direct.is_empty();
     let mut candidates = Vec::new();
     for child_id in direct {
         match follow_use_or_external(krate, child_id, &mut HashSet::new())? {
@@ -338,6 +339,10 @@ fn external_candidates(
             }
             Followed::Local(_) => {}
         }
+    }
+
+    if shadows_intermediate {
+        return Ok(candidates);
     }
 
     for child_id in children {
@@ -2113,6 +2118,20 @@ fn where_predicate_str(predicate: &WherePredicate) -> Option<String> {
     }
 }
 
+fn pointee_str(ty: &Type) -> String {
+    let needs_parens = match ty {
+        Type::DynTrait(object) => object.traits.len() + usize::from(object.lifetime.is_some()) > 1,
+        Type::ImplTrait(bounds) => bounds.len() > 1,
+        _ => false,
+    };
+    let rendered = type_str(ty);
+    if needs_parens {
+        format!("({rendered})")
+    } else {
+        rendered
+    }
+}
+
 fn type_str(ty: &Type) -> String {
     match ty {
         Type::ResolvedPath(path) => format_path(path),
@@ -2159,7 +2178,7 @@ fn type_str(ty: &Type) -> String {
         Type::RawPointer { is_mutable, type_ } => format!(
             "*{} {}",
             if *is_mutable { "mut" } else { "const" },
-            type_str(type_)
+            pointee_str(type_)
         ),
         Type::BorrowedRef {
             lifetime,
@@ -2172,7 +2191,7 @@ fn type_str(ty: &Type) -> String {
                 .map(|l| format!("{} ", lifetime_str(l)))
                 .unwrap_or_default(),
             if *is_mutable { "mut " } else { "" },
-            type_str(type_)
+            pointee_str(type_)
         ),
         Type::QualifiedPath {
             name,

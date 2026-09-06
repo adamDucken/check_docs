@@ -2359,12 +2359,12 @@ fn binary_applies_named_shadowing_per_exact_namespace() {
 #[test]
 fn binary_honors_self_import_namespaces_and_primitive_reexports() {
     let workspace = TempDir::new().unwrap();
-    for member in ["app", "shape_dep"] {
+    for member in ["app", "shape_dep", "origin"] {
         fs::create_dir_all(workspace.path().join(member).join("src")).unwrap();
     }
     fs::write(
         workspace.path().join("Cargo.toml"),
-        "[workspace]\nmembers = [\"app\", \"shape_dep\"]\nresolver = \"3\"\n",
+        "[workspace]\nmembers = [\"app\", \"shape_dep\", \"origin\"]\nresolver = \"3\"\n",
     )
     .unwrap();
     fs::write(
@@ -2372,22 +2372,32 @@ fn binary_honors_self_import_namespaces_and_primitive_reexports() {
         "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nshape_dep = { path = \"../shape_dep\" }\n",
     )
     .unwrap();
-    fs::write(workspace.path().join("app/src/lib.rs"), "").unwrap();
+    fs::write(
+        workspace.path().join("app/src/lib.rs"),
+        "pub use shape_dep::{foo::{Nested, External}, Choice::One, remote::Nested as Remote};",
+    )
+    .unwrap();
     fs::write(
         workspace.path().join("shape_dep/Cargo.toml"),
-        "[package]\nname = \"shape_dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        "[package]\nname = \"shape_dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\norigin = { path = \"../origin\" }\n",
     )
     .unwrap();
     fs::write(
         workspace.path().join("shape_dep/src/lib.rs"),
-        "pub mod foo {}\npub fn foo() {}\npub struct Bar;\n#[macro_export]\nmacro_rules! Bar { () => {}; }\npub use i32 as MyI32;\n",
+        "pub mod foo { pub struct Nested; pub use origin::External; }\npub fn foo() {}\npub enum Choice { One }\n#[macro_export]\nmacro_rules! Choice { () => {}; }\npub use origin::remote;\npub use origin::remote_fn as remote;\npub struct Bar;\n#[macro_export]\nmacro_rules! Bar { () => {}; }\npub use i32 as MyI32;\n",
     )
     .unwrap();
+    write_member(
+        &workspace,
+        "origin",
+        "[package]\nname = \"origin\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        "pub struct External; pub mod remote { pub struct Nested; } pub fn remote_fn() {}",
+    );
     lock_workspace(&workspace);
 
     let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
         .args([
-            "use shape_dep::{foo::{self}, Bar::{self}, MyI32};",
+            "use shape_dep::{foo::{self, Nested, External}, Choice::One, remote::Nested, Bar::{self}, MyI32};",
             "--root",
             workspace.path().to_str().unwrap(),
             "--package",
@@ -2411,6 +2421,33 @@ fn binary_honors_self_import_namespaces_and_primitive_reexports() {
     );
     assert!(stdout.contains("item: use MyI32"), "{stdout}");
     assert!(stdout.contains("resolved item: primitive i32"), "{stdout}");
+
+    for expected in [
+        "import: use shape_dep::foo::Nested;\nitem: struct Nested",
+        "import: use shape_dep::foo::External;\nitem: use External",
+        "import: use shape_dep::Choice::One;\nitem: variant One",
+        "import: use shape_dep::remote::Nested;\nitem: struct Nested",
+    ] {
+        assert!(stdout.contains(expected), "{stdout}");
+    }
+    for import in ["use shape_dep::foo;", "use shape_dep::Choice;"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+            .args([
+                import,
+                "--root",
+                workspace.path().to_str().unwrap(),
+                "--package",
+                "app",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{import}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("ambiguous across Rust namespaces"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]

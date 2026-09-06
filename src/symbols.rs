@@ -147,7 +147,11 @@ pub(crate) fn find_symbol(krate: &Crate, import: &ImportPath) -> Result<SymbolDo
             krate,
             current,
             part,
-            is_last.then_some(import.namespace).flatten(),
+            if is_last {
+                import.namespace
+            } else {
+                Some(NamespaceConstraint::Type)
+            },
             &mut HashSet::new(),
         )?;
         current = follow_use(krate, current, &mut HashSet::new())?;
@@ -176,7 +180,11 @@ pub(crate) fn find_symbol_report(
             krate,
             current,
             part,
-            is_last.then_some(import.namespace).flatten(),
+            if is_last {
+                import.namespace
+            } else {
+                Some(NamespaceConstraint::Type)
+            },
             &mut HashSet::new(),
         )?;
         let child = item(krate, child_id)?;
@@ -228,7 +236,11 @@ pub(crate) fn imported_reexport(
             krate,
             current,
             part,
-            is_last.then_some(import.namespace).flatten(),
+            if is_last {
+                import.namespace
+            } else {
+                Some(NamespaceConstraint::Type)
+            },
             &mut HashSet::new(),
         )?;
         let child = item(krate, child_id)?;
@@ -300,7 +312,11 @@ fn external_candidates(
         krate,
         children,
         part,
-        tail.is_empty().then_some(namespace).flatten(),
+        if tail.is_empty() {
+            namespace
+        } else {
+            Some(NamespaceConstraint::Type)
+        },
     )?;
     let mut candidates = Vec::new();
     for child_id in direct {

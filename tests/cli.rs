@@ -2364,11 +2364,123 @@ fn binary_respects_shadowed_intermediate_glob_paths() {
         "pub mod nested { pub struct Thing; }\npub mod sibling { pub struct Thing; }\n",
     );
     lock_workspace(&workspace);
-    for (path, succeeds) in [("nested", false), ("sibling", true), ("named", true)] {
-        let query = format!("use facade::{path}::Thing;");
+    for (binding, shadows) in [
+        ("pub mod nested {}", true),
+        ("mod nested { pub struct Thing; }", true),
+        ("pub(crate) mod nested { pub struct Thing; }", true),
+        (
+            "macro_rules! shadow { () => { mod nested {} } } shadow!();",
+            true,
+        ),
+        ("#[cfg(any())] mod nested {}", false),
+    ] {
+        fs::write(
+            workspace.path().join("facade/src/lib.rs"),
+            format!("{binding}\npub use origin::nested as named;\npub use origin::*;\n"),
+        )
+        .unwrap();
+        for (path, succeeds) in [("nested", !shadows), ("sibling", true), ("named", true)] {
+            let query = format!("use facade::{path}::Thing;");
+            let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+                .env("CARGO_TARGET_DIR", workspace.path().join("target"))
+                .args([
+                    &query,
+                    "--root",
+                    workspace.path().to_str().unwrap(),
+                    "--package",
+                    "app",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.success(),
+                succeeds,
+                "{binding}: {query}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if succeeds {
+                assert!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .any(|line| line == "definition: pub struct Thing;")
+                );
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    stderr.contains("item 'Thing' not found in facade 0.1.0"),
+                    "{stderr}"
+                );
+            }
+            fs::write(workspace.path().join("app/src/lib.rs"), query).unwrap();
+            let compiled = Command::new("cargo")
+                .env("CARGO_TARGET_DIR", workspace.path().join("target"))
+                .args([
+                    "check",
+                    "--offline",
+                    "--locked",
+                    "--manifest-path",
+                    workspace.path().join("Cargo.toml").to_str().unwrap(),
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(
+                compiled.status.success(),
+                succeeds,
+                "{binding}: {path}: {}",
+                String::from_utf8_lossy(&compiled.stderr)
+            );
+            fs::write(workspace.path().join("app/src/lib.rs"), "").unwrap();
+        }
+    }
+}
+
+#[test]
+fn binary_deduplicates_equivalent_external_reexport_routes() {
+    let workspace = TempDir::new().unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"facade\", \"left\", \"right\", \"origin\"]\nresolver = \"3\"\n",
+    ).unwrap();
+    for (name, dependencies, source) in [
+        ("app", "facade = { path = \"../facade\" }", ""),
+        (
+            "facade",
+            "left = { path = \"../left\" }\nright = { path = \"../right\" }",
+            "pub use left::*; pub use right::*;",
+        ),
+        (
+            "left",
+            "origin = { path = \"../origin\" }",
+            "pub use origin::Thing;",
+        ),
+        (
+            "right",
+            "origin = { path = \"../origin\" }",
+            "pub use origin::Thing;",
+        ),
+        ("origin", "", "pub struct Thing;"),
+    ] {
+        write_member(
+            &workspace,
+            name,
+            &format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\n{dependencies}\n"
+            ),
+            source,
+        );
+    }
+    lock_workspace(&workspace);
+    for (right, succeeds) in [
+        ("pub use origin::Thing;", true),
+        ("pub struct Thing;", false),
+    ] {
+        fs::write(workspace.path().join("right/src/lib.rs"), right).unwrap();
+        let query = "use facade::Thing;";
         let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+            .env("CARGO_TARGET_DIR", workspace.path().join("target"))
             .args([
-                &query,
+                query,
                 "--root",
                 workspace.path().to_str().unwrap(),
                 "--package",
@@ -2379,31 +2491,38 @@ fn binary_respects_shadowed_intermediate_glob_paths() {
         assert_eq!(
             output.status.success(),
             succeeds,
-            "{query}: {} {}",
+            "{} {}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         if succeeds {
-            assert!(
-                String::from_utf8_lossy(&output.stdout)
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(
+                stdout
                     .lines()
-                    .any(|line| line == "definition: pub struct Thing;")
+                    .filter(|line| line.starts_with("definition:"))
+                    .collect::<Vec<_>>(),
+                [
+                    "definition: pub use origin::Thing as Thing;",
+                    "definition: pub struct Thing;"
+                ]
             );
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
-                stderr.contains("item 'Thing' not found in facade 0.1.0"),
-                "{stderr}"
+                String::from_utf8_lossy(&output.stderr).contains("ambiguous external re-export")
             );
         }
         fs::write(workspace.path().join("app/src/lib.rs"), query).unwrap();
         let compiled = Command::new("cargo")
+            .env("CARGO_TARGET_DIR", workspace.path().join("target"))
             .args([
                 "check",
                 "--offline",
                 "--locked",
                 "--manifest-path",
                 workspace.path().join("Cargo.toml").to_str().unwrap(),
+                "-p",
+                "app",
             ])
             .output()
             .unwrap();

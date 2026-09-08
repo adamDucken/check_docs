@@ -83,6 +83,7 @@ impl ReportedAttribute {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SymbolReport {
+    pub(crate) resolved_id: Id,
     pub(crate) imported: SymbolDoc,
     pub(crate) resolved: Option<SymbolDoc>,
 }
@@ -193,6 +194,7 @@ pub(crate) fn find_symbol_report(
                 let imported = format_item(krate, child);
                 if let Some(resolved) = primitive_reexport_doc(child) {
                     return Ok(SymbolReport {
+                        resolved_id: child_id,
                         imported,
                         resolved: Some(resolved),
                     });
@@ -200,12 +202,14 @@ pub(crate) fn find_symbol_report(
                 let resolved_id = follow_use(krate, child_id, &mut HashSet::new())?;
                 let resolved = format_item(krate, item(krate, resolved_id)?);
                 return Ok(SymbolReport {
+                    resolved_id,
                     imported,
                     resolved: Some(resolved),
                 });
             }
             let id = follow_use(krate, child_id, &mut HashSet::new())?;
             return Ok(SymbolReport {
+                resolved_id: id,
                 imported: format_item(krate, item(krate, id)?),
                 resolved: None,
             });
@@ -318,6 +322,9 @@ fn external_candidates(
             Some(NamespaceConstraint::Type)
         },
     )?;
+    if !tail.is_empty() && has_private_type_binding(krate, children, part)? {
+        return Ok(Vec::new());
+    }
     let shadows_intermediate = !tail.is_empty() && !direct.is_empty();
     let mut candidates = Vec::new();
     for child_id in direct {
@@ -680,6 +687,14 @@ fn find_child(
         ))
     })?;
 
+    if namespace == Some(NamespaceConstraint::Type)
+        && has_private_type_binding(krate, children, name)?
+    {
+        return Err(SymbolError::NotFound(format!(
+            "'{name}' is private under {}",
+            path_label(krate, module_id)
+        )));
+    }
     let direct_matches = direct_matching_children(krate, children, name, namespace)?;
     match direct_matches.as_slice() {
         [_] => {}
@@ -912,6 +927,26 @@ pub(crate) fn report_has_unshadowed_namespace(named: &SymbolReport, glob: &Symbo
 pub(crate) fn report_item_label(report: &SymbolReport) -> String {
     let item = report.resolved.as_ref().unwrap_or(&report.imported);
     format!("{} {}", item.kind, item.name)
+}
+
+fn has_private_type_binding(
+    krate: &Crate,
+    children: &[Id],
+    name: &str,
+) -> Result<bool, SymbolError> {
+    for id in children {
+        let child = item(krate, *id)?;
+        if is_cfg_available(child)
+            && !is_public(child)
+            && exported_name(child)
+                .as_deref()
+                .is_some_and(|exported| identifier_key(exported) == identifier_key(name))
+            && item_namespaces(krate, *id)? & TYPE_NAMESPACE != 0
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn direct_matching_children(

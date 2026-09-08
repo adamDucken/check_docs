@@ -525,6 +525,7 @@ fn resolve_query(
             .and_then(|(external_krate, external_json_path)| {
                 Ok(ResolvedQuery {
                     symbols: SymbolReport {
+                        resolved_id: external_krate.root,
                         imported: symbols::format_crate_root(&external_krate)
                             .map_err(|error| QueryError::Incomplete(error.to_string()))?,
                         resolved: None,
@@ -593,6 +594,14 @@ fn resolve_query(
         Err(SymbolError::NotFound(_) | SymbolError::ExternalReexport(_)) => None,
         Err(error) => return Err(QueryError::Incomplete(error.to_string())),
     };
+    // Prefer named routes when the same definition is also reached via a glob.
+    // Each cached JSON path belongs to one exact package/Cargo unit. Item IDs
+    // identify definitions only within that graph, never across JSON files.
+    successes.sort_by_key(|(via_glob, _)| *via_glob);
+    let mut definitions = HashSet::new();
+    successes.retain(|(_, resolved)| {
+        definitions.insert((resolved.json_path.clone(), resolved.symbols.resolved_id))
+    });
     let named = successes
         .iter()
         .enumerate()
@@ -631,6 +640,7 @@ fn resolve_query(
                     .take()
                     .unwrap_or(resolved.symbols.imported);
                 resolved.symbols = SymbolReport {
+                    resolved_id: resolved.symbols.resolved_id,
                     imported,
                     resolved: Some(resolved_item),
                 };
@@ -900,6 +910,7 @@ mod tests {
 
     fn report(doc: SymbolDoc) -> SymbolReport {
         SymbolReport {
+            resolved_id: Id(0),
             imported: doc,
             resolved: None,
         }
@@ -1033,6 +1044,7 @@ mod tests {
             source: PathBuf::from("/tmp/src"),
             import_line: "use x::Thing;".into(),
             symbols: SymbolReport {
+                resolved_id: Id(0),
                 imported: doc("Thing", Vec::new()),
                 resolved: Some(doc("ResolvedThing", Vec::new())),
             },

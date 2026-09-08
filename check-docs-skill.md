@@ -99,6 +99,14 @@ names apply to that selected package just as they do for `cargo check -p`.
   the `r#` prefix wherever Rustdoc reports an unescaped keyword name.
 - Concrete items behind public external globs and multi-package re-export chains
   are followed through the resolved Cargo dependency graph.
+- Equivalent re-export routes to the same item in the same exact Cargo unit count
+  as one definition; distinct definitions and namespace conflicts remain ambiguous.
+- Private and restricted intermediate modules shadow glob re-exports just as they
+  do in Rust. Rustdoc retains private items internally to detect these bindings,
+  including macro-generated ones; reports still exclude private paths and fields.
+- Limitation: the pinned Rustdoc omits private `use` aliases even with private-item
+  output enabled. Such aliases can still hide an external glob path without the
+  resolver detecting the shadow; verify those paths with Cargo (review CD-007).
 - Canonical external targets remain usable when Rustdoc strips a private module
   from the syntactic path of a public re-export, including bare crate-root-relative
   paths and source-level `extern crate` aliases.

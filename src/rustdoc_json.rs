@@ -131,6 +131,7 @@ pub(crate) fn load_or_generate(
     let mut krate = load_valid_json(&json_path, request.package)?;
     let cfg = load_rustc_cfg(&json_path.with_extension("cfg"))?;
     apply_non_doc_cfg(&mut krate, &cfg);
+    strip_private_fields(&mut krate);
     normalize_span_paths(&mut krate, &invocation_dir);
     Ok((krate, json_path))
 }
@@ -496,6 +497,49 @@ fn normalize_span_paths(krate: &mut Crate, invocation_dir: &Path) {
         if span.filename.is_relative() {
             span.filename = invocation_dir.join(&span.filename);
         }
+    }
+}
+
+fn strip_private_fields(krate: &mut Crate) {
+    use rustdoc_types::{ItemEnum, StructKind, Visibility};
+
+    let private_fields = krate
+        .index
+        .iter()
+        .filter_map(|(id, item)| {
+            (matches!(item.inner, ItemEnum::StructField(_))
+                && !matches!(item.visibility, Visibility::Public | Visibility::Default))
+            .then_some(*id)
+        })
+        .collect::<HashSet<_>>();
+    for item in krate.index.values_mut() {
+        let (fields, stripped) = match &mut item.inner {
+            ItemEnum::Struct(struct_) => match &mut struct_.kind {
+                StructKind::Tuple(fields) => {
+                    for field in fields {
+                        if field.is_some_and(|id| private_fields.contains(&id)) {
+                            *field = None;
+                        }
+                    }
+                    continue;
+                }
+                StructKind::Plain {
+                    fields,
+                    has_stripped_fields,
+                } => (fields, has_stripped_fields),
+                StructKind::Unit => continue,
+            },
+            ItemEnum::Union(union_) => (&mut union_.fields, &mut union_.has_stripped_fields),
+            _ => continue,
+        };
+        fields.retain(|id| {
+            if private_fields.contains(id) {
+                *stripped = true;
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
@@ -1063,7 +1107,14 @@ pub(crate) fn run_rustc_wrapper() -> ! {
     };
     let status = command
         .args(rustdoc_arguments)
-        .args(["-Z", "unstable-options", "--output-format", "json", "-o"])
+        .args([
+            "-Z",
+            "unstable-options",
+            "--output-format",
+            "json",
+            "--document-private-items",
+            "-o",
+        ])
         .arg(&doc_dir)
         .status()
         .unwrap_or_else(|err| {

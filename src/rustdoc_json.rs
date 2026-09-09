@@ -2,7 +2,7 @@ use crate::cli::FeatureSelection;
 use crate::resolver::{DependencyContext, is_library_target, package_spec};
 use cargo_metadata::{DependencyKind, Metadata, Package, Target};
 use rustdoc_types::{Crate, FORMAT_VERSION};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -992,6 +992,125 @@ fn target_default_panic(toolchain: &str, platform: Option<&str>) -> Result<&'sta
     ))
 }
 
+#[derive(Serialize, Deserialize)]
+struct ImportProbe {
+    compiler: Vec<OsString>,
+    directory: PathBuf,
+    arguments: Vec<OsString>,
+}
+
+fn save_import_probe(
+    compiler: Vec<OsString>,
+    arguments: &[OsString],
+    path: &Path,
+) -> Result<(), String> {
+    let directory = env::current_dir().map_err(|error| error.to_string())?;
+    let output = Command::new(&compiler[0])
+        .args(&compiler[1..])
+        .args(arguments)
+        .arg("--print=file-names")
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+    }
+    let strings = arguments
+        .iter()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>();
+    let out_dir = argument_value(&strings, "--out-dir")
+        .ok_or("selected compiler invocation has no output directory")?;
+    let artifact = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|name| directory.join(out_dir).join(name))
+        .find_map(|path| {
+            let metadata = path.with_extension("rmeta");
+            if metadata.is_file() {
+                Some(metadata)
+            } else if path.is_file() {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .ok_or("selected compiler invocation produced no importable artifact")?;
+    let mut probe_arguments = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let arg = arguments[index].to_string_lossy();
+        if matches!(arg.as_ref(), "-L" | "--target" | "--sysroot") {
+            probe_arguments.push(arguments[index].clone());
+            index += 1;
+            probe_arguments.push(arguments[index].clone());
+        } else if arg.starts_with("-L")
+            || arg.starts_with("--target=")
+            || arg.starts_with("--sysroot=")
+        {
+            probe_arguments.push(arguments[index].clone());
+        }
+        index += 1;
+    }
+    probe_arguments.push("--extern".into());
+    let mut external = OsString::from("check_docs_dependency=");
+    external.push(artifact);
+    probe_arguments.push(external);
+    let probe = ImportProbe {
+        compiler,
+        directory,
+        arguments: probe_arguments,
+    };
+    fs::write(
+        path,
+        serde_json::to_vec(&probe).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+pub(crate) fn validate_import(
+    json_path: &Path,
+    import: &crate::imports::ImportPath,
+) -> Result<(), String> {
+    let probe: ImportProbe = serde_json::from_slice(
+        &fs::read(json_path.with_extension("probe")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let source = json_path.with_extension("probe.rs");
+    let mut parts = import.segments.clone();
+    parts.push(import.item.clone());
+    if import.namespace.is_some() {
+        parts.push("{self}".into());
+    }
+    fs::write(
+        &source,
+        format!(
+            "#![no_std]\nuse check_docs_dependency::{};\n",
+            parts.join("::")
+        ),
+    )
+    .map_err(|error| error.to_string())?;
+    let output = Command::new(&probe.compiler[0])
+        .args(&probe.compiler[1..])
+        .current_dir(&probe.directory)
+        .args(&probe.arguments)
+        .args([
+            "--edition=2024",
+            "--crate-name=check_docs_import_probe",
+            "--crate-type=lib",
+            "--emit=metadata",
+            "--cap-lints=allow",
+        ])
+        .arg(&source)
+        .arg("-o")
+        .arg(json_path.with_extension("probe.rmeta"))
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+}
+
 pub(crate) fn run_rustc_wrapper() -> ! {
     let command_arguments = env::args_os().skip(1).collect::<Vec<_>>();
     let Some(compiler) = command_arguments.first() else {
@@ -1078,6 +1197,18 @@ pub(crate) fn run_rustc_wrapper() -> ! {
             "check-docs Rust compiler wrapper failed to write {}: {err}",
             cfg_path.display()
         );
+        std::process::exit(1);
+    }
+    let mut probe_compiler = original_wrapper.iter().cloned().collect::<Vec<_>>();
+    probe_compiler.extend_from_slice(
+        &command_arguments[..command_arguments.len() - invocation.arguments.len()],
+    );
+    if let Err(error) = save_import_probe(
+        probe_compiler,
+        invocation.arguments,
+        &cfg_path.with_extension("probe"),
+    ) {
+        eprintln!("check-docs failed to retain the selected compiler artifact: {error}");
         std::process::exit(1);
     }
     let mut rustdoc = PathBuf::from(invocation.rustc);

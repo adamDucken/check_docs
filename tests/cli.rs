@@ -2373,6 +2373,13 @@ fn binary_respects_shadowed_intermediate_glob_paths() {
             true,
         ),
         ("#[cfg(any())] mod nested {}", false),
+        ("use origin::sibling as nested;", true),
+        ("pub(crate) use origin::sibling as nested;", true),
+        (
+            "macro_rules! shadow { () => { use origin::sibling as nested; } } shadow!();",
+            true,
+        ),
+        ("#[cfg(any())] use origin::sibling as nested;", false),
     ] {
         fs::write(
             workspace.path().join("facade/src/lib.rs"),

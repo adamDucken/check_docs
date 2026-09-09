@@ -447,6 +447,31 @@ fn resolve_query(
         };
     }
 
+    // Only the user's path must be externally importable. Recursive routes may
+    // contain private canonical modules exposed by a public re-export.
+    let is_root_query = visited.len() == 1;
+    let validate_candidate = || {
+        if !is_root_query {
+            return Ok(());
+        }
+        rustdoc_json::validate_import(&json_path, import).map_err(|error| {
+            if error.contains("error[E0603]") || error.contains("error[E0432]") {
+                QueryError::Absent(format!(
+                    "item '{}' not found in {} {}: compiler rejected import '{}': {error}",
+                    import.item,
+                    package.name,
+                    package.version,
+                    import.full_path()
+                ))
+            } else {
+                QueryError::Incomplete(format!(
+                    "could not validate import '{}': {error}",
+                    import.full_path()
+                ))
+            }
+        })
+    };
+
     let mut successes = Vec::new();
     let mut absent_branch_errors = Vec::new();
     let mut incomplete_branch_errors = Vec::new();
@@ -578,6 +603,7 @@ fn resolve_query(
                 conflicts.join(", ")
             )));
         }
+        validate_candidate()?;
         return Ok(ResolvedQuery {
             symbols: local_symbols,
             crate_name: package.name.clone(),
@@ -632,6 +658,7 @@ fn resolve_query(
     }
     match successes.len() {
         1 => {
+            validate_candidate()?;
             let (_, mut resolved) = successes.pop().expect("one successful branch");
             if let Some(imported) = imported_reexport {
                 let resolved_item = resolved

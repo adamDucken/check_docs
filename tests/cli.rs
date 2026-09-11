@@ -1367,7 +1367,7 @@ fn binary_preserves_dev_context_across_external_reexports() {
 
 #[test]
 fn binary_preserves_build_context_across_external_reexports() {
-    let workspace = context_reexport_workspace("[target.'cfg(unix)'.build-dependencies]", true);
+    let workspace = context_reexport_workspace("[build-dependencies]", true);
     fs::create_dir_all(workspace.path().join(".cargo")).unwrap();
     fs::write(
         workspace.path().join(".cargo/config.toml"),
@@ -1394,7 +1394,7 @@ fn binary_preserves_build_context_across_external_reexports() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("crate: origin 0.1.0"), "{stdout}");
     assert!(
-        stdout.contains("dependency: transitive via facade (build (cfg(unix)))"),
+        stdout.contains("dependency: transitive via facade (build)"),
         "{stdout}"
     );
     assert!(stdout.contains("definition: pub struct ContextThing;"));
@@ -1612,7 +1612,7 @@ edition = "2024"
 shared = { path = "../shared" }
 macro_dep = { path = "../macro_dep" }
 
-[target.'cfg(unix)'.build-dependencies]
+[build-dependencies]
 shared = { path = "../shared" }
 "#,
     )
@@ -2132,12 +2132,12 @@ fn binary_matches_raw_cfg_flags_and_cfg_attr_derives_from_a_rustc_wrapper() {
         &workspace,
         "raw_dep",
         "[package]\nname = \"raw_dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-        "#[cfg(any(doc, r#async))]\n#[cfg_attr(r#async, derive(Debug))]\npub struct RawCfg;\n",
+        "#[cfg(any(doc, r#async))]\n#[cfg_attr(r#async, derive(Debug))]\npub struct RawCfg;\n#[cfg(café)] pub struct UnicodeCfg;\n#[cfg(café = \"oui\")] pub struct UnicodeValue;\n",
     );
     let wrapper = workspace.path().join("raw-cfg-wrapper.sh");
     fs::write(
         &wrapper,
-        "#!/bin/sh\ncompiler=\"$1\"\nshift\nexec \"$compiler\" --cfg r#async \"$@\"\n",
+        "#!/bin/sh\ncompiler=\"$1\"\nshift\ncase \" $* \" in\n  *' --crate-name raw_dep '*) set -- --cfg café --cfg 'café=\"oui\"' \"$@\" ;;\nesac\nexec \"$compiler\" --cfg r#async \"$@\"\n",
     )
     .unwrap();
     let mut permissions = fs::metadata(&wrapper).unwrap().permissions();
@@ -2152,7 +2152,7 @@ fn binary_matches_raw_cfg_flags_and_cfg_attr_derives_from_a_rustc_wrapper() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
         .args([
-            "use raw_dep::RawCfg;",
+            "use raw_dep::{RawCfg, UnicodeCfg, UnicodeValue};",
             "--root",
             workspace.path().to_str().unwrap(),
             "--package",
@@ -2174,6 +2174,14 @@ fn binary_matches_raw_cfg_flags_and_cfg_attr_derives_from_a_rustc_wrapper() {
         "{stdout}"
     );
     assert!(stdout.contains("derives: Debug\n"), "{stdout}");
+    assert!(
+        stdout.contains("definition: pub struct UnicodeCfg;"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("definition: pub struct UnicodeValue;"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -2683,11 +2691,11 @@ fn binary_honors_self_import_namespaces_and_primitive_reexports() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("import: use shape_dep::foo;\nitem: module foo"),
+        stdout.contains("import: use shape_dep::foo::{self};\nitem: module foo"),
         "{stdout}"
     );
     assert!(
-        stdout.contains("import: use shape_dep::Bar;\nitem: struct Bar"),
+        stdout.contains("import: use shape_dep::Bar::{self};\nitem: struct Bar"),
         "{stdout}"
     );
     assert!(stdout.contains("item: use MyI32"), "{stdout}");
@@ -3941,4 +3949,53 @@ fn binary_prints_help() {
         .unwrap();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("usage: check-docs"));
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_reuses_unit_graphs_for_batch_and_external_queries() {
+    let workspace = context_reexport_workspace("[dependencies]", false);
+    let shim_dir = workspace.path().join("bin");
+    fs::create_dir(&shim_dir).unwrap();
+    let cargo = Command::new("sh")
+        .args(["-c", "command -v cargo"])
+        .output()
+        .unwrap();
+    assert!(cargo.status.success());
+    let real_cargo = String::from_utf8(cargo.stdout).unwrap();
+    let log = workspace.path().join("cargo.log");
+    let shim = shim_dir.join("cargo");
+    fs::write(
+        &shim,
+        "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = --unit-graph ]; then echo graph >> \"$GRAPH_LOG\"; fi\ndone\nexec \"$REAL_CARGO\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut paths = vec![shim_dir];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let output = Command::new(env!("CARGO_BIN_EXE_check-docs"))
+        .args([
+            "use facade::{ContextThing, ContextThing, ContextThing};",
+            "--root",
+            workspace.path().to_str().unwrap(),
+            "--package",
+            "app",
+        ])
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("REAL_CARGO", real_cargo.trim())
+        .env("GRAPH_LOG", &log)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .matches("definition: pub struct ContextThing;")
+            .count(),
+        3
+    );
+    assert_eq!(fs::read_to_string(log).unwrap(), "graph\n");
 }

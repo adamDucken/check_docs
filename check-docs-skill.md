@@ -90,7 +90,8 @@ names apply to that selected package just as they do for `cargo check -p`.
 - Nested brace imports: `use tower::{service_fn, util::{MapResponseLayer}};`
 - Renamed imports resolve original item: `use syn::File as SynFile;`
 - `self` imports inside non-root braces: `use tokio::sync::{self, mpsc};`.
-  These bind only the parent's type namespace, matching Rust import semantics.
+  These bind only the parent's type namespace, matching Rust import semantics;
+  displayed imports retain `::{self}` so they can be queried again.
 - Modules are supported and labeled: `use tokio::sync::watch;` -> `item: module watch`
 - External crate-root re-exports are labeled as crates and use an explicit unsupported
   definition marker rather than inventing a module declaration.
@@ -140,6 +141,8 @@ Consequences:
 
 - It refuses to create or update `Cargo.lock`; a missing or stale lockfile must be
   refreshed explicitly with `cargo check` or `cargo build`.
+- Unit graphs are reused within one query for matching Cargo invocations, including
+  batch imports and external routes; distinct dev graphs remain separate.
 - It obtains the dependency's context-specific feature unit from Cargo's unit graph
   and emits JSON from that exact compiler invocation, including non-workspace dependencies.
 - `--features`, `--all-features`, and `--no-default-features` are forwarded to
@@ -186,8 +189,8 @@ Consequences:
   the matched compiler-wrapper invocation, so documentation-only platform APIs and
   disabled conditional derives are excluded while APIs and derives valid for the
   selected target/profile/features remain available. Raw cfg identifiers are matched
-  against rustc's normalized cfg keys while their raw spelling remains intact in
-  rendered Rust paths.
+  against rustc's normalized cfg keys, including Unicode identifiers, while their
+  raw spelling remains intact in rendered Rust paths.
 - It uses exact versions from the project lockfile/resolution.
 - It respects dependency renames from `Cargo.toml`.
 - It uses exactly the features enabled by the target project.

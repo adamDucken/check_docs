@@ -3,7 +3,7 @@ use crate::resolver::{DependencyContext, is_library_target, package_spec};
 use cargo_metadata::{DependencyKind, Metadata, Package, Target};
 use rustdoc_types::{Crate, FORMAT_VERSION};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -64,6 +64,7 @@ pub(crate) struct GenerationSession {
     generation_root: PathBuf,
     target_dir: PathBuf,
     next_unit: usize,
+    unit_graphs: HashMap<(PathBuf, Vec<OsString>), UnitGraph>,
     _lock: JsonGenerationLock,
 }
 
@@ -76,6 +77,7 @@ impl GenerationSession {
             generation_root,
             target_dir,
             next_unit: 0,
+            unit_graphs: HashMap::new(),
             _lock: lock,
         })
     }
@@ -579,11 +581,7 @@ impl RustcCfg {
                 if let Ok(value) = syn::parse_str::<syn::LitStr>(value) {
                     cfg.values.insert((name.to_string(), value.value()));
                 }
-            } else if !line.is_empty()
-                && line
-                    .chars()
-                    .all(|character| character == '_' || character.is_ascii_alphanumeric())
-            {
+            } else if !line.is_empty() {
                 cfg.flags.insert(line.to_string());
             }
         }
@@ -1914,7 +1912,10 @@ fn select_configured_targets(targets: ConfiguredCargoTargets) -> Result<Option<S
     }
 }
 
-pub(crate) fn resolved_unit(request: CargoUnitRequest<'_>) -> Result<CargoUnitIdentity, String> {
+pub(crate) fn resolved_unit(
+    generation: &mut GenerationSession,
+    request: CargoUnitRequest<'_>,
+) -> Result<CargoUnitIdentity, String> {
     let CargoUnitRequest {
         manifest_path,
         metadata,
@@ -1955,38 +1956,54 @@ pub(crate) fn resolved_unit(request: CargoUnitRequest<'_>) -> Result<CargoUnitId
     if let Some(target_triple) = &target_selection.command_line_override {
         command.args(["--target", target_triple]);
     }
-    let output = command.output().map_err(|err| {
-        format!(
-            "failed to run cargo +{toolchain} to resolve the exact feature unit for {} {}: {err}",
-            package.name, package.version
-        )
-    })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let hint = if is_lockfile_failure(&stderr) {
-            "; Cargo.lock is missing or stale; run `cargo check` or `cargo build` to refresh it, then retry"
-        } else {
-            ""
-        };
-        return Err(format!(
-            "failed to resolve the exact Cargo feature unit for {} {} without changing Cargo.lock: {}{hint}",
-            package.name,
-            package.version,
-            stderr.trim()
-        ));
-    }
-    let graph: UnitGraph = serde_json::from_slice(&output.stdout).map_err(|err| {
-        format!(
-            "failed to parse Cargo unit graph while resolving features for {} {}: {err}",
-            package.name, package.version
-        )
-    })?;
-    if graph.version != 1 {
-        return Err(format!(
-            "Cargo unit graph version {} is unsupported; supported: 1",
-            graph.version
-        ));
-    }
+    // The command captures root, toolchain, target, features, and dev/build graph mode.
+    // Environment and Cargo configuration remain fixed for this query session.
+    let graph_key = (
+        command
+            .get_current_dir()
+            .unwrap_or(Path::new(""))
+            .to_path_buf(),
+        command.get_args().map(OsStr::to_os_string).collect(),
+    );
+    let graph = match generation.unit_graphs.entry(graph_key) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let output = command.output().map_err(|err| {
+                format!(
+                    "failed to run cargo +{toolchain} to resolve the exact feature unit for {} {}: {err}",
+                    package.name, package.version
+                )
+            })?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let hint = if is_lockfile_failure(&stderr) {
+                    "; Cargo.lock is missing or stale; run `cargo check` or `cargo build` to refresh it, then retry"
+                } else {
+                    ""
+                };
+                return Err(format!(
+                    "failed to resolve the exact Cargo feature unit for {} {} without changing Cargo.lock: {}{hint}",
+                    package.name,
+                    package.version,
+                    stderr.trim()
+                ));
+            }
+            let graph: UnitGraph = serde_json::from_slice(&output.stdout).map_err(|err| {
+                format!(
+                    "failed to parse Cargo unit graph while resolving features for {} {}: {err}",
+                    package.name, package.version
+                )
+            })?;
+            if graph.version != 1 {
+                return Err(format!(
+                    "Cargo unit graph version {} is unsupported; supported: 1",
+                    graph.version
+                ));
+            }
+
+            entry.insert(graph)
+        }
+    };
 
     let expected_mode = if only_dev || host_unit {
         "build"
@@ -1998,19 +2015,15 @@ pub(crate) fn resolved_unit(request: CargoUnitRequest<'_>) -> Result<CargoUnitId
     } else {
         target_selection.cargo_platform.as_deref()
     };
-    let mut candidates = units_for_context_edges(
-        &graph,
-        metadata,
-        root_package,
-        package,
-        target,
-        &contexts[0],
-    )
-    .into_iter()
-    .filter_map(|index| graph.units.get(index))
-    .filter(|unit| unit.mode == expected_mode && unit.platform.as_deref() == expected_platform)
-    .map(unit_identity)
-    .collect::<Vec<_>>();
+    let mut candidates =
+        units_for_context_edges(graph, metadata, root_package, package, target, &contexts[0])
+            .into_iter()
+            .filter_map(|index| graph.units.get(index))
+            .filter(|unit| {
+                unit.mode == expected_mode && unit.platform.as_deref() == expected_platform
+            })
+            .map(unit_identity)
+            .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
         left.features
             .cmp(&right.features)
@@ -2750,7 +2763,10 @@ mod tests {
 
     #[test]
     fn cfg_lookup_normalizes_raw_identifiers_without_changing_rendered_paths() {
-        let cfg = RustcCfg::parse(b"async\nmode=\"fast\"\n");
+        let cfg = RustcCfg::parse("async\nmode=\"fast\"\ncafé\ncafé=\"oui\"\n".as_bytes());
+
+        assert!(cfg_expression_matches("café", &cfg));
+        assert!(cfg_expression_matches("café = \"oui\"", &cfg));
 
         assert!(cfg_expression_matches("r#async", &cfg));
         assert!(cfg_expression_matches("r#mode = \"fast\"", &cfg));

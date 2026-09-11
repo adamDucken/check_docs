@@ -722,16 +722,19 @@ fn load_docs_cached(
     generation: &mut rustdoc_json::GenerationSession,
     request: DependencyDocsRequest<'_>,
 ) -> Result<LoadedDocs, String> {
-    let unit = rustdoc_json::resolved_unit(rustdoc_json::CargoUnitRequest {
-        manifest_path: request.manifest_path,
-        metadata: request.metadata,
-        root_package: request.root_package,
-        package: request.package,
-        target: request.target,
-        contexts: request.contexts,
-        target_selection: request.target_selection,
-        feature_selection: request.feature_selection,
-    })?;
+    let unit = rustdoc_json::resolved_unit(
+        generation,
+        rustdoc_json::CargoUnitRequest {
+            manifest_path: request.manifest_path,
+            metadata: request.metadata,
+            root_package: request.root_package,
+            package: request.package,
+            target: request.target,
+            contexts: request.contexts,
+            target_selection: request.target_selection,
+            feature_selection: request.feature_selection,
+        },
+    )?;
     let key = rustdoc_cache_key(request.package, request.target, &unit);
     if let Some(cached) = cache.get(&key) {
         return Ok(cached.clone());
@@ -784,6 +787,9 @@ fn format_use(import: &ImportPath) -> String {
     let mut parts = vec![import.crate_name.clone()];
     parts.extend(import.segments.clone());
     parts.push(import.item.clone());
+    if import.namespace.is_some() {
+        parts.push("{self}".to_string());
+    }
     format!("use {};", parts.join("::"))
 }
 
@@ -916,6 +922,18 @@ mod tests {
     use rustdoc_types::{Crate, Id, Item, ItemEnum, Module, Struct, StructKind, Visibility};
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    #[test]
+    fn displayed_import_preserves_namespace_on_round_trip() {
+        for line in ["use dep::foo::{self};", "use dep::foo;"] {
+            let original = imports::parse_use_line(line).unwrap();
+            let displayed = format_use(&original);
+            assert_eq!(displayed, line);
+            let reparsed = imports::parse_use_line(&displayed).unwrap();
+            assert_eq!(reparsed.full_path(), original.full_path());
+            assert_eq!(reparsed.namespace, original.namespace);
+        }
+    }
 
     fn doc(name: &str, docs: Vec<String>) -> SymbolDoc {
         SymbolDoc {

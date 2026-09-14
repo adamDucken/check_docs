@@ -17,7 +17,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 use std::sync::Arc;
-use symbols::{SymbolDoc, SymbolError, SymbolReport};
+use symbols::{NestedDoc, SymbolDoc, SymbolError, SymbolReport};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RustdocCacheKey {
@@ -29,6 +29,12 @@ struct RustdocCacheKey {
 type LoadedDocs = (Arc<rustdoc_types::Crate>, PathBuf);
 type RustdocCache = HashMap<RustdocCacheKey, LoadedDocs>;
 
+struct SelectedDocs {
+    krate: Arc<rustdoc_types::Crate>,
+    json_path: PathBuf,
+    unit: rustdoc_json::CargoUnitSelection,
+}
+
 struct DependencyDocsRequest<'a> {
     manifest_path: &'a Path,
     metadata: &'a Metadata,
@@ -36,6 +42,7 @@ struct DependencyDocsRequest<'a> {
     package: &'a Package,
     target: &'a Target,
     contexts: &'a [DependencyContext],
+    parent: Option<&'a rustdoc_json::CargoParentUnit>,
     target_selection: &'a rustdoc_json::CargoTargetSelection,
     feature_selection: &'a FeatureSelection,
 }
@@ -149,6 +156,7 @@ fn run() -> Result<(), String> {
     )?;
     let base_metadata = cargo_metadata_for(
         &manifest_path,
+        &manifest_path,
         &target_selection.effective_triple,
         &FeatureSelection::default(),
         &toolchain,
@@ -164,6 +172,7 @@ fn run() -> Result<(), String> {
     } else {
         cargo_metadata_for(
             &metadata_manifest,
+            &manifest_path,
             &target_selection.effective_triple,
             &args.feature_selection,
             &toolchain,
@@ -172,6 +181,7 @@ fn run() -> Result<(), String> {
     let host_metadata = if args.include_build && host_target != target_selection.effective_triple {
         cargo_metadata_for(
             &metadata_manifest,
+            &manifest_path,
             &host_target,
             &args.feature_selection,
             &toolchain,
@@ -227,6 +237,7 @@ fn run() -> Result<(), String> {
         {
             let diagnostic_host_metadata = cargo_metadata_for(
                 &metadata_manifest,
+                &manifest_path,
                 &host_target,
                 &args.feature_selection,
                 &toolchain,
@@ -267,6 +278,7 @@ fn run() -> Result<(), String> {
                     dependency.package,
                     dependency.target,
                     vec![context],
+                    None,
                     &target_selection,
                     &args.feature_selection,
                     import,
@@ -321,6 +333,7 @@ fn run() -> Result<(), String> {
 
 fn cargo_metadata_for(
     manifest_path: &Path,
+    invocation_manifest: &Path,
     platform: &str,
     features: &FeatureSelection,
     toolchain: &str,
@@ -329,7 +342,9 @@ fn cargo_metadata_for(
     command.cargo_path("cargo");
     command.manifest_path(manifest_path);
     command.env("RUSTUP_TOOLCHAIN", toolchain);
-    if let Some(invocation_dir) = manifest_path.parent() {
+    // The member manifest scopes features; the original invocation directory
+    // must still govern Cargo configuration, just as it does for unit graphs.
+    if let Some(invocation_dir) = invocation_manifest.parent() {
         command.current_dir(invocation_dir);
     }
     let mut options = vec![
@@ -374,6 +389,7 @@ fn resolve_query(
     package: &Package,
     target: &Target,
     contexts: Vec<DependencyContext>,
+    parent: Option<rustdoc_json::CargoParentUnit>,
     target_selection: &rustdoc_json::CargoTargetSelection,
     feature_selection: &FeatureSelection,
     import: &ImportPath,
@@ -388,7 +404,7 @@ fn resolve_query(
         )));
     }
     let context_metadata = metadata.for_contexts(&contexts);
-    let (krate, json_path) = load_docs_cached(
+    let selected_docs = load_docs_cached(
         cache,
         generation,
         DependencyDocsRequest {
@@ -398,11 +414,18 @@ fn resolve_query(
             package,
             target,
             contexts: &contexts,
+            parent: parent.as_ref(),
             target_selection,
             feature_selection,
         },
     )
     .map_err(QueryError::Incomplete)?;
+    let krate = selected_docs.krate;
+    let json_path = selected_docs.json_path;
+    let child_parent = rustdoc_json::CargoParentUnit {
+        package_id: package.id.to_string(),
+        graph_index: selected_docs.unit.graph_index,
+    };
     let local_result = symbols::find_symbol_report(&krate, import);
     if let Err(SymbolError::Ambiguous(message)) = &local_result {
         return Err(QueryError::Incomplete(format!(
@@ -526,6 +549,7 @@ fn resolve_query(
                 external_dep.package,
                 external_dep.target,
                 external_dep.contexts,
+                Some(child_parent.clone()),
                 target_selection,
                 feature_selection,
                 &external_import,
@@ -542,12 +566,15 @@ fn resolve_query(
                     package: external_dep.package,
                     target: external_dep.target,
                     contexts: &external_dep.contexts,
+                    parent: Some(&child_parent),
                     target_selection,
                     feature_selection,
                 },
             )
             .map_err(QueryError::Incomplete)
-            .and_then(|(external_krate, external_json_path)| {
+            .and_then(|external_docs| {
+                let external_krate = external_docs.krate;
+                let external_json_path = external_docs.json_path;
                 Ok(ResolvedQuery {
                     symbols: SymbolReport {
                         resolved_id: external_krate.root,
@@ -588,7 +615,11 @@ fn resolve_query(
             .iter()
             .filter(|(via_glob, resolved)| {
                 !*via_glob
-                    || symbols::report_has_unshadowed_namespace(&local_symbols, &resolved.symbols)
+                    || symbols::report_has_unshadowed_namespace(
+                        &local_symbols,
+                        &resolved.symbols,
+                        import.namespace,
+                    )
             })
             .map(|(_, resolved)| symbols::report_item_label(&resolved.symbols))
             .collect::<Vec<_>>();
@@ -646,6 +677,7 @@ fn resolve_query(
                         || symbols::report_has_unshadowed_namespace(
                             named_report,
                             &resolved.symbols,
+                            import.namespace,
                         ))
             })
             .map(|(_, (_, resolved))| symbols::report_item_label(&resolved.symbols))
@@ -721,23 +753,27 @@ fn load_docs_cached(
     cache: &mut RustdocCache,
     generation: &mut rustdoc_json::GenerationSession,
     request: DependencyDocsRequest<'_>,
-) -> Result<LoadedDocs, String> {
+) -> Result<SelectedDocs, String> {
     let unit = rustdoc_json::resolved_unit(
         generation,
         rustdoc_json::CargoUnitRequest {
             manifest_path: request.manifest_path,
-            metadata: request.metadata,
             root_package: request.root_package,
             package: request.package,
             target: request.target,
             contexts: request.contexts,
+            parent: request.parent,
             target_selection: request.target_selection,
             feature_selection: request.feature_selection,
         },
     )?;
-    let key = rustdoc_cache_key(request.package, request.target, &unit);
+    let key = rustdoc_cache_key(request.package, request.target, &unit.identity);
     if let Some(cached) = cache.get(&key) {
-        return Ok(cached.clone());
+        return Ok(SelectedDocs {
+            krate: Arc::clone(&cached.0),
+            json_path: cached.1.clone(),
+            unit,
+        });
     }
 
     let (krate, json_path) = rustdoc_json::load_or_generate(
@@ -751,12 +787,16 @@ fn load_docs_cached(
             contexts: request.contexts,
             target_selection: request.target_selection,
             feature_selection: request.feature_selection,
-            unit: &unit,
+            unit: &unit.identity,
         },
     )?;
     let loaded = (Arc::new(krate), json_path);
     cache.insert(key, loaded.clone());
-    Ok(loaded)
+    Ok(SelectedDocs {
+        krate: loaded.0,
+        json_path: loaded.1,
+        unit,
+    })
 }
 
 fn rustdoc_cache_key(
@@ -859,14 +899,20 @@ fn push_doc(output: &mut String, label: &str, found: &SymbolDoc) {
     }
     if !found.details.is_empty() {
         output.push_str("details:\n");
-        for line in &found.details {
-            output.push_str(&format!("  {line}\n"));
+        for detail in &found.details {
+            push_nested_doc(output, detail, 2);
         }
     }
     if !found.methods.is_empty() {
         output.push_str("methods:\n");
-        for line in &found.methods {
-            output.push_str(&format!("  {line}\n"));
+        for method in &found.methods {
+            push_nested_doc(output, method, 2);
+        }
+    }
+    if !found.associated_constants.is_empty() {
+        output.push_str("associated constants:\n");
+        for constant in &found.associated_constants {
+            push_nested_doc(output, constant, 2);
         }
     }
     if !found.impls.is_empty() {
@@ -881,6 +927,46 @@ fn push_doc(output: &mut String, label: &str, found: &SymbolDoc) {
         output.push_str("docs:\n");
         for line in &found.docs {
             output.push_str(&format!("  {line}\n"));
+        }
+    }
+}
+
+fn push_nested_doc(output: &mut String, doc: &NestedDoc, indent: usize) {
+    let padding = " ".repeat(indent);
+    output.push_str(&format!("{padding}{}\n", doc.definition));
+    if let Some(deprecation) = &doc.deprecation {
+        output.push_str(&format!("{padding}  deprecation:\n"));
+        if let Some(since) = &deprecation.since {
+            output.push_str(&format!("{padding}    since: {since}\n"));
+        }
+        if let Some(note) = &deprecation.note {
+            output.push_str(&format!("{padding}    note: {note}\n"));
+        }
+        if deprecation.since.is_none() && deprecation.note.is_none() {
+            output.push_str(&format!("{padding}    (no details)\n"));
+        }
+    }
+    if !doc.attributes.is_empty() {
+        output.push_str(&format!("{padding}  attributes:\n"));
+        for attribute in &doc.attributes {
+            output.push_str(&format!("{padding}    {}\n", attribute.render()));
+        }
+    }
+    if !doc.docs.is_empty() {
+        output.push_str(&format!("{padding}  docs:\n"));
+        for line in &doc.docs {
+            output.push_str(&format!("{padding}    {line}\n"));
+        }
+    }
+    let documented_children = doc
+        .children
+        .iter()
+        .filter(|child| child.has_metadata())
+        .collect::<Vec<_>>();
+    if !documented_children.is_empty() {
+        output.push_str(&format!("{padding}  members:\n"));
+        for child in documented_children {
+            push_nested_doc(output, child, indent + 4);
         }
     }
 }
@@ -936,6 +1022,13 @@ mod tests {
     }
 
     fn doc(name: &str, docs: Vec<String>) -> SymbolDoc {
+        let nested = |definition: &str| NestedDoc {
+            definition: definition.into(),
+            deprecation: None,
+            attributes: Vec::new(),
+            docs: Vec::new(),
+            children: Vec::new(),
+        };
         SymbolDoc {
             path: PathBuf::from("/tmp/src/lib.rs"),
             line: 7,
@@ -944,10 +1037,11 @@ mod tests {
             definition: format!("pub struct {name};"),
             deprecation: None,
             attributes: Vec::new(),
-            details: vec!["field: usize".into()],
+            details: vec![nested("field: usize")],
             docs,
             derives: vec!["Debug".into()],
-            methods: vec!["pub fn new() -> Self".into()],
+            methods: vec![nested("pub fn new() -> Self")],
+            associated_constants: Vec::new(),
             impls: vec!["impl Clone".into()],
             namespaces: 1,
         }

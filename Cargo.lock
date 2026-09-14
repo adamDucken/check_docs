@@ -57,6 +57,7 @@ name = "check-docs"
 version = "0.1.0"
 dependencies = [
  "cargo_metadata",
+ "proc-macro2",
  "rustdoc-types",
  "serde",
  "serde_json",

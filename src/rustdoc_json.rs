@@ -37,6 +37,18 @@ pub(crate) struct CargoUnitIdentity {
     pub(crate) profile: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CargoUnitSelection {
+    pub(crate) identity: CargoUnitIdentity,
+    pub(crate) graph_index: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CargoParentUnit {
+    pub(crate) package_id: String,
+    pub(crate) graph_index: usize,
+}
+
 pub(crate) struct RustdocRequest<'a> {
     pub(crate) manifest_path: PathBuf,
     pub(crate) metadata: &'a Metadata,
@@ -51,11 +63,11 @@ pub(crate) struct RustdocRequest<'a> {
 
 pub(crate) struct CargoUnitRequest<'a> {
     pub(crate) manifest_path: &'a Path,
-    pub(crate) metadata: &'a Metadata,
     pub(crate) root_package: &'a Package,
     pub(crate) package: &'a Package,
     pub(crate) target: &'a Target,
     pub(crate) contexts: &'a [DependencyContext],
+    pub(crate) parent: Option<&'a CargoParentUnit>,
     pub(crate) target_selection: &'a CargoTargetSelection,
     pub(crate) feature_selection: &'a FeatureSelection,
 }
@@ -107,16 +119,6 @@ pub(crate) fn load_or_generate(
             request.manifest_path.display()
         )
     })?;
-    let invocation_dir = request
-        .manifest_path
-        .parent()
-        .ok_or_else(|| {
-            format!(
-                "manifest path {} has no parent",
-                request.manifest_path.display()
-            )
-        })?
-        .to_path_buf();
     let target_dir = generation.next_target_dir(request.metadata)?;
     let mut doc_dir = target_dir.clone();
     if let Some(platform) = &request.unit.platform {
@@ -131,10 +133,11 @@ pub(crate) fn load_or_generate(
         json_path.parent().expect("JSON path has doc directory"),
     )?;
     let mut krate = load_valid_json(&json_path, request.package)?;
+    let compiler_directory = load_import_probe(&json_path)?.directory;
     let cfg = load_rustc_cfg(&json_path.with_extension("cfg"))?;
-    apply_non_doc_cfg(&mut krate, &cfg);
+    normalize_span_paths(&mut krate, &compiler_directory);
+    apply_non_doc_cfg(&mut krate, &cfg)?;
     strip_private_fields(&mut krate);
-    normalize_span_paths(&mut krate, &invocation_dir);
     Ok((krate, json_path))
 }
 
@@ -607,12 +610,40 @@ fn load_rustc_cfg(path: &Path) -> Result<RustcCfg, String> {
     Ok(RustcCfg::parse(&output))
 }
 
-fn apply_non_doc_cfg(krate: &mut Crate, cfg: &RustcCfg) {
-    let unavailable = krate
+fn apply_non_doc_cfg(krate: &mut Crate, cfg: &RustcCfg) -> Result<(), String> {
+    let mut unavailable = krate
         .index
         .iter()
         .filter_map(|(id, item)| (!item_matches_cfg(item, cfg)).then_some(*id))
         .collect::<HashSet<_>>();
+    let mut pending = unavailable.iter().copied().collect::<Vec<_>>();
+    while let Some(id) = pending.pop() {
+        let item = &krate.index[&id];
+        let mut children = lexical_children(&item.inner);
+        if matches!(item.inner, rustdoc_types::ItemEnum::Module(_)) {
+            // Rustdoc omits impls from Module.items and records only the header
+            // span for inline modules. Recover their body before pruning the
+            // impl references attached to types declared elsewhere.
+            let span = module_body_span(item)?;
+            children.extend(krate.index.iter().filter_map(|(child_id, child)| {
+                child
+                    .span
+                    .as_ref()
+                    .filter(|child_span| {
+                        child.crate_id == item.crate_id
+                            && child_span.filename == span.filename
+                            && child_span.begin >= span.begin
+                            && child_span.end <= span.end
+                    })
+                    .map(|_| *child_id)
+            }));
+        }
+        for child in children {
+            if krate.index.contains_key(&child) && unavailable.insert(child) {
+                pending.push(child);
+            }
+        }
+    }
     for item in krate.index.values_mut() {
         activate_cfg_attr_derives(&mut item.attrs, cfg);
     }
@@ -626,6 +657,75 @@ fn apply_non_doc_cfg(krate: &mut Crate, cfg: &RustcCfg) {
     for item in krate.index.values_mut() {
         prune_unavailable_references(&mut item.inner, &unavailable);
     }
+    Ok(())
+}
+
+fn lexical_children(inner: &rustdoc_types::ItemEnum) -> Vec<rustdoc_types::Id> {
+    use rustdoc_types::{ItemEnum, StructKind, VariantKind};
+    match inner {
+        ItemEnum::Module(module) => module.items.clone(),
+        ItemEnum::Struct(struct_) => match &struct_.kind {
+            StructKind::Plain { fields, .. } => fields.clone(),
+            StructKind::Tuple(fields) => fields.iter().flatten().copied().collect(),
+            StructKind::Unit => Vec::new(),
+        },
+        ItemEnum::Union(union_) => union_.fields.clone(),
+        ItemEnum::Enum(enum_) => enum_.variants.clone(),
+        ItemEnum::Variant(variant) => match &variant.kind {
+            VariantKind::Struct { fields, .. } => fields.clone(),
+            VariantKind::Tuple(fields) => fields.iter().flatten().copied().collect(),
+            VariantKind::Plain => Vec::new(),
+        },
+        ItemEnum::Trait(trait_) => trait_.items.clone(),
+        ItemEnum::Impl(impl_) => impl_.items.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn module_body_span(item: &rustdoc_types::Item) -> Result<rustdoc_types::Span, String> {
+    let incomplete = |reason: String| {
+        format!(
+            "cannot establish non-doc lexical availability for module '{}': {reason}",
+            item.name.as_deref().unwrap_or("<unnamed>")
+        )
+    };
+    let mut span = item
+        .span
+        .clone()
+        .ok_or_else(|| incomplete("source span missing".into()))?;
+    let source = fs::read_to_string(&span.filename)
+        .map_err(|error| incomplete(format!("{}: {error}", span.filename.display())))?;
+    let file = syn::parse_file(&source).map_err(|error| incomplete(error.to_string()))?;
+    struct ModuleBody<'a> {
+        name: Option<&'a str>,
+        end: (usize, usize),
+        body_end: Option<(usize, usize)>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for ModuleBody<'_> {
+        fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+            let end = module.ident.span().end();
+            if self.name.is_some_and(|name| {
+                crate::imports::identifier_key(&module.ident.to_string())
+                    == crate::imports::identifier_key(name)
+            }) && self.end == (end.line, end.column + 1)
+                && let Some((brace, _)) = &module.content
+            {
+                let end = brace.span.close().end();
+                self.body_end = Some((end.line, end.column + 1));
+            }
+            syn::visit::visit_item_mod(self, module);
+        }
+    }
+    let mut visitor = ModuleBody {
+        name: item.name.as_deref(),
+        end: span.end,
+        body_end: None,
+    };
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+    if let Some(end) = visitor.body_end {
+        span.end = end;
+    }
+    Ok(span)
 }
 
 fn activate_cfg_attr_derives(attrs: &mut Vec<rustdoc_types::Attribute>, cfg: &RustcCfg) {
@@ -997,14 +1097,22 @@ struct ImportProbe {
     arguments: Vec<OsString>,
 }
 
+fn load_import_probe(json_path: &Path) -> Result<ImportProbe, String> {
+    serde_json::from_slice(
+        &fs::read(json_path.with_extension("probe")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
 fn save_import_probe(
+    artifact_compiler: Vec<OsString>,
     compiler: Vec<OsString>,
     arguments: &[OsString],
     path: &Path,
 ) -> Result<(), String> {
     let directory = env::current_dir().map_err(|error| error.to_string())?;
-    let output = Command::new(&compiler[0])
-        .args(&compiler[1..])
+    let output = Command::new(&artifact_compiler[0])
+        .args(&artifact_compiler[1..])
         .args(arguments)
         .arg("--print=file-names")
         .output()
@@ -1068,10 +1176,7 @@ pub(crate) fn validate_import(
     json_path: &Path,
     import: &crate::imports::ImportPath,
 ) -> Result<(), String> {
-    let probe: ImportProbe = serde_json::from_slice(
-        &fs::read(json_path.with_extension("probe")).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
+    let probe = load_import_probe(json_path)?;
     let source = json_path.with_extension("probe.rs");
     let mut parts = import.segments.clone();
     parts.push(import.item.clone());
@@ -1197,12 +1302,13 @@ pub(crate) fn run_rustc_wrapper() -> ! {
         );
         std::process::exit(1);
     }
-    let mut probe_compiler = original_wrapper.iter().cloned().collect::<Vec<_>>();
-    probe_compiler.extend_from_slice(
+    let mut artifact_compiler = original_wrapper.iter().cloned().collect::<Vec<_>>();
+    artifact_compiler.extend_from_slice(
         &command_arguments[..command_arguments.len() - invocation.arguments.len()],
     );
     if let Err(error) = save_import_probe(
-        probe_compiler,
+        artifact_compiler,
+        import_probe_compiler(&invocation),
         invocation.arguments,
         &cfg_path.with_extension("probe"),
     ) {
@@ -1260,6 +1366,13 @@ struct RustcInvocation<'a> {
     workspace_wrapper: Option<&'a OsStr>,
     rustc: &'a OsStr,
     arguments: &'a [OsString],
+}
+
+fn import_probe_compiler(invocation: &RustcInvocation<'_>) -> Vec<OsString> {
+    // Cargo-scoped wrappers already produced the dependency artifact. The probe
+    // only imports it, so invoking rustc directly avoids replaying wrappers
+    // without Cargo's per-unit environment.
+    vec![invocation.rustc.to_owned()]
 }
 
 fn rustc_invocation(arguments: &[OsString]) -> RustcInvocation<'_> {
@@ -1915,14 +2028,14 @@ fn select_configured_targets(targets: ConfiguredCargoTargets) -> Result<Option<S
 pub(crate) fn resolved_unit(
     generation: &mut GenerationSession,
     request: CargoUnitRequest<'_>,
-) -> Result<CargoUnitIdentity, String> {
+) -> Result<CargoUnitSelection, String> {
     let CargoUnitRequest {
         manifest_path,
-        metadata,
         root_package,
         package,
         target,
         contexts,
+        parent,
         target_selection,
         feature_selection,
     } = request;
@@ -2016,20 +2129,25 @@ pub(crate) fn resolved_unit(
         target_selection.cargo_platform.as_deref()
     };
     let mut candidates =
-        units_for_context_edges(graph, metadata, root_package, package, target, &contexts[0])
+        units_for_context_edges(graph, root_package, package, target, &contexts[0], parent)
             .into_iter()
-            .filter_map(|index| graph.units.get(index))
+            .filter_map(|index| graph.units.get(index).map(|unit| (index, unit)))
             .filter(|unit| {
-                unit.mode == expected_mode && unit.platform.as_deref() == expected_platform
+                unit.1.mode == expected_mode && unit.1.platform.as_deref() == expected_platform
             })
-            .map(unit_identity)
+            .map(|(graph_index, unit)| CargoUnitSelection {
+                identity: unit_identity(unit),
+                graph_index,
+            })
             .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
-        left.features
-            .cmp(&right.features)
-            .then_with(|| left.profile.cmp(&right.profile))
+        left.identity
+            .features
+            .cmp(&right.identity.features)
+            .then_with(|| left.identity.profile.cmp(&right.identity.profile))
+            .then_with(|| left.graph_index.cmp(&right.graph_index))
     });
-    candidates.dedup();
+    candidates.dedup_by_key(|candidate| candidate.graph_index);
     match candidates.as_slice() {
         [unit] => Ok(unit.clone()),
         [] => Err(format!(
@@ -2053,11 +2171,11 @@ pub(crate) fn resolved_unit(
 
 fn units_for_context_edges(
     graph: &UnitGraph,
-    metadata: &Metadata,
     root_package: &Package,
     package: &Package,
     target: &Target,
     context: &DependencyContext,
+    parent: Option<&CargoParentUnit>,
 ) -> Vec<usize> {
     let root_id = root_package.id.to_string();
     let roots = graph
@@ -2071,39 +2189,29 @@ fn units_for_context_edges(
                 .is_some_and(|unit| unit.pkg_id == root_id)
         })
         .collect::<Vec<_>>();
-    let (anchors, exclude_custom_build) = if context.kind == DependencyKind::Build {
-        (
-            reachable_units(graph, &roots, false)
-                .into_iter()
-                .filter(|index| {
-                    graph
-                        .units
-                        .get(*index)
-                        .is_some_and(|unit| unit.pkg_id == root_id && is_custom_build_unit(unit))
-                })
-                .collect::<Vec<_>>(),
-            false,
-        )
-    } else {
-        (roots, true)
-    };
-
-    let parents = if let Some(via) = &context.via {
-        let parent_ids = metadata
-            .packages
-            .iter()
-            .filter(|candidate| candidate.name == *via)
-            .map(|candidate| candidate.id.to_string())
-            .collect::<HashSet<_>>();
-        reachable_units(graph, &anchors, exclude_custom_build)
+    let anchors = if context.kind == DependencyKind::Build {
+        reachable_units(graph, &roots, false)
             .into_iter()
             .filter(|index| {
                 graph
                     .units
                     .get(*index)
-                    .is_some_and(|unit| parent_ids.contains(&unit.pkg_id))
+                    .is_some_and(|unit| unit.pkg_id == root_id && is_custom_build_unit(unit))
             })
             .collect::<Vec<_>>()
+    } else {
+        roots
+    };
+
+    let parents = if let Some(parent) = parent {
+        graph
+            .units
+            .get(parent.graph_index)
+            .filter(|unit| unit.pkg_id == parent.package_id)
+            .map(|_| vec![parent.graph_index])
+            .unwrap_or_default()
+    } else if context.via.is_some() {
+        Vec::new()
     } else {
         anchors
     };
@@ -2524,6 +2632,10 @@ mod tests {
         );
         assert_eq!(invocation.rustc, OsStr::new("/toolchain/bin/rustc"));
         assert_eq!(invocation.arguments, &nested[2..]);
+        assert_eq!(
+            import_probe_compiler(&invocation),
+            [OsString::from("/toolchain/bin/rustc")]
+        );
     }
 
     #[test]
@@ -2667,6 +2779,21 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_module_without_source_fails_instead_of_leaking_impls() {
+        let mut docs = minimal_crate(None, FORMAT_VERSION);
+        let root = docs.index.get_mut(&docs.root).unwrap();
+        root.attrs
+            .push(rustdoc_types::Attribute::Other("#[cfg(doc)]".into()));
+        root.span = None;
+        let error = apply_non_doc_cfg(&mut docs, &RustcCfg::parse(b"")).unwrap_err();
+        assert!(
+            error.contains("cannot establish non-doc lexical availability"),
+            "{error}"
+        );
+        assert!(error.contains("source span missing"), "{error}");
+    }
+
+    #[test]
     fn retained_cfgs_are_evaluated_without_rustdocs_doc_flag() {
         let mut docs = minimal_crate(None, FORMAT_VERSION);
         let root = docs.root;
@@ -2682,10 +2809,13 @@ mod tests {
                 "#[<cfg>(any(doc, windows))]".into(),
             )],
             deprecation: None,
-            inner: ItemEnum::Module(Module {
-                is_crate: false,
-                items: Vec::new(),
-                is_stripped: false,
+            inner: ItemEnum::Struct(rustdoc_types::Struct {
+                kind: rustdoc_types::StructKind::Unit,
+                generics: rustdoc_types::Generics {
+                    params: Vec::new(),
+                    where_predicates: Vec::new(),
+                },
+                impls: Vec::new(),
             }),
         };
         let unix_only = Item {
@@ -2714,7 +2844,7 @@ mod tests {
         root_module.items = vec![Id(2), Id(3), Id(4)];
         let cfg = RustcCfg::parse(b"unix\ntarget_os=\"linux\"\npanic=\"unwind\"\n");
 
-        apply_non_doc_cfg(&mut docs, &cfg);
+        apply_non_doc_cfg(&mut docs, &cfg).unwrap();
 
         let ItemEnum::Module(root_module) = &docs.index[&root].inner else {
             panic!("crate root is a module");
@@ -3032,11 +3162,51 @@ mod tests {
         };
 
         assert_eq!(
-            units_for_context_edges(&graph, &metadata, root, dependency, target, &dev),
+            units_for_context_edges(&graph, root, dependency, target, &dev, None),
             vec![1]
         );
         assert_eq!(
-            units_for_context_edges(&graph, &metadata, root, dependency, target, &build),
+            units_for_context_edges(&graph, root, dependency, target, &build, None),
+            vec![3]
+        );
+
+        let facade_one = "facade 1.0.0 (path+file:///one)".to_string();
+        let facade_two = "facade 2.0.0 (path+file:///two)".to_string();
+        let graph = UnitGraph {
+            version: 1,
+            roots: vec![0],
+            units: vec![
+                unit(root.id.to_string(), "check-docs", "bin", &[], &[1, 2]),
+                unit(facade_one.clone(), "facade", "lib", &["one"], &[3]),
+                unit(facade_two, "facade", "lib", &["two"], &[4]),
+                unit(
+                    dependency.id.to_string(),
+                    &target.name,
+                    "lib",
+                    &["through-one"],
+                    &[],
+                ),
+                unit(
+                    dependency.id.to_string(),
+                    &target.name,
+                    "lib",
+                    &["through-two"],
+                    &[],
+                ),
+            ],
+        };
+        let transitive = DependencyContext {
+            kind: DependencyKind::Development,
+            target: None,
+            via: Some("facade".into()),
+        };
+        let parent = CargoParentUnit {
+            package_id: facade_one,
+            graph_index: 1,
+        };
+
+        assert_eq!(
+            units_for_context_edges(&graph, root, dependency, target, &transitive, Some(&parent),),
             vec![3]
         );
     }
